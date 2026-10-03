@@ -2,7 +2,7 @@
 
 ## Context
 
-We are building a Go IM backend for a WeChat-like social app (Android, iOS, web) targeting ~1M concurrent users. The user previously built a C++ IM handling 2.6M TCP connections (600k per gateway). Two draft docs exist in the repo (`gpt_design.md`, `claude_design.md`); they disagree on presence model and scope, and leave the "delayed disconnect deletes the new session" race unsolved.
+We are building a Go IM backend for a WeChat-like social app (Android, iOS, web) targeting ~1M concurrent users. The user previously built a C++ IM handling 2.6M TCP connections (600k per gateway). Two earlier draft docs (`gpt_design.md`, `claude_design.md`, added in `4ce1fa6` and removed in `05cd570`) disagree on presence model and scope, and leave the "delayed disconnect deletes the new session" race unsolved.
 
 The full system is decomposed into 5 sub-projects (1 connection/session core, 2 messaging, 3 push pipeline, 4 social feed, 5 scale/hardening). **This spec covers sub-project 1 only**: connect, encrypted handshake, login, heartbeat, kick, disconnect — correct under reconnect races, and meeting a storm-recovery SLO.
 
