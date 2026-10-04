@@ -1,5 +1,7 @@
 # Sub-project 1: Connection & Session Core — Design (revision 4)
 
+> 中文版: [2026-10-03-connection-session-core-design-rev4.zh-CN.md](2026-10-03-connection-session-core-design-rev4.zh-CN.md). This English version is authoritative.
+
 > Revision 4 of `2026-10-03-connection-session-core-design-rev3.md`, which is left unchanged. This revision applies every decision in `docs/superpowers/objections/connection-session-core-design-rev3-dispositions.md` (O1–O7 of the third review, plus its clarifications of rev3's open points 4–6), and the follow-up decisions on rev4's own open points recorded in the same file (*R3-OP2*, *R3-OP4*–*R3-OP7*). Every review round numbers its objections from O1, so references are prefixed: *(R1-O4)* points at `connection-session-core-design-dispositions.md` (first review), *(R2-O4)* at the rev2 dispositions (second review), *(R3-O4)* at the rev3 dispositions (third review). Points this revision had to interpret are listed under **Open points** at the end.
 
 ## Context
