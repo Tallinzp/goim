@@ -73,9 +73,11 @@ A connection moves through four states: **HANDSHAKE → AUTH_PENDING → ONLINE 
 | --- | --- | --- |
 | `REPLACED` | Same device, newer connection | Goes quiet; reconnects when the user returns |
 | `KICKED_BY_OTHER_DEVICE` | Another device took the slot | Tells the user |
-| `REVOKED` | Ban, password change, "log out everywhere" | Drops the token; shows the login screen |
+| `REVOKED` | Ban, password change, "log out everywhere", or "log this device out" | Drops the token; shows the login screen |
 
 **Login tokens** are short-lived (about 1h) and checked only at login. An already-online connection is not cut off when its token expires; revocation handles security for long-lived connections.
+
+**Revocation markers.** Revoking writes a marker in Redis (`rev:{uid}`): "tokens issued before time T are no good". It can cover the whole user or just one slot, for example "log this device out". The marker is written and confirmed on a Redis replica *before* the session is deleted or the Kick is sent. So even if the Kick is lost, the next Reconcile sees the marker and closes the connection instead of bringing the session back. When the app itself logs out, no marker is needed: the gateway closes that connection, so nothing can bring it back.
 
 ## Staying correct under races
 
@@ -192,14 +194,16 @@ Redis presence is *eventually* right, and the table below gives the bounds. Mess
 
 ## Still open, and where to read more
 
-One real gap is still undecided, and four smaller rev4 choices are awaiting confirmation.
+Two small points are still open; both are already handled in the current spec and only wait for a formal sign-off.
 
-- **Revoking a single slot (undecided).** "Log this device out" deletes the session but leaves no marker. If the Kick is lost, the next Reconcile could put the session back. A per-slot revocation marker would close the gap.
-- **Small rev4 choices to confirm:** retry a failed ReconcileEnd for up to 60s; ignore `missing` on a gateway's very first lease renewal; a sweeper that aborts releases its claim; a fourth Reconcile result, `unchanged`, for a write that lost a race.
+- **Lease check outside the script.** Reconcile checks whether a gateway is alive in Logic, then writes with a compare-and-set, because the lease key lives in a different Redis slot.
+- **Error order at login.** If a login is both revoked and too late, the client sees `REVOKED` rather than `EXPIRED`. Only the error code differs.
 
-**Deliberately left out:** per-user login rate limits, per-IP limits, distributed locks and a reverse index. Each one either harmed legitimate users in a storm or was unnecessary given the atomic per-user script.
+Already decided this round: "log this device out" writes a per-slot revocation marker (see *Life of a connection*); a failed ReconcileEnd is retried for up to 60s; a gateway ignores `missing` on its very first lease renewal; a sweeper that aborts releases its claim; and Reconcile has a fourth result, `unchanged`, for a write that lost a race.
+
+**Deliberately left out (confirmed for this iteration):** per-user login rate limits, per-IP limits, distributed locks and a reverse index. Each one either harmed legitimate users in a storm or was unnecessary given the atomic per-user script.
 
 **Read next**
 
-- Full spec: `docs/superpowers/specs/2026-10-03-connection-session-core-design-rev4.md`, including the full race list (16 cases), failure table, metrics and test plan.
+- Full spec: `docs/superpowers/specs/2026-10-03-connection-session-core-design-rev4.md`, including the full race list (17 cases), failure table, metrics and test plan.
 - Why each rule exists: the review decisions in `docs/superpowers/objections/` (three rounds).

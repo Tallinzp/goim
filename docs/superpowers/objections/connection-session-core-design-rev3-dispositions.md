@@ -104,3 +104,58 @@ The user decides each objection. This file records the decision and the spec cha
 - O4–O7 are accepted; their changes can be applied in the same revision.
 - Open points 4 and 5 are confirmed as interpreted, with these clarifications to apply: the connection cap counts sockets (accept to close), not connection-table entries kept for a pending Logout; a cancelled Reconcile pass builds and sends no further chunks and sends no `ReconcileEnd`. Open point 6 is confirmed with the O6 changes.
 - Open points 1 and 3 are unchanged. Open point 2 (slot-scoped Revoke) remains open.
+
+## Follow-up — rev4 open points (2026-10-04)
+
+Revision 4 listed open points of its own. The user decided them as follows, and the changes are applied directly to the rev4 spec. References in the spec use the prefix *R3-OP<n>*, where `<n>` is the rev4 open-point number.
+
+### OP2 — slot-scoped Revoke can be undone by Reconcile — ACCEPTED
+
+**Decision:** Add a minimal per-slot revocation marker. A slot-scoped logout (`Revoke(scope = slot)`, "log this device out") writes the marker synchronously: it must be confirmed before the session is deleted, before the Kick is sent and before `Revoke` returns success.
+
+**Rationale:** Without a marker, a lost Kick leaves the connection ONLINE with its `sess:` field deleted. The next Reconcile then restores it under rule 4 and the logged-out device stays online for good. Keeping the marker in the existing `rev:{uid}` key keeps it in the same hash slot as `sess:{uid}`, so the login Lua still reads it atomically. This adds no new key, RPC or mechanism.
+
+**Confirmed interpretation:** "when a user logs out" means the server-side slot-scoped Revoke. A client's own `Logout` command writes no marker: the gateway closes that connection, so Reconcile can't restore it.
+
+**Spec changes applied:**
+- *Redis schema:* `rev:{uid}` becomes a HASH. Field `*` holds the scope=all marker and field `appid:platform` holds that slot's marker. Each field is written as `max(stored, new)` and confirmed with `WAIT`. The key TTL is max token lifetime + margin, refreshed on every marker write.
+- *Effective marker:* `max(rev[*], rev[appid:platform])`; a missing field counts as 0. The login Lua (step 1) and Reconcile rule 1 both use it.
+- *Logic → Revoke:* both scopes write their field, `WAIT`, and only then delete and kick. If `WAIT` fails, Revoke returns a retryable error.
+- *Replication note:* `WAIT` covers marker writes for both scopes.
+- *Races handled:* new race 17, a slot-scoped logout whose Kick is lost.
+- *Consistency contract:* the revoked-owner row covers both scopes.
+- *Tests:* the effective marker in Lua; a slot marker blocks login on that slot only; a slot Revoke with its Kick dropped is closed by Reconcile, not restored, and other slots are unaffected; a slot Revoke whose `WAIT` fails sends no Kick and is idempotent on retry.
+
+### OP4 — `ReconcileEnd` delivery failure — CONFIRMED
+
+**Decision:** Retry `ReconcileEnd` with the same payload through the 60s bounded retry queue, then drop it; the next pass covers what it missed.
+
+**Spec changes applied:** text moved into *Gateway → Reconcile, Pass end*; metric for retries and drops added; test "a `ReconcileEnd` that fails once is retried and its deletes apply" added.
+
+### OP5 — `missing` on the first lease call after boot — CONFIRMED
+
+**Decision:** The gateway ignores `missing` on its first lease call after boot; it neither counts nor acts on it.
+
+**Spec changes applied:** text moved into *Gateway → Lease*; test added.
+
+### OP6 — sweep claim after an abort — CONFIRMED
+
+**Decision:** An aborting sweeper `DEL`s its `sweep:gw:{epoch}` claim.
+
+**Spec changes applied:** added to *Sweeper → Abort on renewal*; the sweep-abort test checks that the claim key is gone.
+
+### OP7 — Reconcile result for a compare-and-set that lost a race — CONFIRMED
+
+**Decision:** Add a fourth per-entry result, `unchanged`. It is definitive for fence (c) and not re-queued, and no kick is sent.
+
+**Spec changes applied:** the open-point reference was replaced by *(R3-OP7)*; `unchanged` was added to the Reconcile metrics.
+
+### Dropped concepts — CONFIRMED OUT OF SCOPE
+
+**Decision:** Per-user login rate limits, per-IP limits, distributed locks, the reverse mapping and the session version stay out of scope for this iteration.
+
+**Spec changes applied:** none.
+
+### Status after the follow-up
+
+- Rev4's open points 2 and 4–7 are resolved. Its *Open points* section now carries only Reconcile vs. lease check atomicity and the `REVOKED`/`EXPIRED` order, which no review decision has addressed yet.

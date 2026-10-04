@@ -1,6 +1,6 @@
 # Sub-project 1: Connection & Session Core — Design (revision 4)
 
-> Revision 4 of `2026-10-03-connection-session-core-design-rev3.md`, which is left unchanged. This revision applies every decision in `docs/superpowers/objections/connection-session-core-design-rev3-dispositions.md` (O1–O7 of the third review, plus its clarifications of rev3's open points 4–6). Every review round numbers its objections from O1, so references are prefixed: *(R1-O4)* points at `connection-session-core-design-dispositions.md` (first review), *(R2-O4)* at the rev2 dispositions (second review), *(R3-O4)* at the rev3 dispositions (third review). Points this revision had to interpret are listed under **Open points** at the end.
+> Revision 4 of `2026-10-03-connection-session-core-design-rev3.md`, which is left unchanged. This revision applies every decision in `docs/superpowers/objections/connection-session-core-design-rev3-dispositions.md` (O1–O7 of the third review, plus its clarifications of rev3's open points 4–6), and the follow-up decisions on rev4's own open points recorded in the same file (*R3-OP2*, *R3-OP4*–*R3-OP7*). Every review round numbers its objections from O1, so references are prefixed: *(R1-O4)* points at `connection-session-core-design-dispositions.md` (first review), *(R2-O4)* at the rev2 dispositions (second review), *(R3-O4)* at the rev3 dispositions (third review). Points this revision had to interpret are listed under **Open points** at the end.
 
 ## Context
 
@@ -122,11 +122,11 @@ Repo: one Go module containing `cmd/{gateway,logic,devtoken,loadgen}`, `internal
     - (c) no Reconcile chunk containing the connection is unresolved. A chunk is resolved when it has a definitive reply, or when `sent_ms + login_deadline + 1s` has passed (timeout, RPC error, Logic crash), since the Reconcile compare-and-set Lua refuses to write after `sent_ms + login_deadline`. A `refused` entry result is a definitive reply *(R3-O6)*. Implemented as a per-connection `in_reconcile_chunk` mark, set when the chunk is built and cleared when the chunk is resolved.
 
   A connection that closes before the fence holds keeps a pending Logout that fires when it does. Logouts go through a bounded retry queue (60s); dropping one is safe because the next Reconcile pass repairs it *(R1-O3, R3-O1)*.
-- **Lease** *(R1-O2, R3-O3)*: call `GatewayLease` every 10s on a **dedicated gRPC connection**, never batched with or queued behind Login/Logout/Reconcile. The reply says whether the lease was found **live** or **missing**: it is `missing` whenever the renewal found the lease key absent, whatever the state of the `gwepochs` member. The renewal itself re-registers the epoch (lease key and `gwepochs` score). On `missing`, the gateway starts an immediate triggered Reconcile pass. A lease that expired but was never swept costs one unneeded triggered pass, which is rare because of the TTL derivation *(R2-O5)*.
+- **Lease** *(R1-O2, R3-O3)*: call `GatewayLease` every 10s on a **dedicated gRPC connection**, never batched with or queued behind Login/Logout/Reconcile. The reply says whether the lease was found **live** or **missing**: it is `missing` whenever the renewal found the lease key absent, whatever the state of the `gwepochs` member. The renewal itself re-registers the epoch (lease key and `gwepochs` score). On `missing`, the gateway starts an immediate triggered Reconcile pass. The first lease call after boot always finds the key absent (a new epoch); the gateway ignores `missing` on that call, and neither counts nor acts on it *(R3-OP5)*. A lease that expired but was never swept costs one unneeded triggered pass, which is rare because of the TTL derivation *(R2-O5)*.
 - **Reconcile** *(R1-O3, R1-O8, R1-O10, R2-O1, R2-O8, R3-O1, R3-O6)*: the gateway sends its ONLINE set — `(uid, appid:platform, conn_id, device_id, conn_seq, login_ms, tok_iat)` — in rate-limited chunks, then ends the pass with `ReconcileEnd`.
   - **Live chunks** *(R2-O1)*: each chunk is read from the per-loop connection tables (via `loop.Execute`) at the moment it is sent, not from a snapshot frozen at the start of the pass. Each chunk carries `sent_ms` (gateway wall clock when sent). Building a chunk sets `in_reconcile_chunk` on each connection in it (see the Logout fence).
-  - **Per-entry results** *(R3-O6)*: Logic returns `written`, `unchanged` (compare-and-set lost to a concurrent change; see open point 7), `refused` (deadline), or `not_owner` (with reason) for each entry. All four are definitive replies for fence (c). For each `not_owner` entry the gateway sends the Kick frame with the given reason and closes the connection. A `refused` entry's conn_id goes back on the current pass's queue and is rebuilt from the live tables when its new chunk is sent; it is skipped if the connection is no longer ONLINE. Each entry is re-queued at most 3 times per pass, so the pass always ends; after that it waits for the next pass.
-  - **Pass end** *(R3-O1)*: a pass completes when every chunk, including re-queued entries, has been sent and resolved. The gateway then collects every conn_id it still **tracks** (see *Per-loop connection tables*), in any state, including closed connections whose fenced Logout has not been sent yet, stamps `as_of_ms` (gateway wall clock, the same clock as `recv_ms`) and sends `ReconcileEnd(gw, epoch, as_of_ms, tracked_conn_ids)`. Size: 8 bytes × 250k (the cap) ≈ 2MB, under gRPC's 4MB default; at the 600k benchmark the list is split or the limit raised.
+  - **Per-entry results** *(R3-O6)*: Logic returns `written`, `unchanged` (compare-and-set lost to a concurrent change) *(R3-OP7)*, `refused` (deadline), or `not_owner` (with reason) for each entry. All four are definitive replies for fence (c). For each `not_owner` entry the gateway sends the Kick frame with the given reason and closes the connection. A `refused` entry's conn_id goes back on the current pass's queue and is rebuilt from the live tables when its new chunk is sent; it is skipped if the connection is no longer ONLINE. Each entry is re-queued at most 3 times per pass, so the pass always ends; after that it waits for the next pass.
+  - **Pass end** *(R3-O1)*: a pass completes when every chunk, including re-queued entries, has been sent and resolved. The gateway then collects every conn_id it still **tracks** (see *Per-loop connection tables*), in any state, including closed connections whose fenced Logout has not been sent yet, stamps `as_of_ms` (gateway wall clock, the same clock as `recv_ms`) and sends `ReconcileEnd(gw, epoch, as_of_ms, tracked_conn_ids)`. If `ReconcileEnd` fails, it is retried with the same payload through the bounded retry queue used for Logouts (60s), then dropped; the next pass covers what it missed *(R3-OP4)*. Retrying late is safe: a conn_id absent from the list had already passed its Logout fence at `as_of_ms`, and conn_ids are never reused, so no later write for it can appear. A dropped `ReconcileEnd` stretches the ghost bound to two cycles for that pass. Size: 8 bytes × 250k (the cap) ≈ 2MB, under gRPC's 4MB default; at the 600k benchmark the list is split or the limit raised.
   - **Two paces** *(R2-O8)*, both configurable:
     - **periodic**: every ~10 min with random jitter per gateway, spread over the cycle (~330 entries/s at 200k);
     - **triggered by a `missing` lease reply**: ~5k entries/s per gateway (200k in ~40s; ~30k Lua calls/s cluster-wide if all 6 gateways run one at once).
@@ -150,11 +150,14 @@ Repo: one Go module containing `cmd/{gateway,logic,devtoken,loadgen}`, `internal
   - Refresh every 5 min. During a rotation every published key is accepted. If a refresh fails, keep the last good set and raise an alert. Alert while a pod runs on the fallback set.
   - A JWT with an unknown `kid` triggers at most one rate-limited refresh before it is rejected.
   - **Key rotation runbook:** a new signing key is published to the `jwks-fallback` ConfigMap before it signs any token; a key withdrawn because it was compromised is also removed from the ConfigMap. (A stale ConfigMap only matters while the account service is unreachable.)
-- **Revoke** *(R1-O10, R2-O4)*: `Revoke(uid, scope = all | slot, reason)`, called by the account service on a ban, a password change or "log out all devices".
-  1. For scope=all, write the marker with a Lua script as `revoked_before_ms = max(stored, new)` (idempotent), then `WAIT 1 <timeout>`. If no replica confirms, return a retryable error; the account service retries `Revoke` until it succeeds.
-  2. After the confirmed write, delete the affected `sess:{uid}` fields and kick each affected connection with reason `REVOKED` using the hardened Kick.
+- **Revoke** *(R1-O10, R2-O4, R3-OP2)*: `Revoke(uid, scope = all | slot, reason)`, called by the account service on a ban, a password change, "log out all devices" (scope=all) or "log this device out" (scope=slot). Both scopes work the same way:
+  1. Write the marker field — `*` for scope=all, `appid:platform` for scope=slot — with a Lua script as `revoked_before_ms = max(stored, new)` (idempotent), then `WAIT 1 <timeout>`. If no replica confirms, return a retryable error; the account service retries `Revoke` until it succeeds. **The marker is written synchronously: it must be confirmed before step 2 and before `Revoke` returns success**, so a lost Kick can't let Reconcile resurrect the session.
+  2. After the confirmed write, delete the affected `sess:{uid}` field(s) and kick each affected connection with reason `REVOKED` using the hardened Kick.
+
+  A client's own `Logout` command writes no marker: the gateway closes that connection, so it is no longer ONLINE and Reconcile can't restore it.
+- **Effective revocation marker** for a slot *(R3-OP2)*: `max(rev[*], rev[appid:platform])` from `rev:{uid}`; a missing field counts as 0. The login Lua and Reconcile rule 1 both use it.
 - **Reconcile handling** *(R1-O3, R1-O8, R1-O10, R2-O1, R2-O4, R3-O4, R3-O6)*, per chunk entry, in this order:
-  1. `tok_iat < revoked_before_ms` → `not_owner` with reason `REVOKED`; write nothing.
+  1. `tok_iat <` the effective revocation marker for the entry's slot *(R3-OP2)* → `not_owner` with reason `REVOKED`; write nothing.
   2. Field holds this exact `gw|epoch|conn_id` → refresh the `sess:{uid}` TTL; ensure the uid is in `gwconns`. Result `written`.
   3. Field holds a **different** session whose `gw|epoch` has a **live** lease → compare the two with the login table's ordering, including its regression window *(R2-O4, R3-O4)*:
      - same device_id: if the two `login_ms` are within `login_deadline` of each other, the higher `conn_seq` wins; otherwise the later `login_ms` wins (the regression row);
@@ -179,7 +182,7 @@ Repo: one Go module containing `cmd/{gateway,logic,devtoken,loadgen}`, `internal
 | Key | Type | Value / TTL | Purpose |
 |---|---|---|---|
 | `sess:{uid}` | HASH | field `appid:platform` → `gw|epoch|conn_id|device_id|conn_seq|login_ms|tok_iat`; `login_ms` is the gateway's `recv_ms` *(R1-O4)*; key TTL 30d, refreshed on login and by Reconcile | online mark (source of truth in Redis) |
-| `rev:{uid}` | STRING | `revoked_before_ms`; written as `max(stored, new)` and confirmed with `WAIT` *(R2-O4)*; TTL = max token lifetime + margin *(R1-O10)* | revocation marker |
+| `rev:{uid}` | HASH | field `*` → `revoked_before_ms` for scope=all; field `appid:platform` → `revoked_before_ms` for that slot *(R3-OP2)*. Each field written as `max(stored, new)` and confirmed with `WAIT` *(R2-O4)*; key TTL = max token lifetime + margin *(R1-O10)*, refreshed on every marker write | revocation markers (user-wide and per slot) |
 | `gwlease:gw:{epoch}` | STRING | `PX <lease TTL>`, renewed every 10s with `SET ... PX <TTL> GET` (a nil previous value means `missing`) *(R3-O3)*. Lease TTL is configurable (default 30s) and must satisfy **TTL > measured shard failover time + one renewal interval** *(R2-O5)* | gateway instance is alive |
 | `gwepochs` | ZSET | member `gw:epoch`, score = last renewal in ms | registry of epochs, used by the sweeper |
 | `gwconns:gw:{epoch}` | SET | uids; pruned by the Reconcile delete phase. One key per epoch, so all of a gateway's `SADD`s land on one shard; acceptable at the storm rate (~10k/s) *(R2-O9)* | cleanup hint (not atomic with sess, not needed for correctness) |
@@ -189,13 +192,13 @@ Repo: one Go module containing `cmd/{gateway,logic,devtoken,loadgen}`, `internal
 
 > The validity rule is defined here, but an efficient read path for consumers is deferred to sub-projects 2/3. They must **not** implement it as `HGETALL` + `EXISTS` per epoch *(R1-O12)*.
 
-**Replication** *(R2-O4)*: Redis Cluster replicates asynchronously; a failover can lose ~1s of acknowledged writes. `sess:` and `gwconns` losses are repaired by Reconcile (rule 3 picks the right winner, rule 4 restores); lease losses are covered by the next renewal. `rev:{uid}` is the exception: nothing would repair its loss, so Revoke confirms it with `WAIT`.
+**Replication** *(R2-O4)*: Redis Cluster replicates asynchronously; a failover can lose ~1s of acknowledged writes. `sess:` and `gwconns` losses are repaired by Reconcile (rule 3 picks the right winner, rule 4 restores); lease losses are covered by the next renewal. `rev:{uid}` is the exception: nothing would repair its loss, so Revoke confirms every marker write, for both scopes, with `WAIT`.
 
 ### Login Lua (single slot, atomic)
 
 Inputs: the new entry, `recv_ms`, token `iat`, `login_deadline` (default 5s). Steps:
 
-1. Read `rev:{uid}`. If `iat < revoked_before_ms` → `REVOKED`; no write *(R1-O10)*.
+1. Read `rev:{uid}` fields `*` and `appid:platform`. If `iat <` their max (the effective marker) → `REVOKED`; no write *(R1-O10, R3-OP2)*.
 2. Read Redis `TIME`. If `now − recv_ms > login_deadline` → `EXPIRED`; no write *(R1-O4)*.
 3. Compare the stored field with the new login:
 
@@ -222,7 +225,7 @@ Assumption *(R1-O4)*: clock skew between gateways (NTP, a few ms) is far below t
 
 Find `gwepochs` members whose last renewal is more than **2 × lease TTL** old (60s by default) *(R2-O5)*, or that sent `EpochEnded`. Claim each with `sweep:` SET NX and **record the epoch's `gwepochs` score at claim time** *(R3-O3)*. Run `SSCAN gwconns`, and for each uid run a Lua script that deletes only the fields whose `gw|epoch` match the dead epoch. Rate-limited to about 10k users/s.
 
-- **Abort on renewal** *(R3-O3)*: between rate-limit batches, re-read the epoch's `gwepochs` score. If it is newer than the claimed score, the epoch has renewed: stop at once, without `UNLINK`ing `gwconns` and without removing the ZSET member, and count `sweep_aborted`. The gateway's renewal already reported `missing` (the lease key was absent), so its triggered Reconcile restores whatever was deleted.
+- **Abort on renewal** *(R3-O3)*: between rate-limit batches, re-read the epoch's `gwepochs` score. If it is newer than the claimed score, the epoch has renewed: stop at once, without `UNLINK`ing `gwconns` and without removing the ZSET member, `DEL` the `sweep:gw:{epoch}` claim so it can't block a later legitimate sweep *(R3-OP6)*, and count `sweep_aborted`. The gateway's renewal already reported `missing` (the lease key was absent), so its triggered Reconcile restores whatever was deleted.
 - On completion, `UNLINK` the set (freed in a background thread, so a 200k-member delete does not stall the shard) and remove the ZSET member *(R2-O9)*.
 
 **Mass-stale guard** *(R1-O2, R2-O3, R2-O5, R3-O2)*: sweep a stale epoch only if
@@ -263,6 +266,7 @@ Safety net: the 30-day TTL on `sess:{uid}`, refreshed by login and Reconcile *(R
 14. **Connection closes during a Reconcile pass** *(R2-O1)*: its Logout is held until the chunk containing it is acknowledged (fence c), or until the chunk's deadline has passed, so the Logout always lands after any restore. A connection that closed before its chunk was built is simply not in the pass.
 15. **Write lost in a Redis failover, older session restored** *(R2-O4, R3-O4)*: if the field rolls back to an older session while the newer connection is live, Reconcile rule 3 compares by the login table's ordering, writes the newer entry back and kicks the older connection. The ordering includes the regression window, so a session that won through a counter regression keeps winning after a rollback. Ties go to the stored session, so two live sessions never overwrite and close each other.
 16. **Login in flight, or Logout dropped, around a Reconcile pass** *(R3-O1)*: a connection whose Login is in flight is tracked, so it is in `tracked_conn_ids` and the delete phase leaves its field alone; a Login received after `as_of_ms` fails the `login_ms < as_of_ms` check. A connection whose Logout was dropped has left the tracked set, so its ghost is deleted at the end of the same pass — whether the Logout was dropped before or after its chunk was sent.
+17. **Slot-scoped logout whose Kick is lost** *(R3-OP2)*: the connection stays ONLINE on its gateway and its `sess:` field is gone. The confirmed per-slot marker makes the next Reconcile pass return the entry as `not_owner` (`REVOKED`, rule 1) instead of restoring it (rule 4), so the device is closed within one cycle. The user's other slots are unaffected.
 
 Note: when the same device reconnects, `conn_seq` also replaces any ghost entry. Reconcile covers devices that never return.
 
@@ -273,7 +277,7 @@ Bounds consumers (sub-projects 2/3) may rely on when sizing caches and fallbacks
 | Divergence consumers may see | Cause | Bound | Repaired by |
 |---|---|---|---|
 | Ghost: valid entry, but the connection is gone | Logout dropped | ≤ 1 Reconcile cycle (~10 min + jitter): a Logout dropped at any point before a pass ends is repaired at the end of that pass *(R3-O1)* | Reconcile delete phase (`ReconcileEnd`) |
-| Old owner still connected after being replaced or revoked | Kick lost | ≤ 1 cycle | Reconcile `not_owner` / rule 1 |
+| Old owner still connected after being replaced or revoked (either scope) | Kick lost | ≤ 1 cycle | Reconcile `not_owner` / rule 1 *(R3-OP2)* |
 | Entry of a dead gateway | Gateway death | invalid after the lease TTL (30s); deleted after 2 × TTL, plus up to one TTL of guard wait *(R3-O2)*, plus sweep time | validity rule, then sweeper |
 | Live connection missing from Redis | Write lost in failover, or wrongly swept | ≤ 1 cycle; ≤ ~1 min after a `missing` lease reply | Reconcile restore |
 | Healthy session reads invalid | Logic or lease shard down longer than the TTL | the length of the outage | lease renewal resumes *(R2-O5)* |
@@ -320,7 +324,7 @@ Prometheus metrics:
 - lease renewal failures; lease replies with `missing`;
 - admission rejects by reason: `at_capacity` *(R2-O2)*, `handshake_rate`, `login_queue`, `pending_mem`, `handshake_timeout`, `auth_timeout`;
 - Kick attempts, retries and give-ups, give-ups labelled `target_lease=live|dead` (alerts use `live` only) *(R2-O6)*; revocation kicks; Revoke `WAIT` failures *(R2-O4)*;
-- Reconcile: entries refreshed, restored, `refused` and re-queued, re-queue limit reached *(R3-O6)*, `not_owner` by reason, rule-3 overrides (chunk entry newer) *(R2-O4)*; `ReconcileEnd` deletes and `tracked_conn_ids` size *(R3-O1)*; passes cancelled; cycle duration, by pace *(R2-O8)*;
+- Reconcile: entries refreshed, restored, `unchanged` *(R3-OP7)*, `refused` and re-queued, re-queue limit reached *(R3-O6)*, `not_owner` by reason, rule-3 overrides (chunk entry newer) *(R2-O4)*; `ReconcileEnd` deletes, `tracked_conn_ids` size, retries and drops *(R3-O1, R3-OP4)*; passes cancelled; cycle duration, by pace *(R2-O8)*;
 - sweeper progress; `sweep_aborted` *(R3-O3)*; **mass-stale guard holds** (also an alert), including time held by the `renewing_since` wait *(R3-O2)*;
 - JWKS refresh failures and unknown-`kid` refreshes; pods running on `jwks-fallback` (also an alert) *(R2-O7)*;
 - **reconnect-after-idle rate** (shows NAT timeouts shorter than 150s); Go GC pause and heap.
@@ -338,7 +342,7 @@ Logs: `slog` lines with `uid` and `conn_id`; a request ID passed in gRPC metadat
   - **SDK** *(R3-O5)*: pre-handshake closes retry after 1–3s up to 5 times in a row, then fall back to exponential backoff; the count resets on a successful login.
 - **Lua tests** against a real Redis in Docker:
   - one table test for each row of the login table, including `SUPERSEDED`, `EXPIRED`, `STALE` (low conn_seq inside the window is rejected) and the regression row (low conn_seq outside the window is accepted);
-  - `REVOKED` (token iat before the marker is rejected); the revocation marker write is `max(stored, new)` and idempotent;
+  - `REVOKED` (token iat before the marker is rejected); the revocation marker write is `max(stored, new)` and idempotent; the effective marker is the max of the `*` and slot fields, and a slot marker blocks login on that slot only *(R3-OP2)*;
   - the logout compare-and-delete;
   - the Reconcile compare-and-set (including refusal after `sent_ms + login_deadline`, and a failed compare returning no write) and the `ReconcileEnd` delete (only fields of this epoch, conn_id not tracked, `login_ms < as_of_ms`) *(R3-O1)*;
   - Reconcile rule 3 after a simulated lost write: restore an older field by hand while the newer connection is live; Reconcile keeps the newer connection and kicks the older one *(R2-O4)*;
@@ -348,7 +352,7 @@ Logs: `slog` lines with `uid` and `conn_id`; a request ID passed in gRPC metadat
 - **Race integration tests** (`deploy/compose`: Redis, Logic, **4 gateways** and a scripted client) *(R3-O7)*:
   - races 1–6, 10, 14 and 16 above; race 6 in both orders (Logout before Login and Login before Logout, with injected Logic delays): no ghost after the fence; a Login with no definitive reply caused by a Logic crash: the Logout waits for the fence;
   - race 14 *(R2-O1)*: a connection closes after its chunk is sent but before Logic processes it (injected Logic delay); no ghost remains after the Logout;
-  - `ReconcileEnd` *(R3-O1)*: a Login in flight when a pass starts (injected Logic delay) is not deleted by that pass's delete phase; a Logout dropped after the connection's chunk was sent is repaired at the end of the same pass; a cancelled pass deletes nothing;
+  - `ReconcileEnd` *(R3-O1)*: a Login in flight when a pass starts (injected Logic delay) is not deleted by that pass's delete phase; a Logout dropped after the connection's chunk was sent is repaired at the end of the same pass; a cancelled pass deletes nothing; a `ReconcileEnd` that fails once is retried and its deletes apply *(R3-OP4)*;
   - Reconcile refusal *(R3-O6)*: inject a Logic delay longer than `login_deadline` on one chunk of a triggered pass: its entries are refused, re-queued and restored within the same pass; a refused rule-3 write sends no kick;
   - gateway crash → lease expiry → sweep → entries gone;
   - kill 2 gateways at once: both epochs are swept while the others renew *(R2-O3)*;
@@ -357,10 +361,11 @@ Logs: `slog` lines with `uid` and `conn_id`; a request ID passed in gRPC metadat
   - gateway→Logic blocked for 90s with Logic↔Redis healthy, then restored: nothing is swept *(R3-O2)*;
   - Logic restart with renewals resuming more than 30s after the sweeper starts: nothing is swept *(R3-O2)*;
   - after a forced sweep of a live gateway, its sessions are restored within ~1 min by the triggered pass *(R2-O8)*;
-  - sweep abort *(R3-O3)*: start a sweep of a live gateway's epoch (lease key removed), let the gateway renew mid-sweep: the reply is `missing`, the sweeper aborts without `UNLINK`/`ZREM`, and the sessions are restored within ~1 min. A renewal after a plain lease expiry with no sweep is `missing` and triggers one pass;
+  - sweep abort *(R3-O3)*: start a sweep of a live gateway's epoch (lease key removed), let the gateway renew mid-sweep: the reply is `missing`, the sweeper aborts without `UNLINK`/`ZREM` and deletes its claim key *(R3-OP6)*, and the sessions are restored within ~1 min. The gateway's first lease call after boot reports `missing` and triggers no pass *(R3-OP5)*. A renewal after a plain lease expiry with no sweep is `missing` and triggers one pass;
   - Reconcile: a ghost entry is removed within one cycle; a missing entry is restored; a newer session on another gateway is never overridden; a dropped Logout is repaired within one cycle;
   - Kick: a dropped Kick to a live gateway is retried and then caught by the next Reconcile *(R2-O6)*; a Kick during `AUTH_PENDING` closes the connection when the Login reply returns; a draining gateway still receives Kicks;
   - Revoke closes connections on two slots; a Revoke whose Kick is dropped is caught by the next Reconcile; a Revoke whose `WAIT` fails returns an error, and the retry is idempotent *(R2-O4)*;
+  - slot-scoped Revoke *(R3-OP2)*: with its Kick dropped, the next Reconcile closes the connection through `not_owner` (`REVOKED`) and does not restore the session; another slot of the same user is unaffected; a slot Revoke whose `WAIT` fails returns an error and sends no Kick, and the retry is idempotent;
   - key rotation: both `kid`s are accepted during the overlap;
   - JWKS *(R2-O7)*: Logic starts with the account service down, becomes Ready from the `jwks-fallback` ConfigMap and accepts tokens; a Logic pod with no key set from either source never becomes Ready.
 - **Redis failover test** *(R2-O5)*: fail over the shard holding the lease keys and measure the time; the lease must survive it at the configured TTL.
@@ -383,17 +388,9 @@ Messaging (seq, dedup, MongoDB) · push pipeline (RocketMQ, APNs/FCM) · social 
 
 ## Open points
 
-Rev3's open points 4 (what the connection cap counts), 5 (overlapping Reconcile passes) and 6 (which Reconcile writes the deadline refuses) were confirmed by the third review and are now part of the body (*Admission control*, *Reconcile*, *Reconcile handling*).
+Rev3's open points 4 (what the connection cap counts), 5 (overlapping Reconcile passes) and 6 (which Reconcile writes the deadline refuses) were confirmed by the third review and are part of the body (*Admission control*, *Reconcile*, *Reconcile handling*). Rev4's open point 2 (slot-scoped Revoke) is resolved by the per-slot revocation marker, and its open points 4–7 are confirmed and folded into the body (*R3-OP2*, *R3-OP4*–*R3-OP7* in the rev3 dispositions).
 
-Carried from revision 3 (unchanged by the third review):
+Still carried, not yet addressed by a review decision:
 
 1. **Reconcile vs. lease check atomicity.** The R1 dispositions say the Reconcile Lua writes "if the stored `gw|epoch` has no live lease", but the lease key is in a different Redis slot. This revision checks liveness in Logic and makes the Lua a compare-and-set on the observed field value (see *Reconcile handling*).
-2. **`Revoke(scope = slot)` and Reconcile.** Slot-scoped revocation deletes the field but sets no `rev:{uid}` marker. If its Kick is lost, the next Reconcile would see an empty field and *restore* the session (rule 4) instead of closing it. A per-slot marker (e.g. a `rev:{uid}` hash keyed by `appid:platform`) would close the gap; not yet decided. (R2-O4's `WAIT` applies only where a marker is written.)
-3. **Order of `REVOKED` vs `EXPIRED`** in the login Lua: revocation is checked first, as R1-O10 says "read `rev:{uid}` first". The outcome differs only in which error the client sees.
-
-New in this revision, interpreted here; confirm or override:
-
-4. **`ReconcileEnd` delivery failure** *(R3-O1)*. The disposition doesn't say what happens if `ReconcileEnd` fails. This revision retries it with the same payload through the bounded retry queue used for Logouts (60s), then drops it; the next pass covers what it missed. Retrying late is safe: a conn_id absent from the list had already passed its Logout fence at `as_of_ms`, and conn_ids are never reused, so no later write for it can appear. A dropped `ReconcileEnd` stretches the ghost bound to two cycles for that pass.
-5. **`missing` on the first lease call after boot** *(R3-O3)*. With `missing` based only on the lease key, a new epoch's first renewal always reports `missing`. The gateway ignores `missing` on its first lease call (it has no sessions to restore yet); it is neither counted nor acted on.
-6. **Sweep claim after an abort** *(R3-O3)*. An aborted sweep leaves its `sweep:gw:{epoch}` claim, which would block a later, legitimate sweep of the same epoch for up to 5 minutes. This revision has the aborting sweeper `DEL` its claim.
-7. **Result of a compare-and-set that lost to a concurrent change** *(R3-O6)*. The disposition calls it "a definitive result with no write". The disposition lists only three results (`written`, `refused`, `not_owner`); this revision adds a fourth, `unchanged`, so the gateway can tell it apart from `refused` and does not re-queue it. No kick is sent; the next pass handles the entry.
+2. **Order of `REVOKED` vs `EXPIRED`** in the login Lua: revocation is checked first, as R1-O10 says "read `rev:{uid}` first". The outcome differs only in which error the client sees.
