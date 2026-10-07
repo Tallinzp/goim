@@ -2,3 +2,4 @@ pkg/
 *.exe
 *.test
 *.out
+tier2-results/

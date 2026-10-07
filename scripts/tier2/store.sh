@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Tier 2: run Plan 1's store tests against a real Redis primary + replica.
+#
+# Usage (on the Tier 2 host, from the repo root): scripts/tier2/store.sh
+#   GOIM_TEST_TIER=2 is set by this script; the host guard refuses smaller hosts.
+#   Results: tier2-results/store-<timestamp>/{result.json,tests.log,mutation.log}
+#   Exit code: 0 if every check passes, 1 if any check fails, 2 if the host is refused.
+#
+# Checks:
+#   1. tests:    `make test-redis` passes (every test on real Redis 7.4, race detector on)
+#   2. no_skips: no test was skipped as "TODO: Tier 2 integration"
+#   3. mutation: with Revoke's WAIT moved to a pooled connection,
+#                TestRevokeFailsWhenReplicaDoesNotAck fails (the test catches the bug)
+#   4. eviction: the test Redis reports maxmemory-policy noeviction
+set -uo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+export GOIM_TEST_TIER=2 CGO_ENABLED=1
+export GOIM_TEST_REDIS=127.0.0.1:6379 GOIM_TEST_REDIS_REPLICA=127.0.0.1:6380
+
+# Host guard (spec: Tier 2 host is 12 cores / 26GB; never the dev machine).
+cores=$(nproc)
+mem_gb=$(awk '/MemTotal/ {printf "%d", $2 / 1024 / 1024}' /proc/meminfo)
+if [ "$cores" -lt 12 ] || [ "$mem_gb" -lt 24 ]; then
+  echo "refused: Tier 2 needs >= 12 cores and >= 24GB RAM (have $cores cores, ${mem_gb}GB)" >&2
+  exit 2
+fi
+for tool in docker go gcc make git; do
+  command -v "$tool" >/dev/null || { echo "refused: $tool not installed" >&2; exit 2; }
+done
+
+out="tier2-results/store-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$out"
+mutdir=""
+teardown() {
+  [ -n "$mutdir" ] && git worktree remove --force "$mutdir" >/dev/null 2>&1
+  make redis-down >/dev/null 2>&1
+}
+trap teardown EXIT
+
+make redis-down >/dev/null 2>&1   # idempotent: start from a clean Redis
+if ! make redis-up >"$out/redis-up.log" 2>&1; then
+  echo "redis-up failed, see $out/redis-up.log" >&2
+  exit 1
+fi
+
+# 1 + 2: full suite on real Redis.
+go test -race -count=1 -v ./... >"$out/tests.log" 2>&1
+tests_rc=$?
+skips=$(grep -c 'TODO: Tier 2 integration' "$out/tests.log")
+failed=$(grep -E '^\s*--- FAIL' "$out/tests.log" | sed 's/^\s*--- FAIL: //; s/ (.*//' | paste -sd, -)
+
+# 3: mutation check in a throwaway worktree, so the checkout is never modified.
+mutdir=$(mktemp -d)
+git worktree add --detach "$mutdir" HEAD >/dev/null 2>&1
+sed -i 's/conn\.Wait(ctx, 1, s\.cfg\.WaitTimeout)/s.rdb.Wait(ctx, 1, s.cfg.WaitTimeout)/' "$mutdir/internal/store/revoke.go"
+if ! grep -q 's.rdb.Wait(ctx, 1' "$mutdir/internal/store/revoke.go"; then
+  mutation="error: could not apply the mutation"
+elif (cd "$mutdir" && go test -race -count=1 -run '^TestRevokeFailsWhenReplicaDoesNotAck$' ./internal/store/) >"$out/mutation.log" 2>&1; then
+  mutation="fail: test still passes with WAIT on a pooled connection"
+else
+  mutation="pass"
+fi
+
+# 4: eviction policy (Execution Notes risk 12).
+policy=$(docker compose -f deploy/compose/redis-test.yml exec -T redis-primary \
+  redis-cli -p 6379 config get maxmemory-policy | tail -1 | tr -d '\r')
+
+ok=true
+[ "$tests_rc" -eq 0 ] || ok=false
+[ "$skips" -eq 0 ] || ok=false
+[ "$mutation" = "pass" ] || ok=false
+[ "$policy" = "noeviction" ] || ok=false
+
+cat >"$out/result.json" <<JSON
+{
+  "scenario": "store",
+  "tier": 2,
+  "commit": "$(git rev-parse HEAD)",
+  "host": {"cores": $cores, "mem_gb": $mem_gb},
+  "redis": "$(docker compose -f deploy/compose/redis-test.yml exec -T redis-primary redis-server --version | tr -d '\r')",
+  "pass": $ok,
+  "checks": {
+    "tests": {"pass": $([ "$tests_rc" -eq 0 ] && echo true || echo false), "failed": "$failed"},
+    "no_skips": {"pass": $([ "$skips" -eq 0 ] && echo true || echo false), "tier2_skips": $skips},
+    "mutation": {"pass": $([ "$mutation" = "pass" ] && echo true || echo false), "detail": "$mutation"},
+    "eviction": {"pass": $([ "$policy" = "noeviction" ] && echo true || echo false), "maxmemory_policy": "$policy"}
+  },
+  "not_covered": ["Redis Cluster: MasterForKey, MOVED after failover, multi-node NOSCRIPT, CRC16 key slots",
+                  "lost replies after a write (needs a fault-injecting proxy)"]
+}
+JSON
+
+cat "$out/result.json"
+$ok && exit 0 || exit 1
