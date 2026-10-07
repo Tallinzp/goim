@@ -3,7 +3,8 @@
 #
 # Usage (on the Tier 2 host, from the repo root): scripts/tier2/store.sh
 #   GOIM_TEST_TIER=2 is set by this script; the host guard refuses smaller hosts.
-#   Results: tier2-results/store-<timestamp>/{result.json,tests.log,mutation.log}
+#   Results: tier2-results/store-<timestamp>/ (result.json and the raw logs), plus
+#   ONE file to send back if anything fails: tier2-results/store-<timestamp>.report.txt
 #   Exit code: 0 if every check passes, 1 if any check fails, 2 if the host is refused.
 #
 # Checks:
@@ -30,11 +31,43 @@ for tool in docker go gcc make git; do
 done
 
 out="tier2-results/store-$(date +%Y%m%d-%H%M%S)"
+report="$out.report.txt"
 mkdir -p "$out"
 mutdir=""
+
+section() { printf '\n===== %s =====\n' "$1"; }
+# write_report gathers everything needed to diagnose a failure into one file:
+# environment, result.json, and the log lines that matter (passing-test noise removed).
+write_report() {
+  {
+    echo "goim Tier 2 report: scenario store"
+    section "environment"
+    echo "date:    $(date -Is)"
+    echo "commit:  $(git rev-parse HEAD) ($(git rev-parse --abbrev-ref HEAD))"
+    echo "dirty:   $(git status --porcelain | wc -l) changed files"
+    echo "host:    $cores cores, ${mem_gb}GB RAM, $(uname -sr)"
+    echo "go:      $(go version)"
+    echo "gcc:     $(gcc --version | head -1)"
+    echo "docker:  $(docker --version); $(docker compose version 2>&1 | head -1)"
+    section "result.json"
+    cat "$out/result.json" 2>/dev/null || echo "(not written: the run stopped early)"
+    section "redis-up.log"
+    cat "$out/redis-up.log" 2>/dev/null
+    section "tests.log (RUN/PASS lines removed)"
+    if [ -f "$out/tests.log" ]; then
+      grep -vE '^\s*(=== (RUN|PAUSE|CONT)|--- PASS)' "$out/tests.log" | head -n 3000
+    fi
+    section "mutation.log"
+    tail -n 200 "$out/mutation.log" 2>/dev/null
+    section "redis logs (last 100 lines each)"
+    docker compose -f deploy/compose/redis-test.yml logs --no-color --tail 100 2>&1
+  } >"$report" 2>&1
+}
 teardown() {
+  write_report
   [ -n "$mutdir" ] && git worktree remove --force "$mutdir" >/dev/null 2>&1
   make redis-down >/dev/null 2>&1
+  echo "report: $report"
 }
 trap teardown EXIT
 
