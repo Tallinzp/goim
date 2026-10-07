@@ -3,3 +3,4 @@ pkg/
 *.test
 *.out
 tier2-results/
+*.DS_Store
