@@ -46,3 +46,12 @@ For a triggered pass, the same flow runs with a fresh as_of_ms
 O10: JWKS Refresh
 A JWT with an unknown kid triggers at most one rate-limited refresh before it is rejected. The refresh is rate-limited globally per Logic pod (e.g., at most once every 5 minutes), so a flood of unknown kids cannot trigger repeated refreshes.
 
+O11: Test execution model
+Tests are split into two tiers by resource requirements.
+Tier 1 — Local smoke (dev machine, 2 cores / 2 GB RAM / 32 GB disk):
+- Unit tests, race integration tests, and small load probes (≤5k connections).
+- MUST run on every change.
+Tier 2 — Full load (dedicated host,12 cores /26 GB RAM / 2 TB disk):
+- 200k and 600k connection scenarios, storm tests, Redis failover, slow-client, handshake flood, and all SLO measurements.
+- MUST NOT be run on the local dev machine.
+- automation contract is needed, full load tests MUST be fully scripted and non-interactive.
