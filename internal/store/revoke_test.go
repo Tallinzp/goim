@@ -149,6 +149,9 @@ func TestRevokeFailsWhenReplicaDoesNotAck(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Every write so far is acknowledged; only the marker write will not be.
+	waitReplicaAcked(t, rdb)
+
 	slept := make(chan error, 1)
 	go func() { slept <- replica.Do(ctx, "DEBUG", "SLEEP", "1").Err() }()
 	time.Sleep(100 * time.Millisecond) // the replica is now blocked and cannot ack

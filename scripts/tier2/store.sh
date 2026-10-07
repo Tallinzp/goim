@@ -111,15 +111,23 @@ skips=$(grep -c 'TODO: Tier 2 integration' "$out/tests.log")
 failed=$(grep -E '^[[:space:]]*--- FAIL' "$out/tests.log" | sed 's/^[[:space:]]*--- FAIL: //; s/ (.*//' | paste -sd, -)
 
 # 3: mutation check in a throwaway worktree, so the checkout is never modified.
+# The mutant sends WAIT through node (the pooled *redis.Client) instead of the
+# Conn that wrote the marker. It counts as caught only if it compiles and the
+# test fails its own assertion; a build error or any other failure is an error.
 mutdir=$(mktemp -d)
 git worktree add --detach "$mutdir" HEAD >/dev/null 2>&1
-sed -i.orig 's/conn\.Wait(ctx, 1, s\.cfg\.WaitTimeout)/s.rdb.Wait(ctx, 1, s.cfg.WaitTimeout)/' "$mutdir/internal/store/revoke.go"
-if ! grep -q 's.rdb.Wait(ctx, 1' "$mutdir/internal/store/revoke.go"; then
+sed -i.orig 's/conn\.Wait(ctx, 1, s\.cfg\.WaitTimeout)/node.Wait(ctx, 1, s.cfg.WaitTimeout)/' "$mutdir/internal/store/revoke.go"
+if ! grep -q 'node.Wait(ctx, 1' "$mutdir/internal/store/revoke.go"; then
   mutation="error: could not apply the mutation"
-elif (cd "$mutdir" && go test -race -count=1 -run '^TestRevokeFailsWhenReplicaDoesNotAck$' ./internal/store/) >"$out/mutation.log" 2>&1; then
+elif ! (cd "$mutdir" && go vet ./internal/store/) >"$out/mutation.log" 2>&1; then
+  mutation="error: the mutant does not compile"
+elif (cd "$mutdir" && go test -race -count=1 -v -run '^TestRevokeFailsWhenReplicaDoesNotAck$' ./internal/store/) >>"$out/mutation.log" 2>&1; then
   mutation="fail: test still passes with WAIT on a pooled connection"
-else
+elif grep -q -- '--- FAIL: TestRevokeFailsWhenReplicaDoesNotAck' "$out/mutation.log" &&
+     grep -q 'want ErrNotReplicated' "$out/mutation.log"; then
   mutation="pass"
+else
+  mutation="error: the test failed for another reason, see mutation.log"
 fi
 
 # 4: eviction policy (Execution Notes risk 12).

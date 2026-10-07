@@ -50,7 +50,8 @@
   12. **Eviction policy.** Every key has a TTL, so any `volatile-*` or `allkeys-*` `maxmemory-policy` can silently evict `rev:{uid}` (a lost revocation that `WAIT` cannot prevent), `gwlease` (a false `missing`) or `sess`. Production Redis must run with `noeviction`. The spec doesn't say so; Plan 6's deploy checks must assert `CONFIG GET maxmemory-policy`.
   13. **SSCAN paging.** On real Redis a set of up to 128 members is listpack-encoded and comes back in one `SSCAN` call, so `TestScanConnsPagesThroughTheSet` (50 members) does not exercise paging there.
   14. **Hash-tag slots.** `TestKeysShareSlotsWhereScriptsNeedIt` checks a hand-written rule, not Redis's CRC16. A Cluster test should assert `CLUSTER KEYSLOT` equality for `sess:{u}`/`rev:{u}` and the three per-epoch keys.
-- **Tier 2 command** (Tier 2 host, Docker installed): `GOIM_TEST_TIER=2 make redis-up test-redis`. Expected: every package `ok`, and no test skipped with `TODO: Tier 2 integration`.
+- **Tier 2 run 1 (2026-10-07, commit 7ef1e2a, Redis 7.4.11):** every test passed on real Redis, including both `WAIT` tests and `TestReplicaIsAttached`, and `maxmemory-policy` was `noeviction`. This closes risks 1–6 for a single node; the Cluster risks (7, 9, 10b, 14) and lost replies (11) stay open. The run's mutation check was a false pass: the mutant (`s.rdb.Wait`) did not compile, and the script counted the build failure as the mutant being caught. Fixed: the mutant is now `node.Wait`, and it counts as caught only if it compiles and `TestRevokeFailsWhenReplicaDoesNotAck` fails its own assertion. The test also waits until the primary has recorded the replica's ack of every earlier write before putting the replica to sleep; otherwise a pooled connection that ran the setup write could time out as well, and the mutant would survive by luck.
+- **Tier 2 command** (Tier 2 host, Docker installed): `make test-tier2 SCENARIO=store` (script `scripts/tier2/store.sh`; it writes one report file to send back). `GOIM_TEST_TIER=2 make redis-up test-redis` runs the tests alone. Expected: every package `ok`, and no test skipped with `TODO: Tier 2 integration`.
 
 - **Final review fixes (2026-10-07).** These are the interface changes Plan 2 must use; the task code blocks above show the pre-review version.
   - **`LoginAlready` (`"ALREADY"`):** the login Lua returns it when the slot already holds this exact entry, i.e. a re-run of a request whose first reply was lost. Treat it as success with no kick.
@@ -1843,7 +1844,7 @@ Expected: `TestRevokeMarkerScriptIsMaxIdempotentAndRefreshesTTL`, `TestRevokeDel
 
 - [ ] **Step 5: (Tier 2 host only, not part of local execution) Prove the WAIT test catches the wrong connection**
 
-On the Tier 2 host, temporarily replace `conn.Wait(ctx, 1, s.cfg.WaitTimeout)` in `markRevoked` with `s.rdb.Wait(ctx, 1, s.cfg.WaitTimeout)`, then run `GOIM_TEST_TIER=2 GOIM_TEST_REDIS=127.0.0.1:6379 GOIM_TEST_REDIS_REPLICA=127.0.0.1:6380 CGO_ENABLED=1 go test -race -count=1 ./internal/store/ -run TestRevokeFailsWhenReplicaDoesNotAck`.
+On the Tier 2 host, temporarily replace `conn.Wait(ctx, 1, s.cfg.WaitTimeout)` in `markRevoked` with `node.Wait(ctx, 1, s.cfg.WaitTimeout)` (`node` is the pooled `*redis.Client`; `redis.UniversalClient` has no `Wait`, so `s.rdb.Wait` does not compile), then run `GOIM_TEST_TIER=2 GOIM_TEST_REDIS=127.0.0.1:6379 GOIM_TEST_REDIS_REPLICA=127.0.0.1:6380 CGO_ENABLED=1 go test -race -count=1 ./internal/store/ -run TestRevokeFailsWhenReplicaDoesNotAck`.
 Expected: FAIL (`want ErrNotReplicated`). Restore `conn.Wait(...)`, rerun, and expect PASS. On the dev machine, skip this step and leave *Execution Notes* risk 1 open.
 
 - [ ] **Step 6: Commit**
