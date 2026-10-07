@@ -4,7 +4,7 @@
 -- ARGV[3] device_id         ARGV[4] conn_seq
 -- ARGV[5] recv_ms           ARGV[6] tok_iat_ms
 -- ARGV[7] login_deadline_ms ARGV[8] sess TTL ms
--- Returns {code, stored value or ''}.
+-- Returns {code, stored value or ''}; code ALREADY means this exact entry is already stored.
 -- epoch and conn_id are uint64 and are never converted to Lua numbers (doubles).
 local function split(s)
   local out = {}
@@ -24,6 +24,10 @@ for i = 1, 2 do
   end
 end
 if tonumber(ARGV[6]) < marker then return {'REVOKED', ''} end
+
+-- A re-run of this exact request: go-redis re-sends a pipeline whose reply was
+-- lost after the write. Report it instead of judging our own write as STALE.
+if redis.call('HGET', KEYS[1], field) == ARGV[2] then return {'ALREADY', ''} end
 
 -- 2. Deadline (R1-O4): no write later than recv_ms + login_deadline.
 local t = redis.call('TIME')

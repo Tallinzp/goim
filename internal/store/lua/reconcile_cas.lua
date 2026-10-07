@@ -15,11 +15,15 @@ for i = 1, 2 do
 end
 if tonumber(ARGV[4]) < marker then return 'REVOKED' end
 
+local cur = redis.call('HGET', KEYS[1], ARGV[1]) or ''
+-- A re-run of a write whose reply was lost (go-redis re-sends it): report the
+-- first run's WRITTEN so Logic still kicks the entry it replaced.
+if cur == ARGV[3] then return 'WRITTEN' end
+
 local t = redis.call('TIME')
 local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 if now - tonumber(ARGV[5]) > tonumber(ARGV[6]) then return 'REFUSED' end
 
-local cur = redis.call('HGET', KEYS[1], ARGV[1]) or ''
 if cur ~= ARGV[2] then return 'UNCHANGED' end
 redis.call('HSET', KEYS[1], ARGV[1], ARGV[3])
 redis.call('PEXPIRE', KEYS[1], ARGV[7])

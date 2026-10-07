@@ -43,7 +43,20 @@
   5. **`TIME` inside scripts.** miniredis serves `TIME` from the host clock. Real Redis 7 allows `TIME` before a write under effects replication; this needs a real-Redis run.
   6. **TTL and SET semantics.** `PEXPIRE`/`PTTL`, `SET ... PX ... GET` returning nil for a missing key, `SSCAN` paging, and `UNLINK` are emulated.
   7. **Redis Cluster.** Neither tier runs a Cluster in this plan. `MasterForKey` (the Revoke and lease paths) and cross-slot pipelines are untested until Plan 5's compose cluster. `TestKeysShareSlotsWhereScriptsNeedIt` only checks the hash-tag rule offline.
+  8. **Lua global protection.** Real Redis rejects a script that creates a global variable; gopher-lua may not. The current scripts are clean, but a future script could pass locally and fail in production.
+  9. **NOSCRIPT across Cluster nodes.** The fallback is tested on one node only, not in a ClusterClient pipeline spread over several nodes where only one node lost its script cache.
+  10. **Revoke after a shard failover.** (a) The new master has no replica until one re-attaches, so every Revoke on that shard returns `ErrNotReplicated` until then (an availability cost; the account service retries). (b) Revoke's sticky `Conn` from `MasterForKey` gets `MOVED` back as a plain error. go-redis reloads the slot map only when cluster-routed traffic hits `MOVED`, or after `ClusterStateReloadInterval` (60s), so Revoke can fail for up to 60s on a quiet cluster. Logic's continuous cluster-routed traffic normally triggers the reload at once.
+  11. **Client retries re-running scripts.** go-redis re-sends a command or pipeline whose reply was lost after the write (read timeout, EOF). Fixed for login, compare-and-set and lease (see *Final review fixes*). Not fixed for `rev_delete.lua`: a re-run deletes nothing and returns an empty list, so those Revoke kicks are lost. Reconcile rule 1 closes the connections within one cycle (the contract's "Kick lost" row). No test injects a lost reply on real Redis; that needs a fault-injecting TCP proxy on the Tier 2 host.
+  12. **Eviction policy.** Every key has a TTL, so any `volatile-*` or `allkeys-*` `maxmemory-policy` can silently evict `rev:{uid}` (a lost revocation that `WAIT` cannot prevent), `gwlease` (a false `missing`) or `sess`. Production Redis must run with `noeviction`. The spec doesn't say so; Plan 6's deploy checks must assert `CONFIG GET maxmemory-policy`.
+  13. **SSCAN paging.** On real Redis a set of up to 128 members is listpack-encoded and comes back in one `SSCAN` call, so `TestScanConnsPagesThroughTheSet` (50 members) does not exercise paging there.
+  14. **Hash-tag slots.** `TestKeysShareSlotsWhereScriptsNeedIt` checks a hand-written rule, not Redis's CRC16. A Cluster test should assert `CLUSTER KEYSLOT` equality for `sess:{u}`/`rev:{u}` and the three per-epoch keys.
 - **Tier 2 command** (Tier 2 host, Docker installed): `GOIM_TEST_TIER=2 make redis-up test-redis`. Expected: every package `ok`, and no test skipped with `TODO: Tier 2 integration`.
+
+- **Final review fixes (2026-10-07).** These are the interface changes Plan 2 must use; the task code blocks above show the pre-review version.
+  - **`LoginAlready` (`"ALREADY"`):** the login Lua returns it when the slot already holds this exact entry, i.e. a re-run of a request whose first reply was lost. Treat it as success with no kick.
+  - **Compare-and-set re-run:** `reconcile_cas.lua` returns `WRITTEN` when the field already holds the chunk entry, so Logic still kicks the replaced entry.
+  - **`RenewLease`:** now one script (`lua/lease.lua`) that reads the old value, sets `<nonce>|<missing>` with `PX <TTL>`, and returns `TIME`. It runs through the cluster-routed client, and a re-run with the same nonce returns the first run's `Missing`. The lease value is no longer `1`; only its existence matters (validity rule).
+  - **Plan 3 note:** a renewal RPC whose outcome is unknown (timeout, transport error) must be treated as `missing`, with a triggered pass, because the renewal may have recreated an absent key.
 
 ---
 

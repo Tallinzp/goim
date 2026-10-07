@@ -19,6 +19,11 @@ const (
 	LoginSuperseded LoginCode = "SUPERSEDED" // rejected; no write, no kick
 	LoginExpired    LoginCode = "EXPIRED"    // rejected; reached Redis after recv_ms + login_deadline
 	LoginRevoked    LoginCode = "REVOKED"    // rejected; token iat before the effective marker
+	// LoginAlready: this exact entry is already stored, written by an earlier run
+	// of the same request whose reply was lost (go-redis re-sent it). It is a
+	// success; the kick that run reported is lost, and Reconcile's not_owner
+	// closes the old connection within one cycle.
+	LoginAlready LoginCode = "ALREADY"
 )
 
 // LoginReq is one Login. Entry.LoginMs is the gateway's recv_ms.

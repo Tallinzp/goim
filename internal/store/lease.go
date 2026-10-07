@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"strconv"
 	"strings"
 
@@ -18,35 +19,30 @@ type LeaseResult struct {
 	IndexErr error
 }
 
-// RenewLease runs SET gwlease:gw:{epoch} 1 PX <LeaseTTL> GET plus TIME on the
-// lease key's shard, then updates the gwepochs score to that TIME.
+var leaseScript = mustScript("lease.lua")
+
+// RenewLease renews gwlease:gw:{epoch} with one script that reads the old value,
+// sets the new one with PX <LeaseTTL>, and reads TIME on the lease key's shard,
+// then updates the gwepochs score to that TIME. The script goes through the
+// cluster-routed client, so a MOVED after a failover reloads the slot map.
 func (s *Store) RenewLease(ctx context.Context, ref EpochRef) (LeaseResult, error) {
+	return s.renewLease(ctx, ref, rand.Uint64())
+}
+
+// renewLease is RenewLease with an explicit nonce; a re-run with the same nonce
+// returns the first run's Missing.
+func (s *Store) renewLease(ctx context.Context, ref EpochRef, nonce uint64) (LeaseResult, error) {
 	if err := ref.validate(); err != nil {
 		return LeaseResult{}, err
 	}
-	node, err := s.nodeFor(ctx, ref.leaseKey())
+	vals, err := leaseScript.Run(ctx, s.rdb, []string{ref.leaseKey()}, nonce, ms(s.cfg.LeaseTTL)).Int64Slice()
 	if err != nil {
-		return LeaseResult{}, err
+		return LeaseResult{}, fmt.Errorf("store: lease renewal: %w", err)
 	}
-	var set *redis.StatusCmd
-	var now *redis.TimeCmd
-	_, _ = node.Pipelined(ctx, func(p redis.Pipeliner) error {
-		set = p.SetArgs(ctx, ref.leaseKey(), "1", redis.SetArgs{TTL: s.cfg.LeaseTTL, Get: true})
-		now = p.Time(ctx)
-		return nil
-	})
-	var res LeaseResult
-	switch err := set.Err(); {
-	case err == redis.Nil:
-		res.Missing = true
-	case err != nil:
-		return LeaseResult{}, fmt.Errorf("store: lease SET: %w", err)
+	if len(vals) != 2 {
+		return LeaseResult{}, fmt.Errorf("store: lease script returned %v", vals)
 	}
-	t, err := now.Result()
-	if err != nil {
-		return LeaseResult{}, fmt.Errorf("store: lease TIME: %w", err)
-	}
-	res.RedisNowMs = t.UnixMilli()
+	res := LeaseResult{Missing: vals[0] == 1, RedisNowMs: vals[1]}
 	res.IndexErr = s.rdb.ZAdd(ctx, epochsKey, redis.Z{Score: float64(res.RedisNowMs), Member: ref.member()}).Err()
 	return res, nil
 }
