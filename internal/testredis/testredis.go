@@ -50,7 +50,7 @@ func NewReplica(t testing.TB) *redis.Client {
 	RequireReal(t)
 	addr := os.Getenv("GOIM_TEST_REDIS_REPLICA")
 	if addr == "" {
-		addr = "127.0.0.1:6380"
+		addr = "127.0.0.1:16380"
 	}
 	return dial(t, addr)
 }

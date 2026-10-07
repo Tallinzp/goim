@@ -1,10 +1,11 @@
 # Real Redis for the tests that skip at Tier 1a: one primary and one replica (Revoke WAIT needs a replica).
 # Tier 2 host only (not the dev machine): `make redis-up`, then `make test-redis`.
+name: goim-test-redis
 services:
   redis-primary:
     image: redis:7.4
     command: ["redis-server", "--port", "6379", "--save", "", "--appendonly", "no"]
-    ports: ["127.0.0.1:6379:6379"]
+    ports: ["127.0.0.1:${GOIM_REDIS_PORT:-16379}:6379"]
     healthcheck:
       test: ["CMD", "redis-cli", "-p", "6379", "ping"]
       interval: 1s
@@ -13,7 +14,7 @@ services:
     image: redis:7.4
     command: ["redis-server", "--port", "6380", "--save", "", "--appendonly", "no",
               "--replicaof", "redis-primary", "6379", "--enable-debug-command", "yes"]
-    ports: ["127.0.0.1:6380:6380"]
+    ports: ["127.0.0.1:${GOIM_REDIS_REPLICA_PORT:-16380}:6380"]
     depends_on:
       redis-primary:
         condition: service_healthy
