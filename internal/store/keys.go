@@ -15,6 +15,13 @@ const epochsKey = "gwepochs"
 func sessKey(uid string) string { return "sess:{" + uid + "}" }
 func revKey(uid string) string  { return "rev:{" + uid + "}" }
 
+// revDeletedKey holds the entries one Revoke request deleted, so a re-run of
+// that request returns them again for the kicks (PI-2). The request is
+// (uid, scope, before_ms); before_ms is fixed by the account service (PI-4).
+func revDeletedKey(uid, scope string, beforeMs int64) string {
+	return "revdel:{" + uid + "}:" + scope + ":" + strconv.FormatInt(beforeMs, 10)
+}
+
 // EpochRef names one gateway instance: gateway_id (pod name) plus its boot epoch.
 type EpochRef struct {
 	Gateway string

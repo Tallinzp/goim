@@ -17,10 +17,11 @@ type SlotRef struct {
 
 // SlotState is what Logic observes before applying Reconcile rules 1–4.
 type SlotState struct {
-	Raw      string         // stored value; "" if the field is absent
-	Stored   *session.Entry // decoded Raw; nil if absent
-	MarkerMs int64          // effective revocation marker: max(rev[*], rev[field]), 0 if none
-	Err      error
+	Raw       string         // stored value; "" if the field is absent
+	Stored    *session.Entry // decoded Raw; nil if absent or StoredErr is set
+	StoredErr error          // Raw did not decode (PI-3); Raw still works as CASReq.ExpectRaw
+	MarkerMs  int64          // effective revocation marker: max(rev[*], rev[field]), 0 if none
+	Err       error          // outcome unknown: nothing else in the state is valid
 }
 
 func (r SlotRef) validate() error {
@@ -62,11 +63,12 @@ func readSlot(get *redis.StringCmd, mark *redis.SliceCmd) SlotState {
 	case err != nil:
 		return SlotState{Err: err}
 	default:
-		e, err := session.Decode(raw)
-		if err != nil {
-			return SlotState{Err: err}
+		st.Raw = raw
+		if e, err := session.Decode(raw); err != nil {
+			st.StoredErr = err
+		} else {
+			st.Stored = &e
 		}
-		st.Raw, st.Stored = raw, &e
 	}
 	vals, err := mark.Result()
 	if err != nil {

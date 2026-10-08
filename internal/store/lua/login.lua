@@ -4,7 +4,8 @@
 -- ARGV[3] device_id         ARGV[4] conn_seq
 -- ARGV[5] recv_ms           ARGV[6] tok_iat_ms
 -- ARGV[7] login_deadline_ms ARGV[8] sess TTL ms
--- Returns {code, stored value or ''}; code ALREADY means this exact entry is already stored.
+-- Returns {code, stored value or ''}; code ALREADY means this exact entry is already stored,
+-- REPAIRED that the stored value was unreadable and has been overwritten.
 -- epoch and conn_id are uint64 and are never converted to Lua numbers (doubles).
 local function split(s)
   local out = {}
@@ -42,7 +43,12 @@ local stored = redis.call('HGET', KEYS[1], field)
 if stored then
   local s = split(stored)
   local s_seq, s_login = tonumber(s[5]), tonumber(s[6])
-  if s[4] == ARGV[3] then
+  if #s ~= 7 or s_seq == nil or s_login == nil then
+    -- Unreadable (an older format, or written by hand): it cannot be a valid
+    -- owner, so this login replaces it with no kick. Failing here instead
+    -- would block every login to the slot until the sess TTL runs out.
+    code = 'REPAIRED'
+  elseif s[4] == ARGV[3] then
     if tonumber(ARGV[4]) > s_seq then
       code = 'REPLACED'
     elseif recv <= s_login + deadline then

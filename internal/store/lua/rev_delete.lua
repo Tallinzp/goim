@@ -1,7 +1,11 @@
 -- Revoke step 2: delete the sess fields in scope whose token predates their effective marker.
--- A field written by a login with a newer token (after the marker) is kept.
--- KEYS[1] sess:{uid}; KEYS[2] rev:{uid}; ARGV[1] '*' (every field) or one 'appid:platform'.
--- Returns {field, value, field, value, ...} of the deleted entries, for the kicks.
+-- A field written by a login with a newer token (after the marker) is kept; a value
+-- whose tok_iat is not a number cannot be a valid session and is deleted.
+-- KEYS[1] sess:{uid}; KEYS[2] rev:{uid}; KEYS[3] revdel:{uid}:<scope>:<before_ms>.
+-- ARGV[1] '*' (every field) or one 'appid:platform'; ARGV[2] KEYS[3] TTL ms.
+-- Every deleted entry is also kept in KEYS[3], so a re-run of the same request
+-- (a lost reply, or the account service's retry) returns it again for the kicks (PI-2).
+-- Returns {field, value, ...}: every entry this request has deleted so far.
 local function split(s)
   local out = {}
   for part in string.gmatch(s .. '|', '([^|]*)|') do out[#out + 1] = part end
@@ -25,13 +29,17 @@ if ARGV[1] == '*' then
 else
   fields = {ARGV[1]}
 end
-local out = {}
+local deleted = false
 for _, f in ipairs(fields) do
   local v = redis.call('HGET', KEYS[1], f)
-  if v and tonumber(split(v)[7]) < marker(f) then
-    redis.call('HDEL', KEYS[1], f)
-    out[#out + 1] = f
-    out[#out + 1] = v
+  if v then
+    local iat = tonumber(split(v)[7] or '')
+    if iat == nil or iat < marker(f) then
+      redis.call('HDEL', KEYS[1], f)
+      redis.call('HSET', KEYS[3], f, v)
+      deleted = true
+    end
   end
 end
-return out
+if deleted then redis.call('PEXPIRE', KEYS[3], ARGV[2]) end
+return redis.call('HGETALL', KEYS[3])

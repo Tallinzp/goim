@@ -41,12 +41,29 @@ type Store struct {
 	// groupOf names the node group of a key; calls in one group share a
 	// pipeline. It is masterAddr in production; tests replace it.
 	groupOf func(ctx context.Context, key string) string
+	// masterFor returns the node that owns key (nodeFor in production), and
+	// reloadSlots asks the cluster client to reload its slot map (nil for a
+	// single node). Revoke uses them to re-route after a failover (PI-6);
+	// tests replace both.
+	masterFor   func(ctx context.Context, key string) (*redis.Client, error)
+	reloadSlots func(ctx context.Context)
+	rerouteWait time.Duration // how long Revoke waits for a new master
 }
+
+// rerouteWait's default, and how often the slot map is re-read meanwhile.
+const (
+	defaultRerouteWait = 2 * time.Second
+	reroutePoll        = 100 * time.Millisecond
+)
 
 // New returns a Store. rdb must be a *redis.ClusterClient or a *redis.Client.
 func New(rdb redis.UniversalClient, cfg Config) *Store {
-	s := &Store{rdb: rdb, cfg: cfg}
+	s := &Store{rdb: rdb, cfg: cfg, rerouteWait: defaultRerouteWait}
 	s.groupOf = s.masterAddr
+	s.masterFor = s.nodeFor
+	if c, ok := rdb.(*redis.ClusterClient); ok {
+		s.reloadSlots = c.ReloadState
+	}
 	return s
 }
 

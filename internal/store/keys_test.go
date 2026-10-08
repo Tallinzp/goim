@@ -23,6 +23,12 @@ func TestKeysShareSlotsWhereScriptsNeedIt(t *testing.T) {
 	if hashTag(sessKey("10086")) != hashTag(revKey("10086")) {
 		t.Fatal("sess:{uid} and rev:{uid} must share a slot: the login and Reconcile Lua read both")
 	}
+	if hashTag(revDeletedKey("10086", "im:pc", 2000)) != hashTag(sessKey("10086")) {
+		t.Fatal("revdel:{uid}:... must share the slot of sess:{uid}: rev_delete.lua writes it")
+	}
+	if got, want := revDeletedKey("10086", ScopeAll, 2000), "revdel:{10086}:*:2000"; got != want {
+		t.Fatalf("revDeletedKey = %q, want %q", got, want)
+	}
 	r := EpochRef{Gateway: "gw-17", Epoch: 1<<63 + 1}
 	if hashTag(r.leaseKey()) != hashTag(r.connsKey()) || hashTag(r.leaseKey()) != hashTag(r.sweepKey()) {
 		t.Fatal("per-epoch keys must share a slot")

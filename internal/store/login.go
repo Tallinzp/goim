@@ -25,6 +25,11 @@ const (
 	// success; the kick that run reported is lost, and Reconcile's not_owner
 	// closes the old connection within one cycle.
 	LoginAlready LoginCode = "ALREADY"
+	// LoginRepaired: the stored value was unreadable even to the Lua (not 7
+	// fields, or conn_seq / login_ms not numbers), so it cannot be a valid
+	// owner. The login was written over it with no kick; PrevErr is set.
+	// Logic answers it like WRITTEN and counts it.
+	LoginRepaired LoginCode = "REPAIRED"
 )
 
 // LoginReq is one Login. Entry.LoginMs is the gateway's recv_ms.
@@ -34,12 +39,17 @@ type LoginReq struct {
 	Entry session.Entry
 }
 
-// LoginResult is the outcome of one LoginReq. Prev is the stored entry the
-// script saw (nil if the slot was empty or the result is EXPIRED/REVOKED).
+// LoginResult is the outcome of one LoginReq. Err is set only when the outcome
+// is unknown (transport failure, invalid request, malformed reply); if Err is
+// nil, Code is what the script did. Prev is the stored entry the script saw
+// (nil if it returned none). If that entry did not decode, Prev is nil and
+// PrevErr says why: follow Code, skip the kick (Reconcile closes the old
+// connection) and count it (PI-3).
 type LoginResult struct {
-	Code LoginCode
-	Prev *session.Entry
-	Err  error
+	Code    LoginCode
+	Prev    *session.Entry
+	PrevErr error
+	Err     error
 }
 
 var loginScript = mustScript("login.lua")
@@ -99,7 +109,7 @@ func parseLogin(vals []any, err error) LoginResult {
 	if prev != "" {
 		e, err := session.Decode(prev)
 		if err != nil {
-			res.Err = err
+			res.PrevErr = err
 			return res
 		}
 		res.Prev = &e

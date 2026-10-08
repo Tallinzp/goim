@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Tallinzp/goim/internal/session"
 	"github.com/Tallinzp/goim/internal/testredis"
 )
 
@@ -55,7 +56,7 @@ func TestRevokeDeletesOnlyAffectedFields(t *testing.T) {
 		write(uid, "im:mobile", 1, 1000)
 		write(uid, "im:pc", 2, 1000)
 		markScript(t, s, uid, ScopeAll, 2000)
-		got, err := s.deleteRevoked(ctx, uid, ScopeAll)
+		got, err := s.deleteRevoked(ctx, uid, ScopeAll, 2000)
 		if err != nil || len(got) != 2 {
 			t.Fatalf("deleteRevoked = %+v, %v; want 2 deleted", got, err)
 		}
@@ -68,7 +69,7 @@ func TestRevokeDeletesOnlyAffectedFields(t *testing.T) {
 		write(uid, "im:mobile", 1, 1000)
 		write(uid, "im:pc", 2, 1000)
 		markScript(t, s, uid, "im:pc", 2000)
-		got, err := s.deleteRevoked(ctx, uid, "im:pc")
+		got, err := s.deleteRevoked(ctx, uid, "im:pc", 2000)
 		if err != nil || len(got) != 1 || got[0].Field != "im:pc" || got[0].Entry.ConnID != 2 {
 			t.Fatalf("deleteRevoked = %+v, %v", got, err)
 		}
@@ -82,7 +83,7 @@ func TestRevokeDeletesOnlyAffectedFields(t *testing.T) {
 		write(uid, "im:mobile", 1, 1000)
 		write(uid, "im:pc", 2, 3000)
 		markScript(t, s, uid, ScopeAll, 2000)
-		got, err := s.deleteRevoked(ctx, uid, ScopeAll)
+		got, err := s.deleteRevoked(ctx, uid, ScopeAll, 2000)
 		if err != nil || len(got) != 1 || got[0].Entry.ConnID != 1 {
 			t.Fatalf("deleteRevoked = %+v, %v; want only conn 1", got, err)
 		}
@@ -93,6 +94,11 @@ func TestRevokeDeletesOnlyAffectedFields(t *testing.T) {
 	t.Run("invalid scope is rejected before Redis", func(t *testing.T) {
 		if _, err := s.Revoke(ctx, testredis.UID(), "im", 1); err == nil {
 			t.Fatal("scope without platform accepted")
+		}
+	})
+	t.Run("before_ms must be positive", func(t *testing.T) {
+		if _, err := s.Revoke(ctx, testredis.UID(), ScopeAll, 0); err == nil {
+			t.Fatal("before_ms 0 accepted")
 		}
 	})
 }
@@ -128,8 +134,9 @@ func TestRevokeEndToEnd(t *testing.T) {
 	if ttl := rdb.PTTL(ctx, revKey(uid)).Val(); ttl < DefaultConfig().SessTTL-time.Minute {
 		t.Fatalf("rev TTL = %v", ttl)
 	}
-	if _, err := s.Revoke(ctx, uid, ScopeAll, 2000); err != nil { // idempotent retry
-		t.Fatal(err)
+	again, err := s.Revoke(ctx, uid, ScopeAll, 2000) // the account service's retry
+	if err != nil || len(again) != 1 || again[0].Entry != e {
+		t.Fatalf("retry = %+v, %v; want the first attempt's deletion again (PI-2)", again, err)
 	}
 }
 
@@ -168,5 +175,76 @@ func TestRevokeFailsWhenReplicaDoesNotAck(t *testing.T) {
 	got, err := s.Revoke(ctx, uid, ScopeAll, 2000) // the account service's retry
 	if err != nil || len(got) != 1 {
 		t.Fatalf("retry: %+v, %v", got, err)
+	}
+}
+
+// PI-2: a re-run of the delete step (go-redis re-sends after a lost reply, or
+// the account service retries Revoke with the same before_ms) returns every
+// entry the request deleted, so its kicks are not lost.
+func TestRevokeReRunReturnsTheSameDeletions(t *testing.T) {
+	s, rdb := newStore(t)
+	uid := testredis.UID()
+	a, b := entry(1, "d", 1, nowMs(t, s)), entry(2, "d", 1, nowMs(t, s))
+	rdb.HSet(ctx, sessKey(uid), "im:mobile", a.Encode(), "im:pc", b.Encode())
+	markScript(t, s, uid, ScopeAll, 2000)
+
+	first, err := s.deleteRevoked(ctx, uid, ScopeAll, 2000)
+	if err != nil || len(first) != 2 {
+		t.Fatalf("first run = %+v, %v", first, err)
+	}
+	again, err := s.deleteRevoked(ctx, uid, ScopeAll, 2000)
+	if err != nil || len(again) != 2 || again[0] != first[0] || again[1] != first[1] {
+		t.Fatalf("re-run = %+v, %v; want %+v", again, err, first)
+	}
+	if again[0].Field != "im:mobile" || again[0].Entry != a || again[1].Entry != b {
+		t.Fatalf("re-run = %+v; want sorted by field with the deleted entries", again)
+	}
+	ttl := rdb.PTTL(ctx, revDeletedKey(uid, ScopeAll, 2000)).Val()
+	if ttl <= 0 || ttl > revDeletedTTL {
+		t.Fatalf("revdel TTL = %v, want (0, %v]", ttl, revDeletedTTL)
+	}
+
+	// A different request (another before_ms) does not inherit those kicks.
+	markScript(t, s, uid, ScopeAll, 3000)
+	if other, err := s.deleteRevoked(ctx, uid, ScopeAll, 3000); err != nil || len(other) != 0 {
+		t.Fatalf("another request = %+v, %v; want nothing", other, err)
+	}
+	// A request that deleted nothing leaves no key behind.
+	if rdb.Exists(ctx, revDeletedKey(uid, ScopeAll, 3000)).Val() != 0 {
+		t.Fatal("a request that deleted nothing must not write a revdel key")
+	}
+}
+
+// PI-3: a stored value that Go cannot decode is still deleted and reported,
+// with EntryErr set and Err nil; the other fields are unaffected. A value whose
+// tok_iat is not a number cannot be a valid session and is deleted too.
+func TestRevokeReportsUndecodableEntries(t *testing.T) {
+	s, rdb := newStore(t)
+	uid := testredis.UID()
+	good := entry(1, "d", 1, nowMs(t, s))
+	rdb.HSet(ctx, sessKey(uid),
+		"im:mobile", good.Encode(),
+		"im:pc", "gw-1|not-a-number|1|d|1|1|1000", // Lua reads tok_iat; Go rejects the epoch
+		"im:pad", "garbage") // no tok_iat at all
+	markScript(t, s, uid, ScopeAll, 2000)
+
+	got, err := s.deleteRevoked(ctx, uid, ScopeAll, 2000)
+	if err != nil || len(got) != 3 {
+		t.Fatalf("deleteRevoked = %+v, %v; want 3 deleted and no error", got, err)
+	}
+	byField := map[string]Revoked{}
+	for _, r := range got {
+		byField[r.Field] = r
+	}
+	if r := byField["im:mobile"]; r.EntryErr != nil || r.Entry != good {
+		t.Fatalf("im:mobile = %+v", r)
+	}
+	for _, f := range []string{"im:pc", "im:pad"} {
+		if r := byField[f]; r.EntryErr == nil || r.Entry != (session.Entry{}) {
+			t.Fatalf("%s = %+v; want EntryErr set and a zero Entry", f, r)
+		}
+	}
+	if n := rdb.HLen(ctx, sessKey(uid)).Val(); n != 0 {
+		t.Fatalf("%d fields left", n)
 	}
 }
