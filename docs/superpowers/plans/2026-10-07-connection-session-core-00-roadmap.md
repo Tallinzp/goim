@@ -10,8 +10,8 @@
 |---|---|---|---|---|---|
 | 1 | `2026-10-07-connection-session-core-01-session-store.md` | Repo skeleton, Tier 1a test Redis, `internal/session` (entry format, ordering rule), `internal/store` (every Redis key and Lua script: login, logout, revoke, Reconcile compare-and-set, ReconcileEnd delete, lease, sweeper ops) | — | *Redis schema*, *Login Lua*, *Logout Lua*, *Sweeper* (store side), *Revoke* (store side), *Reconcile handling* (store side) | Tasks 1–10 implemented (Task 10: per-node Login/Logout results, R5S-O1, commit 9c8519e) |
 | 2 | `2026-10-08-connection-session-core-02-logic.md` | `api/internal.proto` + generated code; JWT/JWKS verification with unknown-`kid` handling; `cmd/devtoken`; Logic RPCs (`Login`, `Logout`, `GatewayLease` on its own pool, `EpochEnded`, `Reconcile` rules 1–4, `ReconcileEnd`, `Revoke`); hardened Kick client; sweeper loop and mass-stale guard; readiness; Logic metrics; `cmd/logic` | 1 | *Logic*, *Sweeper*, *Auth*, *Observability* (Logic side) | implemented 2026-10-08 on `feat/plan2-logic` (13 tasks, Native); final review: 1 Important + 1 re-graded Minor fixed, 7 minors deferred (Plan 2 Execution Notes) |
-| 3 | Gateway core | Transport-independent gateway: loopState and `conn_id`, timing wheel, connection state machine on a fake transport, admission (connection cap, pending cap, Login-queue cap), Login batching, Logout fence (a)(b)(c) and retry queue, lease loop, Reconcile pass controller, Kick server, readiness, drain; gateway metrics; layer-rule import test (no gateway package imports `internal/store`) | 2 (proto) | *Gateway* (all but the TCP transport), *Timers* | not written |
-| 4 | TCP transport | Frame codec (6-byte header), Noise NK with `key_id` prologue, handshake limiter (semaphore + token bucket), gnet v2.10.0 integration, gnet loop-ownership `-race` test, `cmd/gateway` | 3 | *Client protocol*, *Transport seam*, *Noise key runbook* | not written |
+| 3 | `2026-10-08-connection-session-core-03-gateway-core.md` | `api/client.proto` (moved from Plan 4, choice #24); transport-independent gateway: loopState and `conn_id`, timing wheel, connection state machine on a fake transport, admission (connection cap, pending cap, Login-queue cap), Login batching, Logout fence (a)(b)(c) and retry queue, lease loop, Reconcile pass controller, Kick server, readiness, drain; gateway metrics; layer-rule import test (no gateway package imports `internal/store`) | 2 (proto) | *Gateway* (all but the TCP transport), *Timers*, *Client protocol* (bodies) | written 2026-10-08 (12 tasks, prototyped and replayed); choices #24–#37 decided 2026-10-08, all as proposed; execution: Native on `feat/plan3-gateway` |
+| 4 | TCP transport | Frame codec (6-byte header; message bodies are Plan 3's `api/client.proto`), Noise NK with `key_id` prologue, handshake limiter (semaphore + token bucket), gnet v2.10.0 integration, gnet loop-ownership `-race` test, `cmd/gateway` | 3 | *Client protocol*, *Transport seam*, *Noise key runbook* | not written |
 | 5 | Client SDK and Tier 1b race suite | Go client SDK (reconnect rules, retryable-reject counter, jitter distributions), scripted test client, fault-injection hooks (Logic delay/drop, Kick drop, fake gateway clock), `deploy/compose` with 4 gateways, test timing profile and ratio checks, every Tier 1b race integration test | 2, 3, 4 | *Client SDK rules*, *Verification → Race integration tests*, *Test execution model* | not written |
 | 6 | Load and release tests | `cmd/loadgen`, Tier 2 scenarios (a, b1, b2, b-stress, c, storm, floods, slowed Logic, Redis failover, `gwconns` shard load), Tier 3 rolling restart with `TARGET=local|cloud`, host guard, JSON results, `deploy/k8s` manifests | 5 | *Verification → Load tests*, *Tier 3 target*, *Deployment* | not written |
 
@@ -60,6 +60,23 @@ Choices Plan 2 makes, **decided 2026-10-08, all as proposed, #22 amended at revi
 22. Kick: workers on demand up to 64 per target, retire after 1m idle; one connection per gateway pod name; retries 10s apart on `UNAVAILABLE`/`DEADLINE_EXCEEDED` only; `target_lease=unknown` when the lease can't be read. A drop is labelled from the lease cache only (`unknown` if nothing is cached), so `Kick` never reads Redis on its caller's goroutine.
 23. One ~1s lease cache serves Kick retries, Reconcile rules 3/4 and the cross-check; Logic's own renewals and `EpochEnded` update it.
 
+Choices Plan 3 makes, **decided 2026-10-08, all as proposed** (#34 kept latched: a single-pod Logic partition answers `Busy` and clients retry elsewhere) (details in Plan 3, *Implementation choices this plan makes*):
+
+24. `api/client.proto` is built in Plan 3 (the core decodes `LoginReq` and encodes the replies); `Platform` and `KickReason` duplicated with a parity test; `ReconnectReason` adds `LOCAL_TRIGGER`.
+25. Transport seam: `Loop.Execute(func()) error`, `Link{Send, Close}`, core calls `Open`/`HandshakeDone`/`Frame`/`Closed` on the loop; no code relies on `Execute` order (gnet v2.10.0 can reorder); reject reason `draining`.
+26. Rejected, cancelled-before-send and dropped-at-deadline Logins need no Logout; a dropped one gets `Error{EXPIRED}` (label `expired_queued`).
+27. No definitive reply: `Busy` (1–3s) and close; the fenced Logout names the token's unverified `sub`.
+28. Lease trigger: `missing`, or a success ending ≥ one lease TTL after the previous success started (gateway `LeaseTTL` = Logic's); errors alone don't trigger; first success ignored.
+29. A trigger during a triggered pass runs one more triggered pass after it.
+30. Chunks of 200, 4 in flight, triggered 5k/s, periodic = ONLINE ÷ (0.9 × cycle) in [10/s, 5k/s]; `sent_ms` stamped on the loop; chunk deadline on the wheel; RPC error waits for the deadline; late reply only Kicks; re-queue after the loop reports resolution.
+31. `ReconcileEnd` deadline 2 × tracked ÷ 10k/s + 10s; retries 1s doubling ≤ 10s for 60s; no `ReconcileEnd` if any loop's fragment is missing.
+32. Logout: batches 200/5ms, 4 RPCs, 5s; per-batch retries 1s doubling ≤ 10s for 60s; queue = cap; full → drop and untrack.
+33. 16 Login RPCs; `LoginQueueCap` 8192 until Plan 6 measures it; `PendingCap` 100k.
+34. Readiness latches once Ready; Kick :9100, admin :9090; Logic channels plaintext, `round_robin`, keepalive 20s/5s.
+35. Drain: Reconnect in 1s steps over 60s (also to connections that come ONLINE meanwhile), Reconcile stopped, close the rest, wait ≤ login_deadline + 1s + 10s for nothing tracked, `EpochEnded` ×3; grace period ≥ 90s.
+36. Metrics `goim_gateway_*`, with `closes_total{reason}` and Login results `busy`, `expired_queued`, `error`.
+37. Request IDs `<epoch hex>-<seq>` (≤ 37 bytes).
+
 ## Invariant index (R4M-10)
 
 Every race, consistency-contract row and spec test maps to the plan and test that pin it. Plan 1's test names are final; names for plans 2–6 are planned and are fixed when each plan is written.
@@ -71,21 +88,21 @@ Every race, consistency-contract row and spec test maps to the plan and test tha
 | 1 Delayed disconnect | P1 `TestLogoutCompareAndDelete` (race 1 subtest) | P5 race 1 |
 | 2 Delayed login, same device | P1 `TestLoginTable` (STALE rows), `TestLoginExpired` | P5 race 2 |
 | 3 Delayed login, other device | P1 `TestLoginTable` (SUPERSEDED row) | P5 race 3 |
-| 4 Zombie gateway, same pod name | P1 `TestSweepDeletesOnlyDeadEpochFields`; P3 Kick epoch-mismatch test | P5 race 4 |
-| 5 Close while Login in flight | P3 Logout fence (a) test | P5 race 5 |
-| 6 No definitive reply, Redis written | P3 Logout fence (b) test | P5 race 6, both orders, Logic crash |
-| 7 Logout lost, gateway alive | P1 `TestDeleteUntracked`; P2 `TestReconcileEndDeletesOnlyUntrackedGhosts` | P5 dropped-Logout repair |
-| 8 Kick lost or early | P2 `TestKickRetriesOnlyWhileLeaseLive`, `TestKickDropDoesNotReadRedis`, `TestKickNewEpochOfSamePodGetsItsOwnConnection`, `TestReconcileKicksWrittenOverrideWhenChunkFails`; P3 kick-pending test | P5 Kick tests |
+| 4 Zombie gateway, same pod name | P1 `TestSweepDeletesOnlyDeadEpochFields`; P3 `TestKickForAnotherEpochOrUnknownConnIsIgnored` | P5 race 4 |
+| 5 Close while Login in flight | P3 `TestFenceAHoldsLogoutUntilTheLoginReply`, `TestCloseWhileQueuedNeedsNoLogout` | P5 race 5 |
+| 6 No definitive reply, Redis written | P3 `TestFenceBReleasesLogoutAfterLoginDeadlinePlusOneSecond`, `TestLoginEntryWithoutResultByItsTimeoutGetsBusyThenFencedLogout`, `TestLoginStreamEndingEarlyIsNoDefinitiveReply` | P5 race 6, both orders, Logic crash |
+| 7 Logout lost, gateway alive | P1 `TestDeleteUntracked`; P2 `TestReconcileEndDeletesOnlyUntrackedGhosts`; P3 `TestLogoutIsDroppedWhenItsRetryBudgetRunsOut`, `TestE2EReconcileRestoresAndDeletesGhosts` | P5 dropped-Logout repair |
+| 8 Kick lost or early | P2 `TestKickRetriesOnlyWhileLeaseLive`, `TestKickDropDoesNotReadRedis`, `TestKickNewEpochOfSamePodGetsItsOwnConnection`, `TestReconcileKicksWrittenOverrideWhenChunkFails`; P3 `TestKickDuringAuthPendingIsAppliedWhenTheLoginReplyArrives`, `TestNotOwnerIsKickedWithItsReason` | P5 Kick tests |
 | 9 Two devices kick each other | P5 SDK: no reconnect after `KICKED_BY_OTHER_DEVICE` | — |
 | 10 Shared device_id | P1 `TestLoginTable` (REPLACED row); P5 SDK: no reconnect after `REPLACED` | P5 race 10 |
 | 11 Counter regression | P1 `TestLoginTable` (regression and STALE rows), `TestChunkWins`; P2 `TestReconcileRule3RegressedCounter` (miniredis at Tier 1a, real Redis at Tier 2) | — |
 | 12 Swept while healthy | P1 `TestRenewLease` (missing after DEL); P2 `TestGuardSurvivesTenSecondRhythmWithJitter`, `TestGuardResetsWhenRenewalsStop`, `TestSweeperAbortsWhenEpochRenews`, `TestSweeperHoldsWhenNobodyRenews`, `TestSweeperSkipsEpochWhoseLeaseExists` | P5 sweep-abort, 90s outages, Logic restart, forced sweep |
-| 13 Two loops generating conn_ids | P3 conn_id test; P4 gnet loop-ownership `-race` test | — |
-| 14 Close during a Reconcile pass | P3 Logout fence (c) test | P5 race 14 |
+| 13 Two loops generating conn_ids | P3 `TestConnIDsAreUniqueAndCarryTheWorkerID`; P4 gnet loop-ownership `-race` test | — |
+| 14 Close during a Reconcile pass | P3 `TestFenceCHoldsLogoutUntilTheChunkIsResolved`, `TestFailedChunkIsResolvedAtSentMsPlusDeadlinePlusOneSecond` | P5 race 14 |
 | 15 Write lost in failover | P1 `TestCompareAndSet`, `TestChunkWins`; P2 `TestReconcileRule3AfterLostWrite`, `TestReconcileRule3TieKeepsStored` | P6 Redis failover (Tier 2) |
-| 16 Login in flight / Logout dropped around a pass | P1 `TestDeleteUntracked` (`login_ms ≥ as_of`, tracked); P3 tracked-set collection after `as_of_ms` | P5 race 16, ReconcileEnd tests |
+| 16 Login in flight / Logout dropped around a pass | P1 `TestDeleteUntracked` (`login_ms ≥ as_of`, tracked); P3 `TestReconcileEndCarriesTheTrackedSetCollectedAfterAsOf`, `TestIncompleteTrackedSetSendsNoReconcileEnd` | P5 race 16, ReconcileEnd tests |
 | 17 Slot logout, Kick lost | P1 `TestRevokeDeletesOnlyAffectedFields`, `TestLoginRevoked`, `TestCompareAndSet` (slot-scope subtests); P2 `TestReconcileRule1Revoked`, `TestReconcileConcurrentChange` | P5 slot-scoped Revoke |
-| 18 Client Logout during a chunk | P3 client Logout through fence (c) | P5 race 18 |
+| 18 Client Logout during a chunk | P3 `TestClientLogoutDuringAChunkGetsLogoutRespAtOnce` | P5 race 18 |
 
 ### Consistency contract rows
 
@@ -94,7 +111,7 @@ Every race, consistency-contract row and spec test maps to the plan and test tha
 | Ghost after a dropped Logout, ≤ 1 cycle | P1 `TestDeleteUntracked`; P5 dropped-Logout repair |
 | Old owner still connected after replace/revoke, ≤ 1 cycle (revocation within the 30d marker TTL) | P1 `TestRevokeMarkerScriptIsMaxIdempotentAndRefreshesTTL`; P2 `TestReconcileRule1Revoked`, `TestReconcileRule3StoredNewerIsNotOwner`; P5 Kick-dropped and revocation-outlives-token tests |
 | Dead gateway's entries: invalid after lease TTL, deleted after 2 × TTL + guard + sweep | P1 `TestSweepDeletesOnlyDeadEpochFields`, `TestEndEpochAndLeasesExist`; P2 `TestSweeperSweepsDeadEpochAfterGuard`, `TestSweeperEndedEpochIsExempt`; P5 gateway crash → sweep |
-| Live connection missing from Redis, ≤ 1 cycle / ~1 min after `missing` | P1 `TestCompareAndSet`, `TestRenewLease`; P5 forced sweep, stale lease observation |
+| Live connection missing from Redis, ≤ 1 cycle / ~1 min after `missing` | P1 `TestCompareAndSet`, `TestRenewLease`; P3 `TestFirstLeaseMissingIsIgnoredAndALaterOneTriggersAPass`, `TestRenewalAfterFailuresForALeaseTTLTriggersAPass`, `TestE2EReconcileRestoresAndDeletesGhosts`; P5 forced sweep, stale lease observation |
 | Healthy session reads invalid during an outage | P5 Redis paused 90s, gateway→Logic blocked 90s |
 
 ### Tiers
