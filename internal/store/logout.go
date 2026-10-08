@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/Tallinzp/goim/internal/session"
+	"github.com/redis/go-redis/v9"
 )
 
 // LogoutReq deletes UID's Field only if it still belongs to Gateway|Epoch|ConnID.
@@ -23,24 +24,30 @@ type LogoutResult struct {
 
 var logoutScript = mustScript("logout.lua")
 
-// Logout runs the compare-and-delete for a batch, pipelined, in request order.
-func (s *Store) Logout(ctx context.Context, reqs []LogoutReq) []LogoutResult {
-	out := make([]LogoutResult, len(reqs))
+// LogoutEach runs the compare-and-delete for a batch, pipelined per owning
+// master, and calls done once per request as soon as its group returns.
+func (s *Store) LogoutEach(ctx context.Context, reqs []LogoutReq, done func(i int, r LogoutResult)) {
 	calls := make([]scriptCall, 0, len(reqs))
 	idx := make([]int, 0, len(reqs))
 	for i, r := range reqs {
 		if err := validLogout(r); err != nil {
-			out[i].Err = err
+			done(i, LogoutResult{Err: err})
 			continue
 		}
 		owner := session.Entry{Gateway: r.Gateway, Epoch: r.Epoch, ConnID: r.ConnID}.OwnerPrefix()
 		calls = append(calls, scriptCall{keys: []string{sessKey(r.UID)}, args: []any{r.Field, owner}})
 		idx = append(idx, i)
 	}
-	for j, cmd := range s.runBatch(ctx, logoutScript, calls) {
+	s.runEach(ctx, logoutScript, calls, func(j int, cmd *redis.Cmd) {
 		n, err := cmd.Int()
-		out[idx[j]] = LogoutResult{Deleted: n == 1, Err: err}
-	}
+		done(idx[j], LogoutResult{Deleted: n == 1, Err: err})
+	})
+}
+
+// Logout is LogoutEach collected in request order.
+func (s *Store) Logout(ctx context.Context, reqs []LogoutReq) []LogoutResult {
+	out := make([]LogoutResult, len(reqs))
+	s.LogoutEach(ctx, reqs, func(i int, r LogoutResult) { out[i] = r })
 	return out
 }
 

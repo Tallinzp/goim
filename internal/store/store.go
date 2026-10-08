@@ -6,6 +6,7 @@ import (
 	"context"
 	"embed"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -37,11 +38,16 @@ const sweepClaimTTL = 300 * time.Second
 type Store struct {
 	rdb redis.UniversalClient
 	cfg Config
+	// groupOf names the node group of a key; calls in one group share a
+	// pipeline. It is masterAddr in production; tests replace it.
+	groupOf func(ctx context.Context, key string) string
 }
 
 // New returns a Store. rdb must be a *redis.ClusterClient or a *redis.Client.
 func New(rdb redis.UniversalClient, cfg Config) *Store {
-	return &Store{rdb: rdb, cfg: cfg}
+	s := &Store{rdb: rdb, cfg: cfg}
+	s.groupOf = s.masterAddr
+	return s
 }
 
 //go:embed lua/*.lua
@@ -84,6 +90,49 @@ func (s *Store) runBatch(ctx context.Context, sc *redis.Script, calls []scriptCa
 		}
 	}
 	return cmds
+}
+
+// masterAddr returns the address of the master that owns key, or "" on a
+// single node or when the owner can't be resolved (the cluster client then
+// routes those calls as usual).
+func (s *Store) masterAddr(ctx context.Context, key string) string {
+	c, ok := s.rdb.(*redis.ClusterClient)
+	if !ok {
+		return ""
+	}
+	n, err := c.MasterForKey(ctx, key)
+	if err != nil {
+		return ""
+	}
+	return n.Options().Addr
+}
+
+// runEach is runBatch split by owning master (R5S-O1): each group is
+// pipelined on its own, concurrently, and done(j, cmd) runs for its calls as
+// soon as that group returns, so a slow or failing-over shard delays only its
+// own calls. done may run on several goroutines at once. runEach returns
+// after every done call.
+func (s *Store) runEach(ctx context.Context, sc *redis.Script, calls []scriptCall, done func(j int, cmd *redis.Cmd)) {
+	groups := map[string][]int{}
+	for j, c := range calls {
+		g := s.groupOf(ctx, c.keys[0])
+		groups[g] = append(groups[g], j)
+	}
+	var wg sync.WaitGroup
+	for _, js := range groups {
+		wg.Add(1)
+		go func(js []int) {
+			defer wg.Done()
+			sub := make([]scriptCall, len(js))
+			for k, j := range js {
+				sub[k] = calls[j]
+			}
+			for k, cmd := range s.runBatch(ctx, sc, sub) {
+				done(js[k], cmd)
+			}
+		}(js)
+	}
+	wg.Wait()
 }
 
 // nodeFor returns the client for the master that owns key, so commands that

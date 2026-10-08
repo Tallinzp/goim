@@ -2969,7 +2969,7 @@ type gateHook struct {
 	release chan struct{}
 }
 
-func (h gateHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (h gateHook) DialHook(next redis.DialHook) redis.DialHook          { return next }
 func (h gateHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook { return next }
 func (h gateHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
 	return func(ctx context.Context, cmds []redis.Cmder) error {

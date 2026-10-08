@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/Tallinzp/goim/internal/session"
+	"github.com/redis/go-redis/v9"
 )
 
 // LoginCode is the login Lua's decision.
@@ -53,15 +54,16 @@ func (r LoginReq) validate() error {
 	return r.Entry.Validate()
 }
 
-// Login runs the login Lua for a batch, pipelined. Results are in request order;
-// an invalid request gets Err and is not sent.
-func (s *Store) Login(ctx context.Context, reqs []LoginReq) []LoginResult {
-	out := make([]LoginResult, len(reqs))
+// LoginEach runs the login Lua for a batch, pipelined per owning master, and
+// calls done once per request as soon as its group returns (R5S-O1). An
+// invalid request is reported at once and not sent. done may be called from
+// several goroutines at the same time.
+func (s *Store) LoginEach(ctx context.Context, reqs []LoginReq, done func(i int, r LoginResult)) {
 	calls := make([]scriptCall, 0, len(reqs))
 	idx := make([]int, 0, len(reqs))
 	for i, r := range reqs {
 		if err := r.validate(); err != nil {
-			out[i].Err = err
+			done(i, LoginResult{Err: err})
 			continue
 		}
 		e := r.Entry
@@ -72,9 +74,15 @@ func (s *Store) Login(ctx context.Context, reqs []LoginReq) []LoginResult {
 		})
 		idx = append(idx, i)
 	}
-	for j, cmd := range s.runBatch(ctx, loginScript, calls) {
-		out[idx[j]] = parseLogin(cmd.Slice())
-	}
+	s.runEach(ctx, loginScript, calls, func(j int, cmd *redis.Cmd) {
+		done(idx[j], parseLogin(cmd.Slice()))
+	})
+}
+
+// Login is LoginEach collected in request order.
+func (s *Store) Login(ctx context.Context, reqs []LoginReq) []LoginResult {
+	out := make([]LoginResult, len(reqs))
+	s.LoginEach(ctx, reqs, func(i int, r LoginResult) { out[i] = r })
 	return out
 }
 
