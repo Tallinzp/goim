@@ -95,7 +95,13 @@ func (g *Gateway) applyLogin(it *loginItem, r loginReply) {
 	default: // no definitive reply: the Logout waits for fence (b)
 		c.outcome = loginUnknown
 		if open {
-			g.busy(c, c.loginReqID)
+			// A pending Kick proves Logic wrote this session and replaced it;
+			// a Busy retry would evict the device that replaced it.
+			if c.kickPending != clientpb.KickReason_KICK_REASON_UNSPECIFIED {
+				g.kickConn(c, c.kickPending, "kick")
+			} else {
+				g.busy(c, c.loginReqID)
+			}
 		}
 	}
 	g.settle(c)

@@ -70,3 +70,31 @@ func TestKickForAnotherEpochOrUnknownConnIsIgnored(t *testing.T) {
 		t.Fatal("an ignored Kick closed the connection")
 	}
 }
+
+// A Kick for this conn_id proves Logic wrote the session and replaced it, so
+// a Login that then has no definitive reply ends with that Kick, not Busy: a
+// Busy retry would log in again and evict the device that replaced it.
+func TestKickPendingWinsOverNoDefinitiveReply(t *testing.T) {
+	l := newLive(t, nil)
+	kc := l.kickClient(t)
+	release := make(chan struct{})
+	l.logic.set(func() {
+		l.logic.login = func(b *pb.LoginBatch, s grpc.ServerStreamingServer[pb.LoginResult]) error {
+			<-release
+			return nil // the stream ends with no result for the entry
+		}
+	})
+	k := l.authed(0)
+	l.frame(k, clientpb.Cmd_CMD_LOGIN, 1, loginReq("u1", "d", 1))
+	waitFor(t, "Login sent", func() bool { return get(l.logic, func() int { return len(l.logic.logins) }) == 1 })
+	kick(t, kc, "gw-1", 0xE1, k.c.id, pb.KickReason_KICK_REASON_KICKED_BY_OTHER_DEVICE)
+	waitFor(t, "kick-pending", func() bool {
+		return onLoop(k, func(c *Conn) bool { return c.kickPending != clientpb.KickReason_KICK_REASON_UNSPECIFIED })
+	})
+	close(release)
+	waitFor(t, "closed", k.isClosed)
+	var m clientpb.Kick
+	if k.last(t, clientpb.Cmd_CMD_BUSY, nil) || !k.last(t, clientpb.Cmd_CMD_KICK, &m) || m.Reason != clientpb.KickReason_KICK_REASON_KICKED_BY_OTHER_DEVICE {
+		t.Fatalf("want the pending Kick instead of Busy, got Kick %v", &m)
+	}
+}
