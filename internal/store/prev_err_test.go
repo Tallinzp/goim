@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/Tallinzp/goim/internal/testredis"
@@ -47,5 +48,30 @@ func TestReadSlotsReportsUndecodableStoredSeparately(t *testing.T) {
 	cas := s.CompareAndSet(ctx, []CASReq{{UID: uid, Field: field, ExpectRaw: st.Raw, Entry: e, SentMs: nowMs(t, s)}})[0]
 	if cas.Err != nil || cas.Code != CASWritten {
 		t.Fatalf("CompareAndSet over the undecodable value = %+v; want WRITTEN", cas)
+	}
+}
+
+// PI-3 with a rejecting code: a stored value the Lua can read but Go cannot
+// decode still decides STALE and SUPERSEDED. Prev is nil, so Logic has no
+// conn_seq hint to send back; nothing is written.
+func TestLoginRejectsWithUndecodablePrev(t *testing.T) {
+	s, rdb := newStore(t)
+	now := nowMs(t, s)
+	cases := map[LoginCode]string{
+		// same device, stored conn_seq 9 inside the window: our conn_seq 1 is stale
+		LoginStale: fmt.Sprintf("gw-1|not-a-number|1|d|9|%d|1000", now),
+		// other device, stored login later than ours
+		LoginSuperseded: fmt.Sprintf("gw-1|not-a-number|1|other-dev|1|%d|1000", now+10_000),
+	}
+	for want, bad := range cases {
+		uid := testredis.UID()
+		rdb.HSet(ctx, sessKey(uid), field, bad)
+		r := login1(t, s, uid, entry(7, "d", 1, now))
+		if r.Code != want || r.Prev != nil || r.PrevErr == nil {
+			t.Fatalf("%s: result = %+v; want %s, Prev nil, PrevErr set", want, r, want)
+		}
+		if got := rdb.HGet(ctx, sessKey(uid), field).Val(); got != bad {
+			t.Fatalf("%s: stored = %q, want it unchanged", want, got)
+		}
 	}
 }
