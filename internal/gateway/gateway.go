@@ -104,6 +104,22 @@ func (g *Gateway) reject(reason string) string {
 	return reason
 }
 
+// Config returns the configuration the gateway was built with; the transport
+// sizes its event loops from NumLoops.
+func (g *Gateway) Config() Config { return g.cfg }
+
+// Reject closes c before its handshake for an admission reason the transport
+// detects (bad_version, noise_unknown_key, handshake_rate), counted like the
+// core's own rejects. Call it on c's loop.
+func (g *Gateway) Reject(c *Conn, reason string) {
+	g.reject(reason)
+	g.closeConn(c, "rejected")
+}
+
+// Close closes c for a transport reason, such as a bad frame or a failed
+// decryption, counted in closes_total. Call it on c's loop.
+func (g *Gateway) Close(c *Conn, reason string) { g.closeConn(c, reason) }
+
 // HandshakeDone moves c from HANDSHAKE to AUTH_PENDING.
 func (g *Gateway) HandshakeDone(c *Conn) {
 	if c.state != stateHandshake || c.closing {

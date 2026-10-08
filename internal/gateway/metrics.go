@@ -4,8 +4,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// Admission reject reasons (spec: Observability). The TCP transport adds
-// handshake_rate, bad_version and noise_unknown_key (Plan 4).
+// Admission reject reasons (spec: Observability). The last three are the
+// TCP transport's, passed to Reject before the Noise handshake.
 const (
 	RejectAtCapacity       = "at_capacity"
 	RejectPendingMem       = "pending_mem"
@@ -13,6 +13,9 @@ const (
 	RejectLoginQueue       = "login_queue"
 	RejectHandshakeTimeout = "handshake_timeout"
 	RejectAuthTimeout      = "auth_timeout"
+	RejectHandshakeRate    = "handshake_rate"
+	RejectBadVersion       = "bad_version"
+	RejectNoiseUnknownKey  = "noise_unknown_key"
 )
 
 // Metrics are the gateway core's Prometheus metrics (spec: Observability).

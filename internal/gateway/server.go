@@ -137,8 +137,12 @@ func (g *Gateway) Addrs() (kick, admin string) {
 	return g.lis[0].Addr().String(), g.lis[1].Addr().String()
 }
 
-// Stop ends everything. Call Drain first for a graceful exit.
+// Stop ends everything. Call Drain first for a graceful exit. Stop on a
+// gateway that never started does nothing.
 func (g *Gateway) Stop() {
+	if g.cancel == nil {
+		return
+	}
 	g.cancel()
 	done := make(chan struct{})
 	go func() { g.kick.GracefulStop(); close(done) }()

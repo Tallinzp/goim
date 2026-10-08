@@ -6,9 +6,10 @@ import (
 	"testing"
 )
 
-// The layer rule: the gateway never touches Redis; only Logic does.
+// The layer rule: the gateway never touches Redis; only Logic does. The
+// pattern covers the core and every transport under it.
 func TestGatewayDoesNotImportTheStore(t *testing.T) {
-	out, err := exec.Command("go", "list", "-deps", "github.com/Tallinzp/goim/internal/gateway").CombinedOutput()
+	out, err := exec.Command("go", "list", "-deps", "github.com/Tallinzp/goim/internal/gateway/...").CombinedOutput()
 	if err != nil {
 		t.Fatalf("go list: %v\n%s", err, out)
 	}

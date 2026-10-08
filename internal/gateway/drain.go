@@ -88,6 +88,9 @@ func (g *Gateway) Drain(ctx context.Context) {
 
 // endEpoch calls EpochEnded on the lease connection, a few times on error.
 func (g *Gateway) endEpoch(ctx context.Context) {
+	if g.leaseC == nil { // never started: no epoch was registered
+		return
+	}
 	for attempt := range 3 {
 		cctx, cancel := g.rpcCtx(ctx, g.cfg.LeaseTimeout)
 		_, err := g.leaseC.EpochEnded(cctx, &pb.EpochEndedRequest{Gw: g.ref})
