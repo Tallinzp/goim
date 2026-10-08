@@ -4,13 +4,13 @@ objections:
   - docs/superpowers/objections/connection-session-core-design-rev5-system-design.md
 date: 2026-10-07
 decision_maker: user
-status: decided (2026-10-07) — every entry is decided by the user; nothing applied to a spec yet.
+status: decided (2026-10-07) — every entry is decided by the user; accepted changes are applied to the rev6 spec (2026-10-03-connection-session-core-design-rev6.md)
 guiding_principle: new system; take the smallest fix that closes the failure, and avoid overdesign
 ---
 
 # Disposition record — Connection & Session Core, revision 5
 
-Decisions on the system-design review of rev5. References use the prefix *R5S-O<n>* (objections O1–O9 of `rev5-system-design.md`). The user decides each objection. Accepted changes are listed under **Spec changes to apply** and are not yet in any spec.
+Decisions on the system-design review of rev5. References use the prefix *R5S-O<n>* (objections O1–O9 of `rev5-system-design.md`). The user decides each objection. Accepted changes are listed under **Spec changes to apply** and are applied in the rev6 spec.
 
 ## Triage summary
 
