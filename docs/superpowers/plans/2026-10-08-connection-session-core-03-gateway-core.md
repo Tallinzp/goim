@@ -75,6 +75,16 @@ The spec leaves these open. Each is restated in the task that implements it. The
   5. **Real Redis and Redis Cluster.** The end-to-end test uses miniredis at Tier 1a; at Tier 2 (`make test-redis`) it runs on the real Redis with a unique gateway id and uid. Cluster behaviour is Plan 1's open risk.
   6. **Scale.** Pre-allocation is checked at 64k/4 loops; memory per connection, `ReconcileEnd` at 250k IDs (~2MB, under gRPC's 4MB default) and pass timings at 200k are Plan 6's load tests (a) and the `gwconns` shard test.
   7. **`ReconcileEnd` longer than Logic's 30s grace** (Plan 2 deferred minor, ~280k members at 10k/s): the gateway's deadline is longer than that, so a cut call fails and is retried; sized in Plan 6.
+- **Implemented 2026-10-08** on `feat/plan3-gateway` (Native, 12 task commits `d358d0a`…`5294a48`). One test deviation: `TestFirstOpenOnALoopAllocatesNoTable` flaked once (5,640 B against a 1 KiB bar, because `TotalAlloc` counts the whole process). The bar is now 64 KiB; a table built on first use is ~590 KB and is still caught (`d73d423`).
+- **Final review** (a fresh Opus reviewer, verdict "with fixes"). Fixed, each with a test that failed first:
+  - (Important) `Drain` left the lease loop running, so a renewal after `EpochEnded` re-created the key and reset the `gwepochs` score. `Drain` now stops the lease loop and waits for its last call before `EpochEnded`. Test: `TestNoLeaseRenewalAfterEpochEnded`, commit `a1597a5`. Open risk: a renewal that timed out at the gateway but still runs in Logic after `EpochEnded`.
+  - (re-graded Minor → Important) A pending Kick was replaced by `Busy` when the Login had no definitive reply, so the client's retry evicted the device that had replaced it. The pending Kick now wins. Test: `TestKickPendingWinsOverNoDefinitiveReply`, commit `23443f8`.
+- **Deferred minors:**
+  - The comment in `loginFrame` wrongly calls the channel-full branch unreachable.
+  - `Stop` doesn't wait for Reconcile `call` goroutines or the `retryLogouts` timers.
+  - `Stop` before or after a failed `Start` panics, and so does `Drain` before `Start` (fix with Plan 4's `cmd/gateway`).
+  - `TestRenewalAfterFailuresForALeaseTTLTriggersAPass` has a thin timing margin under `-race`.
+  - Plan 2's *Execution Notes* still say a lease error counts as `missing`; choice #28 replaced that rule.
 - **For Plan 4 (TCP transport), the seam this plan fixes:**
   - Build `NumLoops` from gnet's `NumEventLoop` and use `gnet.WithLoadBalancing(gnet.RoundRobin)`.
   - In `OnOpen`: `conn, reason := g.Open(loopOf(c.EventLoop()), link)`; on a reason, close before any crypto. The `Loop` passed must be the same comparable value every time for the same loop (e.g. a struct wrapping the `EventLoop`).
