@@ -7,11 +7,19 @@ export GOIM_REDIS_REPLICA_PORT ?= 16380
 COMPOSE_REDIS := docker compose -f deploy/compose/redis-test.yml
 TIER2_GUARD := test "$$GOIM_TEST_TIER" = 2 || { echo "Tier 2 host only: set GOIM_TEST_TIER=2"; exit 1; }
 
-.PHONY: test redis-up redis-down test-redis test-tier2
+.PHONY: test proto redis-up redis-down test-redis test-tier2
 
 # Tier 1a (dev machine): unit and Lua tests on in-process miniredis, race detector on.
 test:
 	go test -race -count=1 ./...
+
+# Regenerate api/internalpb from api/internal.proto. Needs protoc 33.1 and the
+# two pinned plugins (Plan 2, Task 1); the generated code is committed.
+PROTOC ?= protoc
+GOBIN_DIR := $(shell go env GOPATH)/bin
+proto:
+	PATH="$(GOBIN_DIR):$$PATH" $(PROTOC) --go_out=. --go_opt=module=github.com/Tallinzp/goim \
+		--go-grpc_out=. --go-grpc_opt=module=github.com/Tallinzp/goim api/internal.proto
 
 # Tier 2 host only: real Redis primary + replica for the tests that skip at Tier 1a.
 redis-up:

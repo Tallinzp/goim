@@ -1,0 +1,211 @@
+// Internal RPCs between gateways, Logic and the account service
+// (spec: Architecture, Logic). The client protocol is api/client.proto (Plan 4).
+syntax = "proto3";
+
+package goim.internal.v1;
+
+option go_package = "github.com/Tallinzp/goim/api/internalpb";
+
+// GatewayRef names one gateway instance: pod name plus its boot epoch.
+message GatewayRef {
+  string gateway = 1;
+  fixed64 epoch = 2;
+}
+
+// Platform is the device class of a slot (userid + appid + platform).
+enum Platform {
+  PLATFORM_UNSPECIFIED = 0;
+  PLATFORM_MOBILE = 1; // Android and iOS share one slot
+  PLATFORM_PAD = 2;
+  PLATFORM_WEB = 3;
+  PLATFORM_PC = 4;
+}
+
+// KickReason is sent to the client in the Kick frame. None of them makes the
+// client reconnect on its own.
+enum KickReason {
+  KICK_REASON_UNSPECIFIED = 0;
+  KICK_REASON_REPLACED = 1;               // same device, newer connection
+  KICK_REASON_KICKED_BY_OTHER_DEVICE = 2; // another device took the slot
+  KICK_REASON_REVOKED = 3;                // token revoked: drop it, show login
+}
+
+// ---- Gateway -> Logic: Login, Logout, Reconcile, ReconcileEnd ----
+
+service Logic {
+  // Login streams one LoginResult per entry as soon as that entry finishes
+  // (R5S-O1). An entry with no result when the stream ends has no definitive
+  // reply: the gateway applies Logout fence (b) to it.
+  rpc Login(LoginBatch) returns (stream LoginResult);
+  rpc Logout(LogoutBatch) returns (LogoutReply);
+  // Reconcile resolves a chunk as a whole (roadmap choice #14). A gRPC error
+  // means no definitive reply: the chunk is resolved at sent_ms + login_deadline + 1s.
+  rpc Reconcile(ReconcileChunk) returns (ReconcileReply);
+  // ReconcileEnd returns after the rate-limited delete phase (R5S-O8).
+  rpc ReconcileEnd(ReconcileEndRequest) returns (ReconcileEndReply);
+}
+
+message LoginEntry {
+  fixed64 conn_id = 1;
+  string token = 2;
+  string appid = 3;
+  Platform platform = 4;
+  string device_id = 5;
+  uint64 conn_seq = 6;
+  int64 recv_ms = 7; // gateway wall clock when the Login frame arrived (R1-O4)
+}
+
+message LoginBatch {
+  GatewayRef gw = 1;
+  repeated LoginEntry entries = 2;
+}
+
+enum LoginCode {
+  LOGIN_CODE_UNSPECIFIED = 0;
+  LOGIN_CODE_OK = 1;          // the session is stored; uid and tok_iat_ms are set
+  LOGIN_CODE_STALE = 2;       // stored_conn_seq is set
+  LOGIN_CODE_SUPERSEDED = 3;
+  LOGIN_CODE_EXPIRED = 4;
+  LOGIN_CODE_REVOKED = 5;
+  LOGIN_CODE_KEY_UNKNOWN = 6;
+  LOGIN_CODE_TOKEN_INVALID = 7; // bad signature, malformed, expired, or appid/platform mismatch
+  LOGIN_CODE_BAD_REQUEST = 8;   // the gateway sent a value the store can't hold
+  // OUTCOME_UNKNOWN is not a definitive reply: the script may or may not have
+  // run (Redis error, timeout). The gateway applies Logout fence (b).
+  LOGIN_CODE_OUTCOME_UNKNOWN = 9;
+}
+
+message LoginResult {
+  uint32 index = 1; // position of the entry in LoginBatch.entries
+  LoginCode code = 2;
+  string uid = 3;          // OK only: the token's subject
+  int64 tok_iat_ms = 4;    // OK only: the token's iat in ms (roadmap choice #3)
+  uint64 stored_conn_seq = 5; // STALE only
+}
+
+message LogoutEntry {
+  fixed64 conn_id = 1;
+  string uid = 2;
+  string appid = 3;
+  Platform platform = 4;
+}
+
+message LogoutBatch {
+  GatewayRef gw = 1;
+  repeated LogoutEntry entries = 2;
+}
+
+message LogoutReply {
+  // done[i] is true when entry i is settled (deleted, owned by a newer
+  // session, or invalid); false means the outcome is unknown: retry it.
+  repeated bool done = 1;
+}
+
+message ReconcileEntry {
+  fixed64 conn_id = 1;
+  string uid = 2;
+  string appid = 3;
+  Platform platform = 4;
+  string device_id = 5;
+  uint64 conn_seq = 6;
+  int64 login_ms = 7;
+  int64 tok_iat_ms = 8;
+}
+
+message ReconcileChunk {
+  GatewayRef gw = 1;
+  int64 sent_ms = 2; // gateway wall clock when the chunk was sent (R2-O1)
+  repeated ReconcileEntry entries = 3;
+}
+
+enum ReconcileCode {
+  RECONCILE_CODE_UNSPECIFIED = 0;
+  RECONCILE_CODE_WRITTEN = 1;   // refreshed (rule 2) or written (rules 3, 4)
+  RECONCILE_CODE_UNCHANGED = 2; // compare-and-set lost to a concurrent change
+  RECONCILE_CODE_REFUSED = 3;   // past sent_ms + login_deadline: re-queue
+  RECONCILE_CODE_NOT_OWNER = 4; // Kick with reason and close
+}
+
+message ReconcileResult {
+  ReconcileCode code = 1;
+  KickReason reason = 2; // NOT_OWNER only
+}
+
+message ReconcileReply {
+  repeated ReconcileResult results = 1; // same order as the chunk's entries
+}
+
+enum Pace {
+  PACE_UNSPECIFIED = 0;
+  PACE_PERIODIC = 1;
+  PACE_TRIGGERED = 2;
+}
+
+message ReconcileEndRequest {
+  GatewayRef gw = 1;
+  int64 as_of_ms = 2;
+  repeated fixed64 tracked_conn_ids = 3; // packed: 8 bytes each
+  Pace pace = 4; // metric label only
+}
+
+message ReconcileEndReply {
+  uint32 deleted = 1;
+}
+
+// ---- Gateway -> Logic, dedicated connection and port (R1-O2) ----
+
+service Lease {
+  rpc GatewayLease(LeaseRequest) returns (LeaseReply);
+  rpc EpochEnded(EpochEndedRequest) returns (EpochEndedReply);
+}
+
+message LeaseRequest {
+  GatewayRef gw = 1;
+  int64 gw_now_ms = 2; // gateway wall clock, for clock_skew_ms (R4M-5)
+}
+
+message LeaseReply {
+  bool missing = 1; // the lease key was absent before this renewal (R3-O3)
+}
+
+message EpochEndedRequest {
+  GatewayRef gw = 1;
+}
+
+message EpochEndedReply {}
+
+// ---- Account service -> Logic ----
+
+service Revocation {
+  // Revoke returns UNAVAILABLE when no replica confirmed the marker; the
+  // account service retries with the same before_ms (PI-4).
+  rpc Revoke(RevokeRequest) returns (RevokeReply);
+}
+
+message RevokeRequest {
+  string uid = 1;
+  bool all = 2;          // scope=all; otherwise scope=slot (appid, platform)
+  string appid = 3;
+  Platform platform = 4;
+  int64 before_ms = 5;   // issuer clock, unit of tok_iat (PI-4)
+  string reason = 6;     // logged only
+}
+
+message RevokeReply {
+  uint32 kicked = 1; // connections queued for a REVOKED Kick
+}
+
+// ---- Logic -> Gateway (pod DNS) ----
+
+service Gateway {
+  // Kick is ignored by the gateway on an epoch mismatch or an unknown conn_id.
+  rpc Kick(KickRequest) returns (KickReply);
+}
+
+message KickRequest {
+  GatewayRef gw = 1;
+  fixed64 conn_id = 2;
+  KickReason reason = 3;
+}
+
+message KickReply {}
