@@ -60,7 +60,17 @@ func keygen(args []string, out io.Writer) error {
 		return err
 	}
 	priv, pub := wire.EncodeKey(k)
-	if err := os.WriteFile(*path, []byte(priv+"\n"), 0o600); err != nil {
+	// O_EXCL: never replace a key whose public half may already be pinned in
+	// shipped apps.
+	f, err := os.OpenFile(*path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteString(priv + "\n"); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
 		return err
 	}
 	fmt.Fprintf(out, "key_id %d public %s\n", *id, pub)
@@ -149,6 +159,7 @@ func parseFlags(args []string) (gateway.Config, gateway.ServerConfig, tcp.Config
 	fs.Var(window{&cfg.Windows.Retryable}, "retryable", "LoginResp retryable reject window, lo-hi")
 
 	fs.IntVar(&tc.MaxClientFrame, "max-client-frame", tc.MaxClientFrame, "largest client frame Length after the handshake")
+	fs.IntVar(&tc.MaxOutbound, "max-outbound", tc.MaxOutbound, "bytes queued for a client that does not read before it is closed as slow_consumer")
 	concurrency := fs.Int("handshake-concurrency", 0, "handshakes computing at once (default: half the loops)")
 	fs.Float64Var(&tc.HandshakeRate, "handshake-rate", tc.HandshakeRate, "handshakes/s, gateway-wide")
 	fs.IntVar(&tc.HandshakeBurst, "handshake-burst", tc.HandshakeBurst, "handshake token bucket burst")

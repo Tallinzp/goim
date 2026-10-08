@@ -32,9 +32,12 @@ func TestDefaultFlagsAreValid(t *testing.T) {
 	if tc.Addr != "tcp://:8000" || sc.KickAddr != ":9100" || o.keyDir != "/etc/goim/noise" || o.drainTimeout != 85*time.Second {
 		t.Fatalf("defaults: %+v %+v %+v", tc, sc, o)
 	}
-	cfg, _, tc, _, err = parseFlags([]string{"-id", "gw-1", "-loops", "16", "-storm-wait", "5s-60s"})
+	cfg, _, tc, _, err = parseFlags([]string{"-id", "gw-1", "-loops", "16", "-storm-wait", "5s-60s", "-max-outbound", "131072"})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if tc.MaxOutbound != 131072 {
+		t.Fatalf("max outbound %d", tc.MaxOutbound)
 	}
 	if tc.HandshakeConcurrency != 8 || cfg.Windows.StormWait.Lo != 5*time.Second || cfg.Windows.StormWait.Hi != time.Minute {
 		t.Fatalf("concurrency %d, storm wait %+v", tc.HandshakeConcurrency, cfg.Windows.StormWait)
@@ -48,6 +51,7 @@ func TestRefusesBadConfig(t *testing.T) {
 		{"-loops", "300"}, // gnet's limit is 256
 		{"-busy-retry", "3s-1s"},
 		{"-max-client-frame", "10"},
+		{"-max-outbound", "4096"}, // below one frame
 		{"-id", "Not_A_Label"},
 	} {
 		if _, _, _, _, err := parseFlags(append([]string{"-id", "gw-0"}, args...)); err == nil {
@@ -72,6 +76,14 @@ func TestNoiseKeygen(t *testing.T) {
 	}
 	if fi, _ := os.Stat(filepath.Join(dir, "3")); fi.Mode().Perm() != 0o600 {
 		t.Fatalf("key file mode %v", fi.Mode())
+	}
+	// A second run must not replace a key whose public half may be pinned.
+	before, _ := os.ReadFile(filepath.Join(dir, "3"))
+	if err := keygen([]string{"-key-id", "3", "-out", filepath.Join(dir, "3")}, &out); err == nil {
+		t.Fatal("an existing key file was overwritten")
+	}
+	if after, _ := os.ReadFile(filepath.Join(dir, "3")); !bytes.Equal(before, after) {
+		t.Fatal("the existing key file changed")
 	}
 	if err := keygen([]string{"-key-id", "70000", "-out", filepath.Join(dir, "x")}, &out); err == nil {
 		t.Fatal("key_id above 65535 accepted")

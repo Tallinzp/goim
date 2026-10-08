@@ -32,6 +32,10 @@ type Config struct {
 	// handshake, checked from the header before the payload is buffered. A
 	// LoginReq with a 4096-byte token fits in 8192 (roadmap choice #16).
 	MaxClientFrame int
+	// MaxOutbound caps the bytes queued for a client whose socket won't take
+	// them; a frame that would pass it closes the connection as
+	// slow_consumer, so a client that never reads can't grow gateway memory.
+	MaxOutbound int
 	// The handshake limit: handshakes computing at once, and a token bucket
 	// on handshakes/s (spec: Admission control).
 	HandshakeConcurrency int
@@ -42,7 +46,7 @@ type Config struct {
 // DefaultConfig returns the defaults for a gateway with numLoops loops.
 // Plan 6 re-derives the handshake limit from the measured NK cost.
 func DefaultConfig(numLoops int) Config {
-	return Config{Addr: "tcp://:8000", MaxClientFrame: 8192,
+	return Config{Addr: "tcp://:8000", MaxClientFrame: 8192, MaxOutbound: 256 << 10,
 		HandshakeConcurrency: max(1, (numLoops+1)/2), HandshakeRate: 25_000, HandshakeBurst: 2_500}
 }
 
@@ -54,6 +58,9 @@ func (c Config) Validate(numLoops int) error {
 	}
 	if c.MaxClientFrame < wire.HandshakeLen || c.MaxClientFrame > wire.MaxLength {
 		errs = append(errs, fmt.Errorf("MaxClientFrame %d must be in [%d, %d]", c.MaxClientFrame, wire.HandshakeLen, wire.MaxLength))
+	}
+	if c.MaxOutbound < wire.HeaderLen+wire.MaxLength {
+		errs = append(errs, fmt.Errorf("MaxOutbound %d must be at least %d (one frame)", c.MaxOutbound, wire.HeaderLen+wire.MaxLength))
 	}
 	if c.HandshakeConcurrency < 1 || c.HandshakeRate <= 0 || c.HandshakeBurst < 1 {
 		errs = append(errs, errors.New("HandshakeConcurrency, HandshakeRate and HandshakeBurst must be positive"))

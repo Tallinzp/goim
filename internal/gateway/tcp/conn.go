@@ -14,6 +14,8 @@ const (
 	closeBadFrame  = "bad_frame" // header, size or command not allowed here
 	closeDecrypt   = "decrypt"   // AEAD failure: tampered, replayed or garbage
 	closeHandshake = "handshake" // the Noise handshake failed
+	// The client doesn't read: its unsent frames passed MaxOutbound.
+	closeSlowConsumer = "slow_consumer"
 )
 
 var errBadFrame = errors.New("tcp: bad frame")
@@ -47,6 +49,10 @@ func (c *conn) Send(cmd clientpb.Cmd, reqID uint32, body []byte) {
 		return
 	}
 	c.l.out = f[:0]
+	if c.gc.OutboundBuffered()+len(f) > c.t.cfg.MaxOutbound {
+		c.t.g.Close(c.c, closeSlowConsumer)
+		return
+	}
 	c.gc.Write(f) // gnet copies what the socket doesn't take at once
 }
 

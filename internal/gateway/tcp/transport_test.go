@@ -3,6 +3,7 @@ package tcp
 import (
 	"context"
 	"encoding/binary"
+	"net"
 	"testing"
 	"time"
 
@@ -247,4 +248,29 @@ func TestCloseInsideACoreCallIsReportedAfterIt(t *testing.T) {
 	if handshaking() != 0 {
 		t.Fatal("Closed not reported after the call")
 	}
+}
+
+// A logged-in client that pipelines Pings and never reads must not grow the
+// gateway's outbound buffer without bound: past MaxOutbound the connection
+// is closed as slow_consumer.
+func TestSlowConsumerIsClosedAtTheOutboundCap(t *testing.T) {
+	s := newServer(t, func(_ *gateway.Config, tc *Config) { tc.MaxOutbound = wire.HeaderLen + wire.MaxLength })
+	c := s.online("u1")
+	c.nc.(*net.TCPConn).SetReadBuffer(4096)
+	deadline := time.Now().Add(8 * time.Second)
+	for id := uint32(10); s.closes(closeSlowConsumer) == 0; {
+		if time.Now().After(deadline) {
+			t.Fatal("never closed as slow_consumer")
+		}
+		var burst []byte
+		for range 1000 {
+			burst = append(burst, c.seal(clientpb.Cmd_CMD_PING, id, nil)...)
+			id++
+		}
+		if _, err := c.nc.Write(burst); err != nil {
+			break // the server closed it
+		}
+	}
+	waitFor(t, "closes_total{slow_consumer}", func() bool { return s.closes(closeSlowConsumer) == 1 })
+	waitFor(t, "fenced Logout reaches Logic", func() bool { return s.logic.loggedOut("u1") })
 }
