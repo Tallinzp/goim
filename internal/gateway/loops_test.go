@@ -98,7 +98,9 @@ func TestFirstOpenOnALoopAllocatesNoTable(t *testing.T) {
 		fakes[i] = &stubLoop{}
 	}
 	for i := range fakes {
-		if n := bytesAllocated(func() { ls.bind(fakes[i]) }); n > 1024 {
+		// TotalAlloc is process-wide, so the bar leaves room for a few KB
+		// allocated elsewhere; a table here is ~400KB.
+		if n := bytesAllocated(func() { ls.bind(fakes[i]) }); n > 64<<10 {
 			t.Fatalf("binding loop %d allocated %d bytes: the table must be built at boot", i, n)
 		}
 	}
