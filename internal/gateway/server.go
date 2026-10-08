@@ -2,13 +2,17 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	pb "github.com/Tallinzp/goim/api/internalpb"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
@@ -43,12 +47,15 @@ type server struct {
 	reqSeq      atomic.Uint64
 
 	clients []*grpc.ClientConn
+	kick    *grpc.Server
+	admin   *http.Server
+	lis     [2]net.Listener
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 }
 
-// Start dials Logic on two connections and starts the background
-// goroutines.
+// Start dials Logic on two connections, opens the Kick and admin listeners
+// and starts the background goroutines.
 func (g *Gateway) Start(ctx context.Context, sc ServerConfig) error {
 	for _, target := range []string{sc.LogicTarget, sc.LeaseTarget} {
 		cc, err := g.dial(target)
@@ -58,8 +65,32 @@ func (g *Gateway) Start(ctx context.Context, sc ServerConfig) error {
 		}
 		g.clients = append(g.clients, cc)
 	}
+	for i, addr := range []string{sc.KickAddr, sc.AdminAddr} {
+		l, err := net.Listen("tcp", addr)
+		if err != nil {
+			for _, open := range g.lis[:i] {
+				open.Close()
+			}
+			g.closeConns()
+			return err
+		}
+		g.lis[i] = l
+	}
 	ctx, g.cancel = context.WithCancel(ctx)
 	logic := pb.NewLogicClient(g.clients[0])
+
+	g.kick = grpc.NewServer()
+	pb.RegisterGatewayServer(g.kick, kickServer{g: g})
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.HandlerFor(g.registry, promhttp.HandlerOpts{}))
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	g.admin = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	g.goRun(func() { g.kick.Serve(g.lis[0]) })
+	g.goRun(func() {
+		if err := g.admin.Serve(g.lis[1]); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			g.log.Error("admin server", "err", err)
+		}
+	})
 
 	g.goRun(func() { g.runTicker(ctx) })
 	g.startLogin(ctx, logic)
@@ -67,9 +98,24 @@ func (g *Gateway) Start(ctx context.Context, sc ServerConfig) error {
 	return nil
 }
 
+// Addrs returns the bound Kick and admin addresses.
+func (g *Gateway) Addrs() (kick, admin string) {
+	return g.lis[0].Addr().String(), g.lis[1].Addr().String()
+}
+
 // Stop ends everything. Call Drain first for a graceful exit.
 func (g *Gateway) Stop() {
 	g.cancel()
+	done := make(chan struct{})
+	go func() { g.kick.GracefulStop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		g.kick.Stop()
+	}
+	shut, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	g.admin.Shutdown(shut)
 	g.wg.Wait()
 	g.closeConns()
 }

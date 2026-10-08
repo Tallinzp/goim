@@ -10,6 +10,7 @@ import (
 	"github.com/Tallinzp/goim/api/clientpb"
 	pb "github.com/Tallinzp/goim/api/internalpb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 // fakeLogic serves the Logic and Lease services on two localhost listeners.
@@ -189,12 +190,24 @@ func startLive(t *testing.T, mod func(*Config), pre func(*Gateway, *fakeLogic)) 
 	if pre != nil {
 		pre(h.g, f)
 	}
-	sc := ServerConfig{LogicTarget: f.logicAddr, LeaseTarget: f.leaseAddr}
+	sc := ServerConfig{LogicTarget: f.logicAddr, LeaseTarget: f.leaseAddr, KickAddr: "127.0.0.1:0", AdminAddr: "127.0.0.1:0"}
 	if err := h.g.Start(context.Background(), sc); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(h.g.Stop)
 	return &live{core: h, logic: f}
+}
+
+// kickClient dials the gateway's Kick server.
+func (l *live) kickClient(t *testing.T) pb.GatewayClient {
+	t.Helper()
+	addr, _ := l.g.Addrs()
+	cc, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cc.Close() })
+	return pb.NewGatewayClient(cc)
 }
 
 // loginLive sends a LoginReq and waits for the connection to be ONLINE.
