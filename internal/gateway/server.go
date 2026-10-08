@@ -44,10 +44,13 @@ func DefaultServerConfig() ServerConfig {
 type server struct {
 	registry    *prometheus.Registry
 	readyChecks []func() error
-	reqSeq      atomic.Uint64
+
+	leaseOK atomic.Bool // the first GatewayLease succeeded
+	reqSeq  atomic.Uint64
 
 	recon     *reconciler
 	stopRecon context.CancelFunc
+	leaseC    pb.LeaseClient
 	clients   []*grpc.ClientConn
 	kick      *grpc.Server
 	admin     *http.Server
@@ -80,6 +83,7 @@ func (g *Gateway) Start(ctx context.Context, sc ServerConfig) error {
 	}
 	ctx, g.cancel = context.WithCancel(ctx)
 	logic := pb.NewLogicClient(g.clients[0])
+	g.leaseC = pb.NewLeaseClient(g.clients[1])
 
 	g.kick = grpc.NewServer()
 	pb.RegisterGatewayServer(g.kick, kickServer{g: g})
@@ -101,6 +105,7 @@ func (g *Gateway) Start(ctx context.Context, sc ServerConfig) error {
 	rctx, stop := context.WithCancel(ctx)
 	g.stopRecon = stop
 	g.goRun(func() { g.recon.run(rctx) })
+	g.goRun(func() { g.runLease(ctx, g.leaseC, g.recon.Trigger) })
 	return nil
 }
 
