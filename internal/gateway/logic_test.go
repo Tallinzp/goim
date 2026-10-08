@@ -187,6 +187,7 @@ func startLive(t *testing.T, mod func(*Config), pre func(*Gateway, *fakeLogic)) 
 			mod(c)
 		}
 	})
+	h.g.limits = okLimits
 	if pre != nil {
 		pre(h.g, f)
 	}
@@ -196,6 +197,11 @@ func startLive(t *testing.T, mod func(*Config), pre func(*Gateway, *fakeLogic)) 
 	}
 	t.Cleanup(h.g.Stop)
 	return &live{core: h, logic: f}
+}
+
+var okLimits = limitSource{
+	nofile:   func() (uint64, error) { return 1 << 20, nil },
+	readFile: func(string) ([]byte, error) { return []byte("4000000\n"), nil },
 }
 
 // kickClient dials the gateway's Kick server.

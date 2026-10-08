@@ -64,7 +64,7 @@ func New(cfg Config, d Deps) (*Gateway, error) {
 		loginCh:  make(chan *loginItem, cfg.LoginQueueCap),
 		logoutCh: make(chan *logoutItem, cfg.LogoutQueue),
 	}
-	g.server = server{registry: d.Registry, readyChecks: d.ReadyChecks}
+	g.server = server{registry: d.Registry, readyChecks: d.ReadyChecks, limits: hostLimits}
 	for s := range g.gauges {
 		gauge := m.Conns.WithLabelValues(stateLabel[s])
 		g.gauges[s] = stateGauges{gauge.Inc, gauge.Dec}

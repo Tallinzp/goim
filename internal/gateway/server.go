@@ -14,6 +14,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
@@ -44,8 +45,11 @@ func DefaultServerConfig() ServerConfig {
 type server struct {
 	registry    *prometheus.Registry
 	readyChecks []func() error
+	limits      limitSource
+	limitsErr   error
 
 	leaseOK atomic.Bool // the first GatewayLease succeeded
+	logicUp atomic.Bool // the Logic channel has been connected once
 	reqSeq  atomic.Uint64
 
 	recon     *reconciler
@@ -59,9 +63,13 @@ type server struct {
 	wg        sync.WaitGroup
 }
 
-// Start dials Logic on two connections, opens the Kick and admin listeners
-// and starts the background goroutines.
+// Start runs the self-check, dials Logic on two connections, opens the Kick
+// and admin listeners and starts every background goroutine.
 func (g *Gateway) Start(ctx context.Context, sc ServerConfig) error {
+	g.limitsErr = checkLimits(g.cfg, g.limits, g.m)
+	if g.limitsErr != nil {
+		g.log.Error("limits self-check failed: staying NotReady", "err", g.limitsErr)
+	}
 	for _, target := range []string{sc.LogicTarget, sc.LeaseTarget} {
 		cc, err := g.dial(target)
 		if err != nil {
@@ -90,6 +98,13 @@ func (g *Gateway) Start(ctx context.Context, sc ServerConfig) error {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(g.registry, promhttp.HandlerOpts{}))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if err := g.Ready(); err != nil {
+			http.Error(w, "not ready: "+err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
 	g.admin = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	g.goRun(func() { g.kick.Serve(g.lis[0]) })
 	g.goRun(func() {
@@ -99,6 +114,7 @@ func (g *Gateway) Start(ctx context.Context, sc ServerConfig) error {
 	})
 
 	g.goRun(func() { g.runTicker(ctx) })
+	g.goRun(func() { g.watchLogic(ctx, g.clients[0]) })
 	g.startLogin(ctx, logic)
 	g.startLogout(ctx, logic)
 	g.recon = newReconciler(g, logic)
@@ -144,6 +160,56 @@ func (g *Gateway) goRun(f func()) {
 		defer g.wg.Done()
 		f()
 	}()
+}
+
+// Ready reports why the gateway must not get traffic yet, or nil (spec:
+// Readiness): not draining, limits pass, the Logic channel connected, the
+// first GatewayLease (on the lease channel) succeeded, and the transport's
+// checks pass. The conditions latch: once Ready, a later Logic outage does not
+// make the gateway NotReady, since every gateway would see it alike.
+func (g *Gateway) Ready() error {
+	switch {
+	case g.draining.Load():
+		return errors.New("draining")
+	case g.limitsErr != nil:
+		return g.limitsErr
+	case !g.logicUp.Load():
+		return errors.New("Logic channel not connected")
+	case !g.leaseOK.Load():
+		return errors.New("first GatewayLease has not succeeded")
+	}
+	for _, check := range g.readyChecks {
+		if err := check(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// watchLogic latches logicUp once the Logic channel is connected, and keeps
+// the Ready gauge current.
+func (g *Gateway) watchLogic(ctx context.Context, cc *grpc.ClientConn) {
+	cc.Connect()
+	for s := cc.GetState(); s != connectivity.Ready; s = cc.GetState() {
+		if !cc.WaitForStateChange(ctx, s) {
+			return
+		}
+	}
+	g.logicUp.Store(true)
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		ready := 0.0
+		if g.Ready() == nil {
+			ready = 1
+		}
+		g.m.Ready.Set(ready)
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
 }
 
 // runTicker advances every loop's wheel once per tick, through Execute
