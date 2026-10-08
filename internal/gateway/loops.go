@@ -16,7 +16,7 @@ type Loop interface {
 }
 
 // loopState is one loop's share of the gateway: its worker_id, conn_id
-// counter, connection table and timing wheel. Every
+// counter, connection table, timing wheel and open Reconcile chunks. Every
 // field but bound is touched only on the loop's goroutine, so none needs a
 // lock (spec: Per-loop connection tables).
 type loopState struct {
@@ -26,6 +26,7 @@ type loopState struct {
 	counter uint64 // conn_id low 48 bits; only Open touches it
 	conns   map[uint64]*Conn
 	wheel   *wheel
+	chunks  map[uint64]*chunkRec // Reconcile chunks sent and not resolved
 }
 
 type boundLoop struct{ l Loop }
@@ -60,6 +61,7 @@ func newLoops(cfg Config, now time.Time) *loops {
 			workerID: uint64(i),
 			conns:    make(map[uint64]*Conn, tableHint(cfg)),
 			wheel:    newWheel(now),
+			chunks:   make(map[uint64]*chunkRec),
 		}
 	}
 	return ls

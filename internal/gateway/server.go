@@ -46,12 +46,14 @@ type server struct {
 	readyChecks []func() error
 	reqSeq      atomic.Uint64
 
-	clients []*grpc.ClientConn
-	kick    *grpc.Server
-	admin   *http.Server
-	lis     [2]net.Listener
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup
+	recon     *reconciler
+	stopRecon context.CancelFunc
+	clients   []*grpc.ClientConn
+	kick      *grpc.Server
+	admin     *http.Server
+	lis       [2]net.Listener
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
 }
 
 // Start dials Logic on two connections, opens the Kick and admin listeners
@@ -95,6 +97,10 @@ func (g *Gateway) Start(ctx context.Context, sc ServerConfig) error {
 	g.goRun(func() { g.runTicker(ctx) })
 	g.startLogin(ctx, logic)
 	g.startLogout(ctx, logic)
+	g.recon = newReconciler(g, logic)
+	rctx, stop := context.WithCancel(ctx)
+	g.stopRecon = stop
+	g.goRun(func() { g.recon.run(rctx) })
 	return nil
 }
 
@@ -117,6 +123,7 @@ func (g *Gateway) Stop() {
 	defer cancel()
 	g.admin.Shutdown(shut)
 	g.wg.Wait()
+	g.recon.ends.Wait()
 	g.closeConns()
 }
 
