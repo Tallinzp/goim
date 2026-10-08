@@ -63,6 +63,7 @@ func (g *Gateway) Start(ctx context.Context, sc ServerConfig) error {
 
 	g.goRun(func() { g.runTicker(ctx) })
 	g.startLogin(ctx, logic)
+	g.startLogout(ctx, logic)
 	return nil
 }
 
