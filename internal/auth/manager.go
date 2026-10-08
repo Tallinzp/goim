@@ -52,6 +52,7 @@ type Manager struct {
 	nextUnknown time.Time       // unknown-kid refreshes are allowed from this time on
 	ctx         context.Context // Run's context, for background refreshes
 	bg          sync.WaitGroup  // background refreshes (tests wait on it)
+	stopped     bool            // Run has ended: no new background refreshes
 }
 
 // NewManager builds a Manager that fetches cfg.URL over HTTP and reads
@@ -128,6 +129,10 @@ func (m *Manager) Run(ctx context.Context) {
 		}
 		select {
 		case <-ctx.Done():
+			// Under mu, so every bg.Add happens before this Wait or not at all.
+			m.mu.Lock()
+			m.stopped = true
+			m.mu.Unlock()
 			m.bg.Wait()
 			return
 		case <-time.After(wait):
@@ -189,7 +194,7 @@ func (m *Manager) Verify(token string) (Claims, error) {
 func (m *Manager) unknownKid() {
 	m.mu.Lock()
 	now := m.now()
-	if now.Before(m.nextUnknown) {
+	if m.stopped || now.Before(m.nextUnknown) {
 		m.mu.Unlock()
 		return
 	}

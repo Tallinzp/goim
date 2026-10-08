@@ -189,3 +189,32 @@ func TestFailedRefreshKeepsLastGoodSet(t *testing.T) {
 		t.Fatalf("last good set: %v", err)
 	}
 }
+
+// After Run ends (shutdown), Logic keeps serving Logins while it drains. An
+// unknown kid then must not start a refresh: it would race Run's final
+// bg.Wait and fail on the cancelled context, firing a false refresh alert.
+func TestNoUnknownKidRefreshAfterRun(t *testing.T) {
+	k1 := testKey(t, "k1")
+	src := &source{}
+	src.publish(t, k1)
+	var failures atomic.Int32
+	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
+	m := newManager(DefaultManagerConfig("u", ""), Observer{RefreshFailed: func(error) { failures.Add(1) }},
+		src.fetch, noFallback, clk.Now)
+	if err := m.Load(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancel := context.WithCancel(context.Background())
+	ran := make(chan struct{})
+	go func() { m.Run(runCtx); close(ran) }()
+	cancel()
+	<-ran
+	src.calls.Store(0)
+	if _, err := m.Verify(sign(t, testKey(t, "k9"), claims(clk.Now().UnixMilli()))); !errors.Is(err, ErrKeyUnknown) {
+		t.Fatalf("verify: %v", err)
+	}
+	m.bg.Wait()
+	if n := src.calls.Load(); n != 0 || failures.Load() != 0 {
+		t.Fatalf("after Run ended: %d fetches, %d failures; want none", n, failures.Load())
+	}
+}
