@@ -54,6 +54,8 @@ type server struct {
 
 	recon     *reconciler
 	stopRecon context.CancelFunc
+	stopLease func()        // Drain stops renewals before EpochEnded
+	leaseDone chan struct{} // closed when runLease returns
 	leaseC    pb.LeaseClient
 	clients   []*grpc.ClientConn
 	kick      *grpc.Server
@@ -121,7 +123,12 @@ func (g *Gateway) Start(ctx context.Context, sc ServerConfig) error {
 	rctx, stop := context.WithCancel(ctx)
 	g.stopRecon = stop
 	g.goRun(func() { g.recon.run(rctx) })
-	g.goRun(func() { g.runLease(ctx, g.leaseC, g.recon.Trigger) })
+	leaseStop := make(chan struct{})
+	g.stopLease, g.leaseDone = sync.OnceFunc(func() { close(leaseStop) }), make(chan struct{})
+	g.goRun(func() {
+		defer close(g.leaseDone)
+		g.runLease(ctx, leaseStop, g.leaseC, g.recon.Trigger)
+	})
 	return nil
 }
 

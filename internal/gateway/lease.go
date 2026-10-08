@@ -8,15 +8,24 @@ import (
 )
 
 // runLease renews the epoch's lease every LeaseInterval on the dedicated
-// lease connection (spec: Lease, R1-O2).
-func (g *Gateway) runLease(ctx context.Context, lease pb.LeaseClient, trigger func()) {
+// lease connection (spec: Lease, R1-O2). It returns when stop is closed,
+// after the renewal in flight (if any) has finished, so EpochEnded can follow
+// without a renewal re-creating the key behind it.
+func (g *Gateway) runLease(ctx context.Context, stop <-chan struct{}, lease pb.LeaseClient, trigger func()) {
 	t := time.NewTicker(g.cfg.LeaseInterval)
 	defer t.Stop()
 	var lastOK time.Time // start of the last successful renewal
 	for {
+		select {
+		case <-stop:
+			return
+		default:
+		}
 		g.renew(ctx, lease, &lastOK, trigger)
 		select {
 		case <-ctx.Done():
+			return
+		case <-stop:
 			return
 		case <-t.C:
 		}

@@ -73,6 +73,16 @@ func (g *Gateway) Drain(ctx context.Context) {
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
+	// A renewal after EpochEnded would re-create the lease key and undo the
+	// ended mark, so stop the lease loop and wait for its last call.
+	if g.stopLease != nil {
+		g.stopLease()
+		select {
+		case <-g.leaseDone:
+		case <-ctx.Done():
+			return
+		}
+	}
 	g.endEpoch(ctx)
 }
 

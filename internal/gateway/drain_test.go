@@ -41,3 +41,16 @@ func TestDrainSendsReconnectClosesTheRestAndEndsTheEpoch(t *testing.T) {
 		t.Fatalf("EpochEnded called %d times", n)
 	}
 }
+
+// EpochEnded deletes the lease and marks the epoch ended; a renewal after it
+// would re-create the key and undo the mark, so the lease loop stops first.
+func TestNoLeaseRenewalAfterEpochEnded(t *testing.T) {
+	l := newLive(t, func(c *Config) { c.Drain.Window, c.Drain.Flush = time.Second, time.Second })
+	l.g.Drain(context.Background())
+	calls := func() int { return get(l.logic, func() int { return len(l.logic.leaseCalls) }) }
+	n := calls()
+	time.Sleep(5 * l.g.cfg.LeaseInterval)
+	if m := calls(); m != n {
+		t.Fatalf("%d GatewayLease calls after EpochEnded", m-n)
+	}
+}
