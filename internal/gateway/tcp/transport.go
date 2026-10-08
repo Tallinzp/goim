@@ -35,6 +35,8 @@ type Config struct {
 	// MaxOutbound caps the bytes queued for a client whose socket won't take
 	// them; a frame that would pass it closes the connection as
 	// slow_consumer, so a client that never reads can't grow gateway memory.
+	// The default is one max frame (choice #46): only control frames are
+	// sent in sub-project 1, so a client this far behind has stopped reading.
 	MaxOutbound int
 	// The handshake limit: handshakes computing at once, and a token bucket
 	// on handshakes/s (spec: Admission control).
@@ -46,7 +48,7 @@ type Config struct {
 // DefaultConfig returns the defaults for a gateway with numLoops loops.
 // Plan 6 re-derives the handshake limit from the measured NK cost.
 func DefaultConfig(numLoops int) Config {
-	return Config{Addr: "tcp://:8000", MaxClientFrame: 8192, MaxOutbound: 256 << 10,
+	return Config{Addr: "tcp://:8000", MaxClientFrame: 8192, MaxOutbound: wire.HeaderLen + wire.MaxLength,
 		HandshakeConcurrency: max(1, (numLoops+1)/2), HandshakeRate: 25_000, HandshakeBurst: 2_500}
 }
 

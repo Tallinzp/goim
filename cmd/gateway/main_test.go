@@ -29,6 +29,9 @@ func TestDefaultFlagsAreValid(t *testing.T) {
 	if cfg.NumLoops != n || tc.HandshakeConcurrency != max(1, (n+1)/2) || cfg.Epoch == 0 {
 		t.Fatalf("loops %d, handshake concurrency %d, epoch %x", cfg.NumLoops, tc.HandshakeConcurrency, cfg.Epoch)
 	}
+	if tc.MaxOutbound != wire.HeaderLen+wire.MaxLength {
+		t.Fatalf("max outbound %d, want one max frame", tc.MaxOutbound)
+	}
 	if tc.Addr != "tcp://:8000" || sc.KickAddr != ":9100" || o.keyDir != "/etc/goim/noise" || o.drainTimeout != 85*time.Second {
 		t.Fatalf("defaults: %+v %+v %+v", tc, sc, o)
 	}
