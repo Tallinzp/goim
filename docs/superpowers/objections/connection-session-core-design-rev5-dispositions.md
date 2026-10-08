@@ -199,3 +199,22 @@ The client can't tell `at_capacity` from the other pre-handshake closes (`handsh
 - *Deployment:* Redis Cluster has **≥ 3 masters spread over ≥ 3 zones, and each master's replica in a different zone from its master**, so one zone loss never removes a majority of masters and every master has a replica outside its own zone. For a managed Redis, the equivalent multi-zone setting is named in the deployment config.
 - *Failure table:* add **Zone loss (Redis)**: masters in the lost zone fail over to their replicas in the surviving zones. Logins on those shards stall or come back `EXPIRED` for the failover time; logins on other shards are unaffected (R5S-O1). Lost writes are repaired as for a shard failover. Revoke may return retryable errors for shards whose replica was in the lost zone until a replica is rebuilt; the account service keeps retrying. The lease TTL rule (TTL > failover time + one renewal) already covers lease keys.
 - *Tests:* Tier 2 Redis failover test: additionally fail over every master of one zone at once (the shape of a zone loss: one master with 3 masters, two with 6), together with the replicas in that zone, and record failover time and the share of logins affected; the lease must survive at the configured TTL.
+
+---
+
+## Follow-up (2026-10-08) — decisions from the Plan 1 interface review
+
+These come from the user's review of the session store interfaces (Plan 1), not from a new review round. Refs *PI-<n>* are the review's decision points. Only PI-4 changes the spec; the others change code and are recorded in Plan 1's *Execution Notes*. **Not yet applied to the rev6 spec**: apply when the user asks (in place or in rev7).
+
+### PI-4 — `Revoke` takes `before_ms` from the account service — DECIDED: ACCEPT (option A)
+
+> **Decision (2026-10-08):** option A accepted: the account service supplies `before_ms` on the `Revoke` RPC. Option B (Logic stamps Redis `TIME`) was rejected.
+
+**Claim.** The marker is compared with `tok_iat`, which the account service's clock stamps. A marker stamped by Logic or Redis is on a different clock: if it runs ahead, a token issued right after a password change is rejected as `REVOKED` (the user is sent back to the login screen until the skew passes); if it runs behind, tokens issued in the skew window survive. Each retry of a failed `Revoke` would also stamp a later time, and `max()` keeps it, so a token issued between the first attempt and the successful retry is revoked by mistake.
+
+**Rationale.** Taking the time from the issuer makes the marker mean exactly "tokens this issuer issued before X", whatever the skew, and makes a retry resend the same value, so `Revoke` is truly idempotent.
+
+**Spec changes to apply:**
+- *Logic, RPCs and Revoke:* `Revoke(uid, scope = all | slot, before_ms, reason)`. `before_ms` is on the token issuer's clock, in the unit of `tok_iat` (ms); the account service sets it when it decides the revocation and resends the same value on every retry. The marker write is `revoked_before_ms = max(stored, before_ms)`.
+- *Logic, Revoke validation:* reject `before_ms ≤ 0` or more than 5 minutes ahead of Redis `TIME` (`INVALID_ARGUMENT`, not retryable); this catches a seconds-vs-ms bug.
+- *Tests:* a retried `Revoke` with the same `before_ms` leaves the marker unchanged; a token whose `iat` is ≥ `before_ms` logs in after the revoke; `before_ms` 10 minutes in the future is rejected.

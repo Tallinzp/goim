@@ -60,6 +60,14 @@
   - **`RenewLease`:** now one script (`lua/lease.lua`) that reads the old value, sets `<nonce>|<missing>` with `PX <TTL>`, and returns `TIME`. It runs through the cluster-routed client, and a re-run with the same nonce returns the first run's `Missing`. The lease value is no longer `1`; only its existence matters (validity rule).
   - **Plan 3 note:** a renewal RPC whose outcome is unknown (timeout, transport error) must be treated as `missing`, with a triggered pass, because the renewal may have recreated an absent key.
 
+- **Interface review decisions (2026-10-08).** The user reviewed the store interfaces before Plan 2 (decision points PI-1..PI-6):
+  - **PI-1, batch shape: kept.** `LoginEach`/`LogoutEach` (per-request callback) plus the collected `Login`/`Logout`; `ReadSlots`/`CompareAndSet` take and return slices; every per-request result carries its own error and a batch never fails as a whole; single-object methods return one `error`.
+  - **PI-2, kicks lost on a lost reply: Login accepts it, Revoke fixes it.** A re-run login that returns `LoginAlready` has no `Prev`; the old connection is closed by Reconcile within one cycle. Revoke must not lose its kicks: `rev_delete.lua` keeps the entries it deleted in a short-lived key so a re-run returns the same list (risk 11 changes accordingly). *To do: Task 11.*
+  - **PI-3, `Prev` decode errors: split.** `Err` means only "outcome unknown" (transport failure, malformed reply); if `Err == nil`, `Code` is authoritative. A stored entry that fails to decode goes in a new `PrevErr`; Logic follows `Code`, skips the kick (Reconcile is the backstop) and counts a metric. The same split applies to every result that carries a decoded entry (`ReadSlots`, Revoke's deleted list). *To do: Task 11.*
+  - **PI-4, `before_ms`: supplied by the account service.** The `Revoke` RPC gains `before_ms` (issuer clock, same unit as `tok_iat`; a retry resends the same value). This is a spec change, recorded as a follow-up in `objections/connection-session-core-design-rev5-dispositions.md`. The store signature `Revoke(ctx, uid, scope, beforeMs)` already fits; Plan 2 validates the value.
+  - **PI-5, clock skew: computed in Logic.** `RenewLease` keeps returning Redis `TIME`; Plan 2's `GatewayLease` handler computes and exports `clock_skew_ms`.
+  - **PI-6, Revoke after a Cluster failover: reload and retry once.** On `MOVED` or a connection error from the pinned connection, `Revoke` reloads the slot map, gets the master again and repeats the marker write and `WAIT` on a fresh pinned connection (safe: the marker is `max()` and `before_ms` is fixed per request). Tested with a fake that returns `MOVED` once; real Cluster behaviour stays under risk 10b until the Plan 6 Tier 2 Cluster scenario. *To do: Task 11.*
+
 ---
 
 ## File Structure
