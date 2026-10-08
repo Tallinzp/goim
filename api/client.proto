@@ -1,0 +1,110 @@
+// Client protocol bodies (spec: Client protocol). Every frame is a 6-byte
+// header (Version, Cmd, Flags, Length) and a payload; the frame codec and the
+// Noise handshake are the TCP transport's (Plan 4). The gateway core sees
+// only decoded frames (cmd, req_id, body), where body is one of the messages
+// below, protobuf-encoded.
+syntax = "proto3";
+
+package goim.client.v1;
+
+option go_package = "github.com/Tallinzp/goim/api/clientpb";
+
+// Cmd is the header's 2-byte command. HANDSHAKE is the TCP transport's only.
+enum Cmd {
+  CMD_UNSPECIFIED = 0;
+  CMD_HANDSHAKE = 1;   // key_id(2) || noise_msg, no req_id, no AEAD
+  CMD_LOGIN = 2;       // client: LoginReq
+  CMD_LOGIN_RESP = 3;  // server: LoginResp
+  CMD_PING = 4;        // client: empty body
+  CMD_PONG = 5;        // server: empty body, echoes the Ping's req_id
+  CMD_LOGOUT = 6;      // client: empty body
+  CMD_LOGOUT_RESP = 7; // server: the gateway accepted the logout (R4H-O8)
+  CMD_KICK = 8;        // server: Kick
+  CMD_RECONNECT = 9;   // server: Reconnect
+  CMD_ERROR = 10;      // server: Error (a rejected Login)
+  CMD_BUSY = 11;       // server: Busy
+}
+
+// Platform is the device class of a slot; numbered as in internal.proto.
+enum Platform {
+  PLATFORM_UNSPECIFIED = 0;
+  PLATFORM_MOBILE = 1;
+  PLATFORM_PAD = 2;
+  PLATFORM_WEB = 3;
+  PLATFORM_PC = 4;
+}
+
+// ReconnectReason says why the client is connecting (R1-O7).
+enum ReconnectReason {
+  RECONNECT_REASON_UNSPECIFIED = 0;
+  RECONNECT_REASON_FIRST_CONNECT = 1;
+  RECONNECT_REASON_RST_FIN = 2;
+  RECONNECT_REASON_PONG_TIMEOUT = 3;
+  // A retryable reject, including a close before the handshake completed (R3-O5).
+  RECONNECT_REASON_BUSY_RETRY = 4;
+  RECONNECT_REASON_DRAIN = 5;         // after Reconnect{jitter_ms} (R4H-O3)
+  RECONNECT_REASON_LOCAL_TRIGGER = 6; // network change or app foreground
+}
+
+message LoginReq {
+  string token = 1;
+  string appid = 2;
+  Platform platform = 3;
+  string device_id = 4;
+  uint64 conn_seq = 5;
+  ReconnectReason reconnect_reason = 6;
+  int64 offline_ms = 7; // ms since the client detected the loss (monotonic)
+}
+
+// Window is a uniform random wait [lo_ms, hi_ms] (R5S-O6).
+message Window {
+  uint32 lo_ms = 1;
+  uint32 hi_ms = 2;
+}
+
+message LoginResp {
+  uint32 heartbeat_s = 1;
+  // Reconnect windows; an absent one keeps the SDK's current value (R5S-O6).
+  Window storm_wait = 2;
+  Window local_trigger = 3;
+  Window pre_handshake_retry = 4;
+  Window retryable = 5;
+}
+
+// ErrorCode is a rejected Login (spec: Login errors; roadmap choice #17).
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_STALE = 1;         // stored_conn_seq is set
+  ERROR_CODE_SUPERSEDED = 2;
+  ERROR_CODE_EXPIRED = 3;
+  ERROR_CODE_REVOKED = 4;
+  ERROR_CODE_KEY_UNKNOWN = 5;
+  ERROR_CODE_TOKEN_INVALID = 6;
+  ERROR_CODE_BAD_REQUEST = 7;
+}
+
+message Error {
+  ErrorCode code = 1;
+  uint64 stored_conn_seq = 2; // STALE only
+}
+
+// KickReason is numbered as in internal.proto. None of them makes the client
+// reconnect on its own.
+enum KickReason {
+  KICK_REASON_UNSPECIFIED = 0;
+  KICK_REASON_REPLACED = 1;
+  KICK_REASON_KICKED_BY_OTHER_DEVICE = 2;
+  KICK_REASON_REVOKED = 3;
+}
+
+message Kick {
+  KickReason reason = 1;
+}
+
+message Reconnect {
+  uint32 jitter_ms = 1; // wait uniform [0, jitter_ms], then reconnect (R4H-O3)
+}
+
+message Busy {
+  uint32 retry_after_ms = 1;
+}
