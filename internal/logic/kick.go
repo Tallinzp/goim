@@ -1,0 +1,266 @@
+package logic
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"strconv"
+	"sync"
+	"time"
+
+	pb "github.com/Tallinzp/goim/api/internalpb"
+	"github.com/Tallinzp/goim/internal/store"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+)
+
+// DialFunc opens a client connection to a gateway pod by name. It must not
+// block (grpc.NewClient connects lazily).
+type DialFunc func(gateway string) (*grpc.ClientConn, error)
+
+// PodDNSDial dials gateways by StatefulSet pod DNS through addrFormat
+// (spec: Logic→Gateway Kick, no registry).
+func PodDNSDial(addrFormat string) DialFunc {
+	return func(gw string) (*grpc.ClientConn, error) {
+		return grpc.NewClient("dns:///"+fmt.Sprintf(addrFormat, gw),
+			grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+}
+
+// Kicker is the hardened Kick client (R1-O8, R2-O6, R5S-O2). Each target
+// gw|epoch has a bounded queue drained by a bounded set of workers; every
+// attempt has its own deadline; retries go through the same queue and happen
+// only while the target's lease is live. A full queue drops the attempt:
+// Reconcile is the backstop (race 8).
+type Kicker struct {
+	cfg    KickConfig
+	leases *LeaseCache
+	m      *Metrics
+	dial   DialFunc
+
+	mu      sync.Mutex
+	targets map[store.EpochRef]*kickTarget
+	conns   map[string]*gwConn // by gateway pod name, shared by its epochs
+	closed  bool
+	done    chan struct{}
+	wg      sync.WaitGroup
+}
+
+type kickTarget struct {
+	ref     store.EpochRef
+	label   string
+	q       chan kickJob
+	client  pb.GatewayClient
+	workers int // running workers; guarded by Kicker.mu
+}
+
+type gwConn struct {
+	cc   *grpc.ClientConn
+	refs int
+}
+
+type kickJob struct {
+	connID  uint64
+	reason  pb.KickReason
+	attempt int // 0 = first
+}
+
+// NewKicker returns a Kicker; Close stops it.
+func NewKicker(cfg KickConfig, leases *LeaseCache, m *Metrics, dial DialFunc) *Kicker {
+	return &Kicker{cfg: cfg, leases: leases, m: m, dial: dial,
+		targets: map[store.EpochRef]*kickTarget{}, conns: map[string]*gwConn{}, done: make(chan struct{})}
+}
+
+// Kick queues the first attempt and returns at once. The first attempt is
+// always queued, whatever the target's lease looks like (R2-O6).
+func (k *Kicker) Kick(ref store.EpochRef, connID uint64, reason pb.KickReason) {
+	k.enqueue(ref, kickJob{connID: connID, reason: reason})
+}
+
+func (k *Kicker) enqueue(ref store.EpochRef, j kickJob) {
+	k.mu.Lock()
+	if k.closed {
+		k.mu.Unlock()
+		return
+	}
+	t, err := k.targetLocked(ref)
+	if err != nil {
+		k.mu.Unlock()
+		slog.Warn("kick: dial failed", "gw", ref.Gateway, "epoch", ref.Epoch, "err", err)
+		k.m.KickGiveUps.WithLabelValues(k.cachedLeaseLabel(ref)).Inc()
+		return
+	}
+	select {
+	case t.q <- j:
+		k.m.KickQueueDepth.WithLabelValues(t.label).Set(float64(len(t.q)))
+		// Workers follow the load up to the cap and retire when idle.
+		if t.workers < k.cfg.Workers {
+			t.workers++
+			k.wg.Add(1)
+			go k.work(t)
+		}
+		k.mu.Unlock()
+	default:
+		k.mu.Unlock()
+		k.m.KickDropped.WithLabelValues(k.cachedLeaseLabel(ref)).Inc()
+	}
+}
+
+// targetLocked returns ref's target, creating it if needed.
+func (k *Kicker) targetLocked(ref store.EpochRef) (*kickTarget, error) {
+	if t, ok := k.targets[ref]; ok {
+		return t, nil
+	}
+	c, ok := k.conns[ref.Gateway]
+	if !ok {
+		cc, err := k.dial(ref.Gateway)
+		if err != nil {
+			return nil, err
+		}
+		c = &gwConn{cc: cc}
+		k.conns[ref.Gateway] = c
+	}
+	c.refs++
+	t := &kickTarget{ref: ref, label: ref.Gateway + ":" + strconv.FormatUint(ref.Epoch, 10),
+		q: make(chan kickJob, k.cfg.Queue), client: pb.NewGatewayClient(c.cc)}
+	k.targets[ref] = t
+	return t, nil
+}
+
+// work drains t's queue. A worker idle for IdleTimeout exits; the last one
+// out removes the target, so dead epochs don't keep goroutines or connections.
+func (k *Kicker) work(t *kickTarget) {
+	defer k.wg.Done()
+	idle := time.NewTimer(k.cfg.IdleTimeout)
+	defer idle.Stop()
+	for {
+		select {
+		case j := <-t.q:
+			k.m.KickQueueDepth.WithLabelValues(t.label).Set(float64(len(t.q)))
+			k.attempt(t, j)
+			idle.Reset(k.cfg.IdleTimeout)
+		case <-idle.C:
+			if k.retire(t) {
+				return
+			}
+			idle.Reset(k.cfg.IdleTimeout)
+		case <-k.done:
+			return
+		}
+	}
+}
+
+// retire lets one idle worker exit unless work arrived meanwhile. The last
+// worker out removes the target and, with it, the gateway's connection if no
+// other epoch of that gateway uses it.
+func (k *Kicker) retire(t *kickTarget) bool {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if len(t.q) > 0 {
+		return false
+	}
+	t.workers--
+	if t.workers > 0 {
+		return true
+	}
+	delete(k.targets, t.ref)
+	k.m.KickQueueDepth.DeleteLabelValues(t.label)
+	if c := k.conns[t.ref.Gateway]; c != nil {
+		if c.refs--; c.refs == 0 {
+			delete(k.conns, t.ref.Gateway)
+			c.cc.Close()
+		}
+	}
+	return true
+}
+
+func (k *Kicker) attempt(t *kickTarget, j kickJob) {
+	kind := "first"
+	if j.attempt > 0 {
+		kind = "retry"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), k.cfg.Deadline)
+	start := time.Now()
+	// Fail-fast (no WaitForReady): a dead pod's address fails or times out
+	// within Deadline instead of blocking on connect (R5S-O2).
+	_, err := t.client.Kick(ctx, &pb.KickRequest{Gw: pbRef(t.ref), ConnId: j.connID, Reason: j.reason})
+	cancel()
+	k.m.KickAttemptSeconds.Observe(time.Since(start).Seconds())
+	if err == nil {
+		k.m.KickAttempts.WithLabelValues(kind, "ok").Inc()
+		return
+	}
+	k.m.KickAttempts.WithLabelValues(kind, "error").Inc()
+	if c := status.Code(err); (c != codes.Unavailable && c != codes.DeadlineExceeded) || j.attempt >= k.cfg.Retries {
+		k.m.KickGiveUps.WithLabelValues(k.leaseLabel(t.ref)).Inc()
+		return
+	}
+	// Retry only while the target's lease is live (R2-O6).
+	if k.leaseLabel(t.ref) != "live" {
+		k.m.KickGiveUps.WithLabelValues("dead").Inc()
+		return
+	}
+	j.attempt++
+	time.AfterFunc(k.cfg.RetrySpacing, func() { k.enqueue(t.ref, j) })
+}
+
+// leaseLabel is the target_lease label: live, dead, or unknown if the lease
+// could not be read. It may read Redis: call it from a worker only.
+func (k *Kicker) leaseLabel(ref store.EpochRef) string {
+	ctx, cancel := context.WithTimeout(context.Background(), k.cfg.Deadline)
+	defer cancel()
+	live, err := k.leases.LiveOne(ctx, ref)
+	switch {
+	case err != nil:
+		return "unknown"
+	case live:
+		return "live"
+	default:
+		return "dead"
+	}
+}
+
+// cachedLeaseLabel is leaseLabel from the cache only. enqueue runs on the
+// caller's goroutine (a Login result callback, Reconcile, Revoke) and must not
+// wait on Redis (R5S-O2); a target's workers keep its observation fresh.
+func (k *Kicker) cachedLeaseLabel(ref store.EpochRef) string {
+	live, ok := k.leases.Peek(ref)
+	switch {
+	case !ok:
+		return "unknown"
+	case live:
+		return "live"
+	default:
+		return "dead"
+	}
+}
+
+// Close stops every worker and closes every connection. Queued Kicks are
+// dropped; Reconcile is the backstop.
+func (k *Kicker) Close() {
+	k.mu.Lock()
+	if k.closed {
+		k.mu.Unlock()
+		return
+	}
+	k.closed = true
+	close(k.done)
+	k.mu.Unlock()
+	k.wg.Wait()
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	for gw, c := range k.conns {
+		c.cc.Close()
+		delete(k.conns, gw)
+	}
+	k.targets = map[store.EpochRef]*kickTarget{}
+}
+
+// targetCount is for tests.
+func (k *Kicker) targetCount() int {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return len(k.targets)
+}
