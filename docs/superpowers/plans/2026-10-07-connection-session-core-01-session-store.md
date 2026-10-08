@@ -3276,6 +3276,793 @@ Open risk, added to *Execution Notes* risk 7 (Redis Cluster): the grouping by `M
 
 ---
 
+### Task 11: Interface review follow-ups (PI-2, PI-3, PI-6)
+
+> Follow-up added 2026-10-08 after the user's review of the store interfaces (decisions PI-1..PI-6 in *Execution Notes*). Three decisions change code:
+> - **PI-2 (Revoke part):** a re-run of Revoke's delete step must return the entries the request already deleted, so their kicks are not lost. Login keeps `LoginAlready` without `Prev` (Reconcile closes the old connection).
+> - **PI-3:** `Err` means only "outcome unknown". A stored entry that does not decode goes in its own field (`LoginResult.PrevErr`, `SlotState.StoredErr`, `Revoked.EntryErr`), and the rest of the result stays valid.
+> - **PI-6:** after a Cluster failover, Revoke reloads the slot map and retries the marker write and `WAIT` once on the new master.
+>
+> PI-4 (`before_ms` from the account service) needs no store change beyond rejecting `beforeMs <= 0`: the store already takes `beforeMs`, and the value now also names the request for PI-2. The code below was prototyped against commit `6556a68`; `go vet ./...` and `go test -race -count=1 ./...` pass on miniredis.
+
+**Files:**
+- Modify: `internal/store/login.go`, `internal/store/reconcile.go`, `internal/store/keys.go`, `internal/store/store.go`, `internal/store/revoke.go`, `internal/store/lua/rev_delete.lua`
+- Test: `internal/store/prev_err_test.go` (new), `internal/store/revoke_reroute_test.go` (new), `internal/store/revoke_test.go`, `internal/store/keys_test.go`
+
+**Interfaces:**
+- Consumes: `LoginResult`, `parseLogin` (Task 3); `SlotState`, `readSlot`, `CompareAndSet` (Task 6); `Revoke`, `deleteRevoked`, `markRevoked`, `revMarkScript` (Task 5); `nodeFor`, `Store.groupOf` (Tasks 3 and 10); test helpers `newStore`, `entry`, `nowMs`, `login1`, `markScript`, `field`.
+- Produces (package `store`):
+  - `LoginResult.PrevErr error`: set, with `Prev` nil, when the stored entry the script returned does not decode. `Err` is now set only when the outcome is unknown; if `Err == nil`, `Code` is what the script did.
+  - `SlotState.StoredErr error`: set, with `Stored` nil, when `Raw` does not decode. `Raw` is still set and works as `CASReq.ExpectRaw`. `MarkerMs` is still read. `Err` means only "outcome unknown".
+  - `Revoked.EntryErr error`: set, with `Entry` zero, when a deleted value does not decode. `Revoke` no longer stops at such a value: every deleted field is reported.
+  - `Revoke(ctx, uid, scope, beforeMs)`: same signature. It rejects `beforeMs <= 0`. A re-run with the same `(uid, scope, beforeMs)` returns every entry that request has deleted, for `revDeletedTTL` (5 min). Results are sorted by field. After a `MOVED`, `READONLY` or connection error on the cached master, it waits up to `rerouteWait` (2s) for the slot map to name another master and retries once there.
+  - unexported: `revDeletedKey(uid, scope, beforeMs)` (`revdel:{uid}:<scope>:<before_ms>`), `revDeletedTTL`, `Store.masterFor`, `Store.reloadSlots`, `Store.rerouteWait`, `markOn`, `staleMaster`, `rerouteMaster`.
+
+How Plan 2 uses it:
+- **Login handler.** If `Err != nil`, the entry failed and the gateway retries. Otherwise answer by `Code`. When `PrevErr != nil`, do not kick, and count `login_prev_undecodable`.
+- **Reconcile handler.** A slot with `StoredErr` set can't be a valid owner, so the chunk wins (rule 3 is skipped) and the CAS uses `Raw` as `ExpectRaw`. Count `reconcile_stored_undecodable`.
+- **Revoke handler.** Kick every `Revoked` whose `EntryErr` is nil with reason `REVOKED`, and count the others. The connections behind the others are closed by Reconcile rule 1.
+
+Why `revdel` and not a field in `rev:{uid}`: the deleted list is per request and short-lived, and `rev:{uid}` must keep its 30-day TTL. A separate key with its own 5-minute TTL keeps the marker hash unchanged. The key shares the `{uid}` hash tag, so `rev_delete.lua` can write it in the same script. A request that deletes nothing writes no key.
+
+Why poll after `ReloadState`: in go-redis v9.23 `ClusterClient.ReloadState` only schedules a reload in the background (`LazyReload`), so `MasterForKey` keeps naming the old master until that reload lands. The test fake reproduces this by switching masters only after the second reload call.
+
+Tier 2 note: `scripts/tier2/store.sh` mutates `conn.Wait(ctx, 1, s.cfg.WaitTimeout)` into `node.Wait(...)`. `markOn` keeps its parameter named `node`, so the mutant still compiles. The prototype checked this.
+
+- [ ] **Step 1: Write the failing tests**
+
+`internal/store/prev_err_test.go`:
+
+```go
+package store
+
+import (
+	"testing"
+
+	"github.com/Tallinzp/goim/internal/testredis"
+)
+
+// undecodable is a stored value the Lua scripts can still read (device_id,
+// conn_seq, login_ms and tok_iat are fine) but session.Decode rejects (the
+// epoch is not a number): written by an older version, or by hand.
+const undecodable = "gw-1|not-a-number|1|other-dev|1|1|1000"
+
+// PI-3: the login went through, so Err is nil and Code stands; only the
+// replaced entry is unusable, and that is reported in PrevErr.
+func TestLoginReportsUndecodablePrevSeparately(t *testing.T) {
+	s, rdb := newStore(t)
+	uid := testredis.UID()
+	rdb.HSet(ctx, sessKey(uid), field, undecodable)
+	e := entry(7, "d", 1, nowMs(t, s))
+
+	r := login1(t, s, uid, e)
+	if r.Err != nil || r.Code != LoginKicked {
+		t.Fatalf("result = %+v; want KICKED with Err nil", r)
+	}
+	if r.Prev != nil || r.PrevErr == nil {
+		t.Fatalf("Prev = %v, PrevErr = %v; want nil and the decode error", r.Prev, r.PrevErr)
+	}
+	if got := rdb.HGet(ctx, sessKey(uid), field).Val(); got != e.Encode() {
+		t.Fatalf("stored = %q, want the new entry", got)
+	}
+}
+
+// PI-3: ReadSlots keeps Raw (usable as ExpectRaw), reports the decode error in
+// StoredErr and still reads the marker; Err stays nil.
+func TestReadSlotsReportsUndecodableStoredSeparately(t *testing.T) {
+	s, rdb := newStore(t)
+	uid := testredis.UID()
+	rdb.HSet(ctx, sessKey(uid), field, undecodable)
+	markScript(t, s, uid, ScopeAll, 500)
+
+	st := s.ReadSlots(ctx, []SlotRef{{UID: uid, Field: field}})[0]
+	if st.Err != nil || st.Raw != undecodable || st.Stored != nil || st.StoredErr == nil || st.MarkerMs != 500 {
+		t.Fatalf("state = %+v", st)
+	}
+	e := entry(7, "d", 1, nowMs(t, s))
+	cas := s.CompareAndSet(ctx, []CASReq{{UID: uid, Field: field, ExpectRaw: st.Raw, Entry: e, SentMs: nowMs(t, s)}})[0]
+	if cas.Err != nil || cas.Code != CASWritten {
+		t.Fatalf("CompareAndSet over the undecodable value = %+v; want WRITTEN", cas)
+	}
+}
+```
+
+`internal/store/revoke_reroute_test.go`:
+
+```go
+package store
+
+import (
+	"context"
+	"errors"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/Tallinzp/goim/internal/testredis"
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
+)
+
+// failedOverMaster stands in for a master that lost its slots in a failover:
+// every command gets reply (e.g. "MOVED ..."). With reply "" it is a node
+// that refuses connections.
+func failedOverMaster(t *testing.T, reply string) *redis.Client {
+	t.Helper()
+	addr := "127.0.0.1:1" // nothing listens on port 1: the dial is refused
+	if reply != "" {
+		m := miniredis.RunT(t)
+		m.SetError(reply)
+		addr = m.Addr()
+	}
+	c := redis.NewClient(&redis.Options{Addr: addr, MaxRetries: -1})
+	t.Cleanup(func() { c.Close() })
+	return c
+}
+
+// rerouteStore resolves every key to old until the slot map has been reloaded
+// mapAfter times, and to the store's own node after that (mapAfter < 0: never).
+// It returns the store, its own node and the reload counter.
+func rerouteStore(t *testing.T, old *redis.Client, mapAfter int32) (*Store, *redis.Client, *atomic.Int32) {
+	t.Helper()
+	s, rdb := newStore(t)
+	var reloads atomic.Int32
+	s.reloadSlots = func(context.Context) { reloads.Add(1) }
+	s.masterFor = func(context.Context, string) (*redis.Client, error) {
+		if mapAfter >= 0 && reloads.Load() >= mapAfter {
+			return rdb, nil
+		}
+		return old, nil
+	}
+	return s, rdb, &reloads
+}
+
+// Revoke's final outcome on the store's own node: success against a real
+// primary with a replica (Tier 2), ErrNotReplicated on miniredis (Tier 1a).
+func wantRevokeOutcome(t *testing.T, err error) {
+	t.Helper()
+	if testredis.Real() {
+		if err != nil {
+			t.Fatalf("err = %v, want success on the new master", err)
+		}
+	} else if !errors.Is(err, ErrNotReplicated) {
+		t.Fatalf("err = %v, want ErrNotReplicated from the new master (miniredis WAIT is 0)", err)
+	}
+}
+
+// PI-6: a MOVED reply from the cached master makes Revoke reload the slot map
+// and write and confirm the marker on the new master.
+func TestRevokeReroutesAfterMoved(t *testing.T) {
+	old := failedOverMaster(t, "MOVED 1234 10.0.0.9:6379")
+	s, rdb, reloads := rerouteStore(t, old, 2) // the async reload lands on the 2nd poll
+	uid := testredis.UID()
+
+	_, err := s.Revoke(ctx, uid, ScopeAll, 2000)
+	wantRevokeOutcome(t, err)
+	if v := rdb.HGet(ctx, revKey(uid), ScopeAll).Val(); v != "2000" {
+		t.Fatalf("marker on the new master = %q, want 2000", v)
+	}
+	if n := reloads.Load(); n != 2 {
+		t.Fatalf("slot map reloaded %d times, want 2 (poll until it changes)", n)
+	}
+}
+
+// PI-6: the old master is gone (connection refused): same re-route.
+func TestRevokeReroutesAfterConnectionError(t *testing.T) {
+	s, rdb, _ := rerouteStore(t, failedOverMaster(t, ""), 1)
+	uid := testredis.UID()
+	_, err := s.Revoke(ctx, uid, ScopeAll, 2000)
+	wantRevokeOutcome(t, err)
+	if v := rdb.HGet(ctx, revKey(uid), ScopeAll).Val(); v != "2000" {
+		t.Fatalf("marker on the new master = %q, want 2000", v)
+	}
+}
+
+// PI-6: the slot map never changes within rerouteWait: Revoke returns the
+// original MOVED error (retryable by the account service) and deletes nothing.
+func TestRevokeGivesUpWhenTheSlotMapDoesNotChange(t *testing.T) {
+	s, rdb, reloads := rerouteStore(t, failedOverMaster(t, "MOVED 1234 10.0.0.9:6379"), -1)
+	s.rerouteWait = 300 * time.Millisecond
+	uid := testredis.UID()
+	rdb.HSet(ctx, sessKey(uid), field, entry(1, "d", 1, nowMs(t, s)).Encode())
+
+	start := time.Now()
+	_, err := s.Revoke(ctx, uid, ScopeAll, 2000)
+	if _, moved := redis.IsMovedError(err); !moved {
+		t.Fatalf("err = %v, want the MOVED error", err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("gave up after %v, want about rerouteWait", d)
+	}
+	if reloads.Load() < 2 {
+		t.Fatalf("slot map reloaded %d times, want polling", reloads.Load())
+	}
+	if !rdb.HExists(ctx, sessKey(uid), field).Val() {
+		t.Fatal("nothing may be deleted when the marker was not confirmed")
+	}
+}
+
+// PI-6: a single-node client has no slot map, and ErrNotReplicated or a
+// script error is final: neither triggers a re-route.
+func TestRevokeDoesNotRerouteFinalErrors(t *testing.T) {
+	s, _ := newStore(t)
+	if s.reloadSlots != nil {
+		t.Fatal("a single-node client must not get a slot-map reload")
+	}
+	for _, err := range []error{ErrNotReplicated, context.DeadlineExceeded,
+		redis.Nil /* a Redis reply */, nil} {
+		if staleMaster(err) {
+			t.Errorf("staleMaster(%v) = true, want false", err)
+		}
+	}
+	s2, _, reloads := rerouteStore(t, failedOverMaster(t, "ERR Error running script"), 1)
+	if _, err := s2.Revoke(ctx, testredis.UID(), ScopeAll, 2000); err == nil || errors.Is(err, ErrNotReplicated) {
+		t.Fatalf("err = %v, want the script error", err)
+	}
+	if reloads.Load() != 0 {
+		t.Fatal("a script error must not trigger a re-route")
+	}
+}
+```
+
+`internal/store/revoke_test.go`: pass `beforeMs` to `deleteRevoked`, check that a retry returns the same deletion, and add the two new tests:
+
+```diff
+diff --git a/internal/store/revoke_test.go b/internal/store/revoke_test.go
+index c3f086b..d55476a 100644
+--- a/internal/store/revoke_test.go
++++ b/internal/store/revoke_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"testing"
+ 	"time"
+ 
++	"github.com/Tallinzp/goim/internal/session"
+ 	"github.com/Tallinzp/goim/internal/testredis"
+ )
+ 
+@@ -55,7 +56,7 @@ func TestRevokeDeletesOnlyAffectedFields(t *testing.T) {
+ 		write(uid, "im:mobile", 1, 1000)
+ 		write(uid, "im:pc", 2, 1000)
+ 		markScript(t, s, uid, ScopeAll, 2000)
+-		got, err := s.deleteRevoked(ctx, uid, ScopeAll)
++		got, err := s.deleteRevoked(ctx, uid, ScopeAll, 2000)
+ 		if err != nil || len(got) != 2 {
+ 			t.Fatalf("deleteRevoked = %+v, %v; want 2 deleted", got, err)
+ 		}
+@@ -68,7 +69,7 @@ func TestRevokeDeletesOnlyAffectedFields(t *testing.T) {
+ 		write(uid, "im:mobile", 1, 1000)
+ 		write(uid, "im:pc", 2, 1000)
+ 		markScript(t, s, uid, "im:pc", 2000)
+-		got, err := s.deleteRevoked(ctx, uid, "im:pc")
++		got, err := s.deleteRevoked(ctx, uid, "im:pc", 2000)
+ 		if err != nil || len(got) != 1 || got[0].Field != "im:pc" || got[0].Entry.ConnID != 2 {
+ 			t.Fatalf("deleteRevoked = %+v, %v", got, err)
+ 		}
+@@ -82,7 +83,7 @@ func TestRevokeDeletesOnlyAffectedFields(t *testing.T) {
+ 		write(uid, "im:mobile", 1, 1000)
+ 		write(uid, "im:pc", 2, 3000)
+ 		markScript(t, s, uid, ScopeAll, 2000)
+-		got, err := s.deleteRevoked(ctx, uid, ScopeAll)
++		got, err := s.deleteRevoked(ctx, uid, ScopeAll, 2000)
+ 		if err != nil || len(got) != 1 || got[0].Entry.ConnID != 1 {
+ 			t.Fatalf("deleteRevoked = %+v, %v; want only conn 1", got, err)
+ 		}
+@@ -95,6 +96,11 @@ func TestRevokeDeletesOnlyAffectedFields(t *testing.T) {
+ 			t.Fatal("scope without platform accepted")
+ 		}
+ 	})
++	t.Run("before_ms must be positive", func(t *testing.T) {
++		if _, err := s.Revoke(ctx, testredis.UID(), ScopeAll, 0); err == nil {
++			t.Fatal("before_ms 0 accepted")
++		}
++	})
+ }
+ 
+ // With no replica to acknowledge (miniredis at Tier 1a always answers WAIT
+@@ -128,8 +134,9 @@ func TestRevokeEndToEnd(t *testing.T) {
+ 	if ttl := rdb.PTTL(ctx, revKey(uid)).Val(); ttl < DefaultConfig().SessTTL-time.Minute {
+ 		t.Fatalf("rev TTL = %v", ttl)
+ 	}
+-	if _, err := s.Revoke(ctx, uid, ScopeAll, 2000); err != nil { // idempotent retry
+-		t.Fatal(err)
++	again, err := s.Revoke(ctx, uid, ScopeAll, 2000) // the account service's retry
++	if err != nil || len(again) != 1 || again[0].Entry != e {
++		t.Fatalf("retry = %+v, %v; want the first attempt's deletion again (PI-2)", again, err)
+ 	}
+ }
+ 
+@@ -170,3 +177,74 @@ func TestRevokeFailsWhenReplicaDoesNotAck(t *testing.T) {
+ 		t.Fatalf("retry: %+v, %v", got, err)
+ 	}
+ }
++
++// PI-2: a re-run of the delete step (go-redis re-sends after a lost reply, or
++// the account service retries Revoke with the same before_ms) returns every
++// entry the request deleted, so its kicks are not lost.
++func TestRevokeReRunReturnsTheSameDeletions(t *testing.T) {
++	s, rdb := newStore(t)
++	uid := testredis.UID()
++	a, b := entry(1, "d", 1, nowMs(t, s)), entry(2, "d", 1, nowMs(t, s))
++	rdb.HSet(ctx, sessKey(uid), "im:mobile", a.Encode(), "im:pc", b.Encode())
++	markScript(t, s, uid, ScopeAll, 2000)
++
++	first, err := s.deleteRevoked(ctx, uid, ScopeAll, 2000)
++	if err != nil || len(first) != 2 {
++		t.Fatalf("first run = %+v, %v", first, err)
++	}
++	again, err := s.deleteRevoked(ctx, uid, ScopeAll, 2000)
++	if err != nil || len(again) != 2 || again[0] != first[0] || again[1] != first[1] {
++		t.Fatalf("re-run = %+v, %v; want %+v", again, err, first)
++	}
++	if again[0].Field != "im:mobile" || again[0].Entry != a || again[1].Entry != b {
++		t.Fatalf("re-run = %+v; want sorted by field with the deleted entries", again)
++	}
++	ttl := rdb.PTTL(ctx, revDeletedKey(uid, ScopeAll, 2000)).Val()
++	if ttl <= 0 || ttl > revDeletedTTL {
++		t.Fatalf("revdel TTL = %v, want (0, %v]", ttl, revDeletedTTL)
++	}
++
++	// A different request (another before_ms) does not inherit those kicks.
++	markScript(t, s, uid, ScopeAll, 3000)
++	if other, err := s.deleteRevoked(ctx, uid, ScopeAll, 3000); err != nil || len(other) != 0 {
++		t.Fatalf("another request = %+v, %v; want nothing", other, err)
++	}
++	// A request that deleted nothing leaves no key behind.
++	if rdb.Exists(ctx, revDeletedKey(uid, ScopeAll, 3000)).Val() != 0 {
++		t.Fatal("a request that deleted nothing must not write a revdel key")
++	}
++}
++
++// PI-3: a stored value that Go cannot decode is still deleted and reported,
++// with EntryErr set and Err nil; the other fields are unaffected. A value whose
++// tok_iat is not a number cannot be a valid session and is deleted too.
++func TestRevokeReportsUndecodableEntries(t *testing.T) {
++	s, rdb := newStore(t)
++	uid := testredis.UID()
++	good := entry(1, "d", 1, nowMs(t, s))
++	rdb.HSet(ctx, sessKey(uid),
++		"im:mobile", good.Encode(),
++		"im:pc", "gw-1|not-a-number|1|d|1|1|1000", // Lua reads tok_iat; Go rejects the epoch
++		"im:pad", "garbage") // no tok_iat at all
++	markScript(t, s, uid, ScopeAll, 2000)
++
++	got, err := s.deleteRevoked(ctx, uid, ScopeAll, 2000)
++	if err != nil || len(got) != 3 {
++		t.Fatalf("deleteRevoked = %+v, %v; want 3 deleted and no error", got, err)
++	}
++	byField := map[string]Revoked{}
++	for _, r := range got {
++		byField[r.Field] = r
++	}
++	if r := byField["im:mobile"]; r.EntryErr != nil || r.Entry != good {
++		t.Fatalf("im:mobile = %+v", r)
++	}
++	for _, f := range []string{"im:pc", "im:pad"} {
++		if r := byField[f]; r.EntryErr == nil || r.Entry != (session.Entry{}) {
++			t.Fatalf("%s = %+v; want EntryErr set and a zero Entry", f, r)
++		}
++	}
++	if n := rdb.HLen(ctx, sessKey(uid)).Val(); n != 0 {
++		t.Fatalf("%d fields left", n)
++	}
++}
+```
+
+`internal/store/keys_test.go`:
+
+```diff
+diff --git a/internal/store/keys_test.go b/internal/store/keys_test.go
+index b8156ce..0c437dc 100644
+--- a/internal/store/keys_test.go
++++ b/internal/store/keys_test.go
+@@ -23,6 +23,12 @@ func TestKeysShareSlotsWhereScriptsNeedIt(t *testing.T) {
+ 	if hashTag(sessKey("10086")) != hashTag(revKey("10086")) {
+ 		t.Fatal("sess:{uid} and rev:{uid} must share a slot: the login and Reconcile Lua read both")
+ 	}
++	if hashTag(revDeletedKey("10086", "im:pc", 2000)) != hashTag(sessKey("10086")) {
++		t.Fatal("revdel:{uid}:... must share the slot of sess:{uid}: rev_delete.lua writes it")
++	}
++	if got, want := revDeletedKey("10086", ScopeAll, 2000), "revdel:{10086}:*:2000"; got != want {
++		t.Fatalf("revDeletedKey = %q, want %q", got, want)
++	}
+ 	r := EpochRef{Gateway: "gw-17", Epoch: 1<<63 + 1}
+ 	if hashTag(r.leaseKey()) != hashTag(r.connsKey()) || hashTag(r.leaseKey()) != hashTag(r.sweepKey()) {
+ 		t.Fatal("per-epoch keys must share a slot")
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `go vet ./internal/store`
+Expected: FAIL to build. The errors include `not enough arguments in call to s.deleteRevoked`, `r.PrevErr undefined`, `st.StoredErr undefined`, `undefined: revDeletedKey`, `s.reloadSlots undefined` and `undefined: staleMaster`.
+
+- [ ] **Step 3: Implement**
+
+`internal/store/login.go`:
+
+```diff
+diff --git a/internal/store/login.go b/internal/store/login.go
+index 4bdb154..19bd506 100644
+--- a/internal/store/login.go
++++ b/internal/store/login.go
+@@ -34,12 +34,17 @@ type LoginReq struct {
+ 	Entry session.Entry
+ }
+ 
+-// LoginResult is the outcome of one LoginReq. Prev is the stored entry the
+-// script saw (nil if the slot was empty or the result is EXPIRED/REVOKED).
++// LoginResult is the outcome of one LoginReq. Err is set only when the outcome
++// is unknown (transport failure, invalid request, malformed reply); if Err is
++// nil, Code is what the script did. Prev is the stored entry the script saw
++// (nil if it returned none). If that entry did not decode, Prev is nil and
++// PrevErr says why: follow Code, skip the kick (Reconcile closes the old
++// connection) and count it (PI-3).
+ type LoginResult struct {
+-	Code LoginCode
+-	Prev *session.Entry
+-	Err  error
++	Code    LoginCode
++	Prev    *session.Entry
++	PrevErr error
++	Err     error
+ }
+ 
+ var loginScript = mustScript("login.lua")
+@@ -99,7 +104,7 @@ func parseLogin(vals []any, err error) LoginResult {
+ 	if prev != "" {
+ 		e, err := session.Decode(prev)
+ 		if err != nil {
+-			res.Err = err
++			res.PrevErr = err
+ 			return res
+ 		}
+ 		res.Prev = &e
+```
+
+`internal/store/reconcile.go`:
+
+```diff
+diff --git a/internal/store/reconcile.go b/internal/store/reconcile.go
+index d5973e1..93b45f4 100644
+--- a/internal/store/reconcile.go
++++ b/internal/store/reconcile.go
+@@ -17,10 +17,11 @@ type SlotRef struct {
+ 
+ // SlotState is what Logic observes before applying Reconcile rules 1–4.
+ type SlotState struct {
+-	Raw      string         // stored value; "" if the field is absent
+-	Stored   *session.Entry // decoded Raw; nil if absent
+-	MarkerMs int64          // effective revocation marker: max(rev[*], rev[field]), 0 if none
+-	Err      error
++	Raw       string         // stored value; "" if the field is absent
++	Stored    *session.Entry // decoded Raw; nil if absent or StoredErr is set
++	StoredErr error          // Raw did not decode (PI-3); Raw still works as CASReq.ExpectRaw
++	MarkerMs  int64          // effective revocation marker: max(rev[*], rev[field]), 0 if none
++	Err       error          // outcome unknown: nothing else in the state is valid
+ }
+ 
+ func (r SlotRef) validate() error {
+@@ -62,11 +63,12 @@ func readSlot(get *redis.StringCmd, mark *redis.SliceCmd) SlotState {
+ 	case err != nil:
+ 		return SlotState{Err: err}
+ 	default:
+-		e, err := session.Decode(raw)
+-		if err != nil {
+-			return SlotState{Err: err}
++		st.Raw = raw
++		if e, err := session.Decode(raw); err != nil {
++			st.StoredErr = err
++		} else {
++			st.Stored = &e
+ 		}
+-		st.Raw, st.Stored = raw, &e
+ 	}
+ 	vals, err := mark.Result()
+ 	if err != nil {
+```
+
+`internal/store/keys.go`:
+
+```diff
+diff --git a/internal/store/keys.go b/internal/store/keys.go
+index eb7ac4a..492886b 100644
+--- a/internal/store/keys.go
++++ b/internal/store/keys.go
+@@ -15,6 +15,13 @@ const epochsKey = "gwepochs"
+ func sessKey(uid string) string { return "sess:{" + uid + "}" }
+ func revKey(uid string) string  { return "rev:{" + uid + "}" }
+ 
++// revDeletedKey holds the entries one Revoke request deleted, so a re-run of
++// that request returns them again for the kicks (PI-2). The request is
++// (uid, scope, before_ms); before_ms is fixed by the account service (PI-4).
++func revDeletedKey(uid, scope string, beforeMs int64) string {
++	return "revdel:{" + uid + "}:" + scope + ":" + strconv.FormatInt(beforeMs, 10)
++}
++
+ // EpochRef names one gateway instance: gateway_id (pod name) plus its boot epoch.
+ type EpochRef struct {
+ 	Gateway string
+```
+
+`internal/store/store.go`:
+
+```diff
+diff --git a/internal/store/store.go b/internal/store/store.go
+index 7198a20..702757e 100644
+--- a/internal/store/store.go
++++ b/internal/store/store.go
+@@ -41,12 +41,29 @@ type Store struct {
+ 	// groupOf names the node group of a key; calls in one group share a
+ 	// pipeline. It is masterAddr in production; tests replace it.
+ 	groupOf func(ctx context.Context, key string) string
++	// masterFor returns the node that owns key (nodeFor in production), and
++	// reloadSlots asks the cluster client to reload its slot map (nil for a
++	// single node). Revoke uses them to re-route after a failover (PI-6);
++	// tests replace both.
++	masterFor   func(ctx context.Context, key string) (*redis.Client, error)
++	reloadSlots func(ctx context.Context)
++	rerouteWait time.Duration // how long Revoke waits for a new master
+ }
+ 
++// rerouteWait's default, and how often the slot map is re-read meanwhile.
++const (
++	defaultRerouteWait = 2 * time.Second
++	reroutePoll        = 100 * time.Millisecond
++)
++
+ // New returns a Store. rdb must be a *redis.ClusterClient or a *redis.Client.
+ func New(rdb redis.UniversalClient, cfg Config) *Store {
+-	s := &Store{rdb: rdb, cfg: cfg}
++	s := &Store{rdb: rdb, cfg: cfg, rerouteWait: defaultRerouteWait}
+ 	s.groupOf = s.masterAddr
++	s.masterFor = s.nodeFor
++	if c, ok := rdb.(*redis.ClusterClient); ok {
++		s.reloadSlots = c.ReloadState
++	}
+ 	return s
+ }
+ 
+```
+
+`internal/store/lua/rev_delete.lua` (whole file):
+
+```lua
+-- Revoke step 2: delete the sess fields in scope whose token predates their effective marker.
+-- A field written by a login with a newer token (after the marker) is kept; a value
+-- whose tok_iat is not a number cannot be a valid session and is deleted.
+-- KEYS[1] sess:{uid}; KEYS[2] rev:{uid}; KEYS[3] revdel:{uid}:<scope>:<before_ms>.
+-- ARGV[1] '*' (every field) or one 'appid:platform'; ARGV[2] KEYS[3] TTL ms.
+-- Every deleted entry is also kept in KEYS[3], so a re-run of the same request
+-- (a lost reply, or the account service's retry) returns it again for the kicks (PI-2).
+-- Returns {field, value, ...}: every entry this request has deleted so far.
+local function split(s)
+  local out = {}
+  for part in string.gmatch(s .. '|', '([^|]*)|') do out[#out + 1] = part end
+  return out
+end
+local function marker(f)
+  local m = redis.call('HMGET', KEYS[2], '*', f)
+  local best = 0
+  for i = 1, 2 do
+    if m[i] then
+      local v = tonumber(m[i])
+      if v > best then best = v end
+    end
+  end
+  return best
+end
+
+local fields
+if ARGV[1] == '*' then
+  fields = redis.call('HKEYS', KEYS[1])
+else
+  fields = {ARGV[1]}
+end
+local deleted = false
+for _, f in ipairs(fields) do
+  local v = redis.call('HGET', KEYS[1], f)
+  if v then
+    local iat = tonumber(split(v)[7] or '')
+    if iat == nil or iat < marker(f) then
+      redis.call('HDEL', KEYS[1], f)
+      redis.call('HSET', KEYS[3], f, v)
+      deleted = true
+    end
+  end
+end
+if deleted then redis.call('PEXPIRE', KEYS[3], ARGV[2]) end
+return redis.call('HGETALL', KEYS[3])
+```
+
+`internal/store/revoke.go` (whole file):
+
+```go
+package store
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+	"time"
+
+	"github.com/Tallinzp/goim/internal/session"
+	"github.com/redis/go-redis/v9"
+)
+
+// ScopeAll is the rev:{uid} field for a user-wide revocation.
+const ScopeAll = "*"
+
+// ErrNotReplicated means no replica confirmed the marker within WaitTimeout.
+// Nothing was deleted; the caller (the account service) retries Revoke.
+var ErrNotReplicated = errors.New("store: revocation marker not confirmed by a replica")
+
+// revDeletedTTL is how long a Revoke request's deleted entries stay readable
+// for a re-run (PI-2). After it, a re-run returns nothing and Reconcile rule 1
+// closes those connections within one cycle.
+const revDeletedTTL = 5 * time.Minute
+
+// Revoked is one sess field deleted by Revoke; its connection must be kicked
+// with REVOKED. If the deleted value did not decode, Entry is zero and EntryErr
+// says why: no kick is possible, and Reconcile rule 1 closes the connection (PI-3).
+type Revoked struct {
+	Field    string
+	Entry    session.Entry
+	EntryErr error
+}
+
+var (
+	revMarkScript   = mustScript("rev_mark.lua")
+	revDeleteScript = mustScript("rev_delete.lua")
+)
+
+// Revoke writes revoked_before_ms = max(stored, beforeMs) for scope (ScopeAll or
+// a slot field), waits until one replica confirms it, and only then deletes the
+// affected sess fields (spec: Revoke). beforeMs comes from the account service
+// and is the same on every retry (PI-4): it names the request, so a retry, or a
+// re-run after a lost reply, returns every entry the request has deleted (PI-2).
+func (s *Store) Revoke(ctx context.Context, uid, scope string, beforeMs int64) ([]Revoked, error) {
+	if err := session.ValidUID(uid); err != nil {
+		return nil, err
+	}
+	if scope != ScopeAll {
+		if err := session.ValidField(scope); err != nil {
+			return nil, err
+		}
+	}
+	if beforeMs <= 0 {
+		return nil, fmt.Errorf("store: revoked_before_ms %d is not positive", beforeMs)
+	}
+	if err := s.markRevoked(ctx, uid, scope, beforeMs); err != nil {
+		return nil, err
+	}
+	return s.deleteRevoked(ctx, uid, scope, beforeMs)
+}
+
+// deleteRevoked is Revoke step 2: delete the fields in scope whose token
+// predates their effective marker. Only Revoke may call it, after the marker
+// is confirmed. The result is sorted by field.
+func (s *Store) deleteRevoked(ctx context.Context, uid, scope string, beforeMs int64) ([]Revoked, error) {
+	keys := []string{sessKey(uid), revKey(uid), revDeletedKey(uid, scope, beforeMs)}
+	vals, err := revDeleteScript.Run(ctx, s.rdb, keys, scope, ms(revDeletedTTL)).StringSlice()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Revoked, 0, len(vals)/2)
+	for i := 0; i+1 < len(vals); i += 2 {
+		r := Revoked{Field: vals[i]}
+		if e, err := session.Decode(vals[i+1]); err != nil {
+			r.EntryErr = err
+		} else {
+			r.Entry = e
+		}
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Field < out[j].Field })
+	return out, nil
+}
+
+// markRevoked writes and confirms the marker on the key's master. If that
+// master turns out to be stale (a Cluster failover: MOVED, READONLY or a
+// connection error), it waits for the slot map to name a new master and tries
+// once more there (PI-6). The retry is safe: the marker write is max().
+func (s *Store) markRevoked(ctx context.Context, uid, scope string, beforeMs int64) error {
+	key := revKey(uid)
+	node, err := s.masterFor(ctx, key)
+	if err != nil {
+		return err
+	}
+	err = s.markOn(ctx, node, key, scope, beforeMs)
+	if !staleMaster(err) {
+		return err
+	}
+	next, rerr := s.rerouteMaster(ctx, key, node.Options().Addr)
+	if rerr != nil {
+		return fmt.Errorf("%w (re-route: %v)", err, rerr)
+	}
+	return s.markOn(ctx, next, key, scope, beforeMs)
+}
+
+// markOn runs the marker write and WAIT on one connection: WAIT only counts
+// the writes made earlier on the same connection, so a pooled WAIT on another
+// connection would confirm nothing.
+func (s *Store) markOn(ctx context.Context, node *redis.Client, key, scope string, beforeMs int64) error {
+	conn := node.Conn()
+	defer conn.Close()
+	if err := revMarkScript.Run(ctx, conn, []string{key}, scope, beforeMs, ms(s.cfg.SessTTL)).Err(); err != nil {
+		return fmt.Errorf("store: revocation marker: %w", err)
+	}
+	n, err := conn.Wait(ctx, 1, s.cfg.WaitTimeout).Result()
+	if err != nil {
+		return fmt.Errorf("store: WAIT: %w", err)
+	}
+	if n < 1 {
+		return ErrNotReplicated
+	}
+	return nil
+}
+
+// staleMaster reports whether err means the node may no longer own the key:
+// a MOVED or READONLY reply, or a failure that is not a Redis reply at all
+// (dial, EOF, reset). ErrNotReplicated, the caller's own deadline and any
+// other Redis reply are final.
+func staleMaster(err error) bool {
+	if err == nil || errors.Is(err, ErrNotReplicated) ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if _, ok := redis.IsMovedError(err); ok {
+		return true
+	}
+	if redis.IsReadOnlyError(err) {
+		return true
+	}
+	var reply redis.Error
+	return !errors.As(err, &reply)
+}
+
+// rerouteMaster reloads the slot map until it names a master for key other
+// than oldAddr, for at most rerouteWait. ReloadState is asynchronous, so it
+// polls. A single-node client has no slot map and never re-routes.
+func (s *Store) rerouteMaster(ctx context.Context, key, oldAddr string) (*redis.Client, error) {
+	if s.reloadSlots == nil {
+		return nil, errors.New("not a cluster client")
+	}
+	ctx, cancel := context.WithTimeout(ctx, s.rerouteWait)
+	defer cancel()
+	tick := time.NewTicker(reroutePoll)
+	defer tick.Stop()
+	for {
+		s.reloadSlots(ctx)
+		if node, err := s.masterFor(ctx, key); err == nil && node.Options().Addr != oldAddr {
+			return node, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("slot map still names %s: %w", oldAddr, ctx.Err())
+		case <-tick.C:
+		}
+	}
+}
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `gofmt -l internal/ && go vet ./... && go test -race -count=1 ./...`
+Expected: no `gofmt` output, and every package `ok`. Locally only `TestReplicaIsAttached`, `TestRevokeEndToEnd` and `TestRevokeFailsWhenReplicaDoesNotAck` skip (`TODO: Tier 2 integration`), as before.
+
+- [ ] **Step 5: Update the Execution Notes**
+
+In *Execution Notes*, mark risk 10b with: "PI-6 (Task 11): Revoke now reloads the slot map and retries once on `MOVED`, `READONLY` or a connection error, waiting up to 2s for the new master. This is tested with a fake old master (miniredis `SetError`) and a stubbed slot map. Real `ReloadState` / `MasterForKey` timing on a Cluster stays open until the Plan 6 Tier 2 Cluster scenario." Mark risk 11 with: "PI-2 (Task 11): `rev_delete.lua` keeps a request's deleted entries in `revdel:{uid}:<scope>:<before_ms>` for 5 minutes, so a re-run returns them. Still untested against a real lost reply (needs the fault-injecting proxy)."
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add internal/store docs/superpowers/plans/2026-10-07-connection-session-core-01-session-store.md
+git commit -m "feat(store): interface review follow-ups PI-2, PI-3, PI-6"
+```
+
+---
+
 ## After this plan
 
 `internal/store` is complete and has no callers yet. It is verified on miniredis only; the open risks are in *Execution Notes*, and `make test-redis` on the Tier 2 host closes them. Plan 2 (Logic service) is written next, against these interfaces. Spec tests that need Logic's rule engine are in Plan 2 (Tier 1a, real Redis): "Reconcile rule 3 after a simulated lost write" and "Reconcile rule 3 with a regressed counter". They build on `ReadSlots`, `ChunkWins` and `CompareAndSet` from this plan. The same goes for "the sweeper skipping an epoch whose lease key exists although its score is stale" (R4M-3): Plan 2's sweeper loop makes that decision with `LeasesExist`.

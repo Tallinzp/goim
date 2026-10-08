@@ -204,7 +204,7 @@ The client can't tell `at_capacity` from the other pre-handshake closes (`handsh
 
 ## Follow-up (2026-10-08) — decisions from the Plan 1 interface review
 
-These come from the user's review of the session store interfaces (Plan 1), not from a new review round. Refs *PI-<n>* are the review's decision points. Only PI-4 changes the spec; the others change code and are recorded in Plan 1's *Execution Notes*. **Not yet applied to the rev6 spec**: apply when the user asks (in place or in rev7).
+These come from the user's review of the session store interfaces (Plan 1), not from a new review round. Refs *PI-<n>* are the review's decision points. Only PI-4 changes the spec; the others change code and are recorded in Plan 1's *Execution Notes*. **PI-4 is applied in place to the rev6 spec and its Chinese translation (2026-10-08, at the user's request).**
 
 ### PI-4 — `Revoke` takes `before_ms` from the account service — DECIDED: ACCEPT (option A)
 

@@ -2,7 +2,7 @@
 
 > 本文是 `2026-10-03-connection-session-core-design-rev6.md` 的中文译本。两者不一致时，以英文版为准。标识符、命令、Redis key、指标名和引用标记（如 *(R1-O4)*）保持英文原样。
 
-> 本版是 `2026-10-03-connection-session-core-design-rev5.md` 的第 6 版修订，rev5 保持不变。本版落实了对 rev5 的系统设计评审 `docs/superpowers/objections/connection-session-core-design-rev5-system-design.md` 的全部决议，决议记录在 `docs/superpowers/objections/connection-session-core-design-rev5-dispositions.md`，引用标记为 *(R5S-O1)* … *(R5S-O9)*。以下说明沿用自 rev5。
+> 本版是 `2026-10-03-connection-session-core-design-rev5.md` 的第 6 版修订，rev5 保持不变。本版落实了对 rev5 的系统设计评审 `docs/superpowers/objections/connection-session-core-design-rev5-system-design.md` 的全部决议，决议记录在 `docs/superpowers/objections/connection-session-core-design-rev5-dispositions.md`，引用标记为 *(R5S-O1)* … *(R5S-O9)*。本版还原地落实了（2026-10-08）用户评审 Plan 1 存储接口时的后续决议 PI-4，记录在同一份处置文件中，引用标记为 *(PI-4)*。以下说明沿用自 rev5。
 
 > 本版是 `2026-10-03-connection-session-core-design-rev4.md` 的第 5 版修订，rev4 保持不变。本版落实了用户本人对 rev4 的评审 `docs/superpowers/objections/connection-session-core-design-rev4-human-view.md.md`，其决议直接写入本规格，引用标记为 *(R4H-O1)* 等；用户对 rev4 剩余待定问题的决议标记为 *(R4H-OP1)*。本版还落实了 `docs/superpowers/objections/connection-session-core-design-rev4-dispositions.md` 中记录的、针对 rev4 两份外部评审的全部决议，引用标记为 *(R4M-<n>)*（MiniMax）和 *(R4G-O<n>)*（GPT）。以下说明沿用自 rev4。
 
@@ -261,8 +261,8 @@ Web ─wss (TLS)────┘                 │ gRPC Login/Logout/Reconcile�
     - **负缓存**：刷新后仍未知的 kid 被记为未知，直到下一次允许的刷新，因此洪峰直接在内存中被拒；
     - **客户端侧**：客户端 1–3 秒后重试（可重试拒绝），刷新落地后即成功。
   - **密钥轮换操作手册：** 新签名密钥必须在签发任何 token **至少一个刷新间隔（5 分钟）加余量之前**发布到 JWKS，这样每个 Pod 都已通过周期刷新持有它，未知 `kid` 只可能意味着操作手册被违反或 token 是伪造的 *(R4H-O10)*；它同样要在签发任何 token 之前发布到 `jwks-fallback` ConfigMap；因泄露而撤回的密钥也要从 ConfigMap 中删除。（过期的 ConfigMap 只在账号服务不可达时才有影响。）
-- **Revoke** *(R1-O10, R2-O4, R3-OP2)*：`Revoke(uid, scope = all | slot, reason)`，由账号服务在封号、改密码、"退出所有设备"（scope=all）或"让这台设备下线"（scope=slot）时调用。两种 scope 处理方式相同：
-  1. 用 Lua 脚本写入标记字段——scope=all 写 `*`，scope=slot 写 `appid:platform`——取 `revoked_before_ms = max(stored, new)`（幂等），然后执行 `WAIT 1 <timeout>`。如果没有从节点确认，返回可重试错误；账号服务会重试 `Revoke` 直到成功。**标记是同步写入的：必须在第 2 步之前、在 `Revoke` 返回成功之前得到确认**，这样丢失的 Kick 就无法让 Reconcile 复活会话。
+- **Revoke** *(R1-O10, R2-O4, R3-OP2, PI-4)*：`Revoke(uid, scope = all | slot, before_ms, reason)`，由账号服务在封号、改密码、"退出所有设备"（scope=all）或"让这台设备下线"（scope=slot）时调用。`before_ms` 使用 token 签发方的时钟，单位与 `tok_iat` 相同（毫秒）：账号服务在决定吊销时设定它，每次重试都发送同一个值，因此无论账号服务与 Redis 之间的时钟偏差多大，标记的含义都恰好是"该签发方在 `before_ms` 之前签发的 token"，重试也不会移动它 *(PI-4)*。Logic 拒绝 `before_ms ≤ 0` 或超前 Redis `TIME` 5 分钟以上的值，返回 `INVALID_ARGUMENT`（不可重试；用于发现秒与毫秒混用的错误）。两种 scope 处理方式相同：
+  1. 用 Lua 脚本写入标记字段——scope=all 写 `*`，scope=slot 写 `appid:platform`——取 `revoked_before_ms = max(stored, before_ms)`（幂等），然后执行 `WAIT 1 <timeout>`。如果没有从节点确认，返回可重试错误；账号服务会重试 `Revoke` 直到成功。**标记是同步写入的：必须在第 2 步之前、在 `Revoke` 返回成功之前得到确认**，这样丢失的 Kick 就无法让 Reconcile 复活会话。
   2. 写入确认后，删除受影响的 `sess:{uid}` 字段，并以原因 `REVOKED` 用加固 Kick 踢掉每条受影响的连接。
 
   客户端自己发出的 `Logout` 命令不写标记：网关会关闭那条连接，它不再是 ONLINE，Reconcile 无法恢复它。
@@ -529,7 +529,7 @@ Prometheus 指标：
   - 租约 key 是权威依据 *(R4M-3)*：让一台网关的 `ZADD gwepochs` 失败 9 秒（即配置中的 90 秒），而 `SET` 成功：什么也不清扫；在清扫中途删除租约 key 但不改分数，再重新加回：清扫器中止；已发送 `EpochEnded` 的 epoch 无需等待其 TTL 即被清扫；
   - Reconcile：幽灵条目在一个周期内被移除；缺失的条目被恢复；另一台网关上更新的会话永远不会被覆盖；被丢弃的 Logout 在一个周期内修复；
   - Kick：发往存活网关的 Kick 被丢弃后会重试，之后被下一轮 Reconcile 兜住 *(R2-O6)*；`AUTH_PENDING` 期间的 Kick 在 Login 回复返回时关闭连接；正在下线的网关仍能收到 Kick；
-  - Revoke 关闭两个槽位上的连接；Kick 被丢弃的 Revoke 被下一轮 Reconcile 兜住；`WAIT` 失败的 Revoke 返回错误，重试是幂等的 *(R2-O4)*；
+  - Revoke 关闭两个槽位上的连接；Kick 被丢弃的 Revoke 被下一轮 Reconcile 兜住；`WAIT` 失败的 Revoke 返回错误，重试是幂等的 *(R2-O4)*；以相同 `before_ms` 重试的 `Revoke` 不改变标记，`iat` ≥ `before_ms` 的 token 在吊销后可以登录，`before_ms` 超前 10 分钟会被拒绝 *(PI-4)*；
   - 吊销比 token 活得更久 *(R4M-1)*：devtoken 签发有效期 2 秒的 token（短于配置中 9 秒的故障，因此旧的"token 有效期 + 余量"TTL 会在故障期间过期）；把一台网关与 Logic 断开 9 秒，吊销它的一条连接并丢弃 Kick，恢复连通：触发式轮次以 `REVOKED` 关闭该连接，且不恢复它；
   - 槽位级 Revoke *(R3-OP2)*：Kick 被丢弃时，下一轮 Reconcile 通过 `not_owner`（`REVOKED`）关闭连接，且不恢复会话；同一用户的其他槽位不受影响；`WAIT` 失败的槽位级 Revoke 返回错误且不发送 Kick，重试是幂等的；
   - 密钥轮换：重叠期间两个 `kid` 都被接受；在 Logic 拉取到之前就开始签名的密钥会得到 `KEY_UNKNOWN`，后台刷新之后登录成功 *(R4H-O10)*；
