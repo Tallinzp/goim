@@ -238,6 +238,38 @@ func TestKickDropDoesNotReadRedis(t *testing.T) {
 	}
 }
 
+// A gateway pod restarts under the same name with a new IP and epoch while the
+// old epoch's connection is stuck on the dead IP (node loss, no RST). Kicks to
+// the new epoch must not ride the old epoch's transport.
+func TestKickNewEpochOfSamePodGetsItsOwnConnection(t *testing.T) {
+	gw := testredis.Gateway()
+	g := &fakeGateway{got: make(chan struct{}, 1)}
+	dead, alive := blackhole(t), startGateway(t, g)
+	var mu sync.Mutex
+	addr := dead
+	dial := func(name string) (*grpc.ClientConn, error) {
+		mu.Lock()
+		a := addr
+		mu.Unlock()
+		return grpc.NewClient("passthrough:///"+a, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+	st, _ := newStore(t, testConfig())
+	m := newMetrics()
+	k := NewKicker(testConfig().Kick, NewLeaseCache(st, time.Second, time.Now), m, dial)
+	t.Cleanup(k.Close)
+
+	k.Kick(store.EpochRef{Gateway: gw, Epoch: 1}, 1, pb.KickReason_KICK_REASON_REPLACED) // old epoch: keeps the target busy
+	mu.Lock()
+	addr = alive // DNS now points at the restarted pod
+	mu.Unlock()
+	k.Kick(store.EpochRef{Gateway: gw, Epoch: 2}, 2, pb.KickReason_KICK_REASON_REPLACED)
+	select {
+	case <-g.got:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Kick to the restarted pod's new epoch never arrived")
+	}
+}
+
 func TestIdleTargetIsRemoved(t *testing.T) {
 	g := &fakeGateway{got: make(chan struct{}, 1)}
 	gw := testredis.Gateway()

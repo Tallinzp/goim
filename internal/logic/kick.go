@@ -42,7 +42,6 @@ type Kicker struct {
 
 	mu      sync.Mutex
 	targets map[store.EpochRef]*kickTarget
-	conns   map[string]*gwConn // by gateway pod name, shared by its epochs
 	closed  bool
 	done    chan struct{}
 	wg      sync.WaitGroup
@@ -52,13 +51,9 @@ type kickTarget struct {
 	ref     store.EpochRef
 	label   string
 	q       chan kickJob
+	cc      *grpc.ClientConn // this epoch's own connection
 	client  pb.GatewayClient
 	workers int // running workers; guarded by Kicker.mu
-}
-
-type gwConn struct {
-	cc   *grpc.ClientConn
-	refs int
 }
 
 type kickJob struct {
@@ -70,7 +65,7 @@ type kickJob struct {
 // NewKicker returns a Kicker; Close stops it.
 func NewKicker(cfg KickConfig, leases *LeaseCache, m *Metrics, dial DialFunc) *Kicker {
 	return &Kicker{cfg: cfg, leases: leases, m: m, dial: dial,
-		targets: map[store.EpochRef]*kickTarget{}, conns: map[string]*gwConn{}, done: make(chan struct{})}
+		targets: map[store.EpochRef]*kickTarget{}, done: make(chan struct{})}
 }
 
 // Kick queues the first attempt and returns at once. The first attempt is
@@ -113,18 +108,15 @@ func (k *Kicker) targetLocked(ref store.EpochRef) (*kickTarget, error) {
 	if t, ok := k.targets[ref]; ok {
 		return t, nil
 	}
-	c, ok := k.conns[ref.Gateway]
-	if !ok {
-		cc, err := k.dial(ref.Gateway)
-		if err != nil {
-			return nil, err
-		}
-		c = &gwConn{cc: cc}
-		k.conns[ref.Gateway] = c
+	// One connection per epoch, not per pod name: a pod that restarts under
+	// the same name gets a fresh dial (and DNS lookup) for its new epoch,
+	// instead of the old epoch's transport, which may be stuck on a dead IP.
+	cc, err := k.dial(ref.Gateway)
+	if err != nil {
+		return nil, err
 	}
-	c.refs++
 	t := &kickTarget{ref: ref, label: ref.Gateway + ":" + strconv.FormatUint(ref.Epoch, 10),
-		q: make(chan kickJob, k.cfg.Queue), client: pb.NewGatewayClient(c.cc)}
+		q: make(chan kickJob, k.cfg.Queue), cc: cc, client: pb.NewGatewayClient(cc)}
 	k.targets[ref] = t
 	return t, nil
 }
@@ -153,8 +145,7 @@ func (k *Kicker) work(t *kickTarget) {
 }
 
 // retire lets one idle worker exit unless work arrived meanwhile. The last
-// worker out removes the target and, with it, the gateway's connection if no
-// other epoch of that gateway uses it.
+// worker out removes the target and closes its connection.
 func (k *Kicker) retire(t *kickTarget) bool {
 	k.mu.Lock()
 	defer k.mu.Unlock()
@@ -167,12 +158,7 @@ func (k *Kicker) retire(t *kickTarget) bool {
 	}
 	delete(k.targets, t.ref)
 	k.m.KickQueueDepth.DeleteLabelValues(t.label)
-	if c := k.conns[t.ref.Gateway]; c != nil {
-		if c.refs--; c.refs == 0 {
-			delete(k.conns, t.ref.Gateway)
-			c.cc.Close()
-		}
-	}
+	t.cc.Close()
 	return true
 }
 
@@ -251,9 +237,8 @@ func (k *Kicker) Close() {
 	k.wg.Wait()
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	for gw, c := range k.conns {
-		c.cc.Close()
-		delete(k.conns, gw)
+	for _, t := range k.targets {
+		t.cc.Close()
 	}
 	k.targets = map[store.EpochRef]*kickTarget{}
 }
