@@ -4,6 +4,7 @@ go 1.27.1
 
 require (
 	github.com/alicebob/miniredis/v2 v2.39.0
+	github.com/flynn/noise v1.1.0
 	github.com/prometheus/client_golang v1.24.1
 	github.com/prometheus/client_model v0.6.2
 	github.com/redis/go-redis/v9 v9.23.0
@@ -21,6 +22,7 @@ require (
 	github.com/prometheus/procfs v0.21.1 // indirect
 	github.com/yuin/gopher-lua v1.1.1 // indirect
 	go.uber.org/atomic v1.12.0 // indirect
+	golang.org/x/crypto v0.54.0 // indirect
 	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
