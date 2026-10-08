@@ -86,6 +86,26 @@ The spec leaves these open. Each is restated in the task that implements it. The
   6. **Pool separation under CPU starvation.** `TestLeasePoolBoundsConcurrency` shows the lease pool is separate. Whether renewals keep their 10s rhythm while Login saturates the CPU is Tier 2's "storm: the other gateways never miss a lease renewal" (Plan 6).
   7. **Redis Cluster.** `cmd/logic` builds a `ClusterClient` by default; no test runs one (Plan 1 risks 7, 9, 10b, 14 and 16 carry over).
   8. **A real account service's JWKS.** The format is the standard OKP/Ed25519 JWK (RFC 8037). `devtoken serve` stands in for the account service.
+- **Implemented 2026-10-08** (Native) as 13 task commits `00ce33e..b06cc93`, then a final whole-branch review on Opus: 0 Critical, 1 Important, 8 Minor. The task code is the code blocks above; the two final fixes below supersede them.
+- **Final review fixes:**
+  1. **Kick connections are per gateway epoch, not per pod name** (`internal/logic/kick.go`). With one connection per pod name, a node loss left it stuck on the dead IP (no RST, no keepalive), and Kicks to the pod's new epoch after a restart went down that transport and failed for minutes. Now each target `gw|epoch` dials its own connection and closes it when its last worker retires. Pinned by `TestKickNewEpochOfSamePodGetsItsOwnConnection`. Not done: client keepalive and a shorter reconnect backoff. A restarted pod already gets a fresh dial, and keepalive would add a ping-rate rule for Plan 3.
+  2. **No unknown-`kid` refresh after the key manager's `Run` ends** (`internal/auth/manager.go`). During a drain, Logins are still verified after `Run`'s context is cancelled. A refresh started then raced `Run`'s final `bg.Wait` and failed on the cancelled context, counting a false `jwks_refresh_failures_total` on every rollout. Pinned by `TestNoUnknownKidRefreshAfterRun`.
+- **Deferred minors (final review):**
+  - The sweeper releases its claim on the cancelled context at shutdown, so the claim lingers for 300s after a rolling deploy (cleanup delay only).
+  - A `ReconcileEnd` or drain that runs longer than `MaxConnectionAgeGrace` or `ShutdownGrace` (30s, about 280k `gwconns` members at 10k/s) is cut and retried. Plans 3 and 6 size the deadlines.
+  - `gw_now_ms = 0` sets a false `clock_skew_alert`.
+  - `LeaseCache.Live` can overwrite a newer `Set` observation for up to 1s.
+  - `cmd/logic` lacks flags for `SweepBatch`, `DeleteBatch`, `Kick.Retries`, `RetrySpacing` and `IdleTimeout`. Plan 5's test profile needs them.
+  - `OUTCOME_UNKNOWN` Login entries get no `gwconns` SADD. If the epoch then dies, their fields (already invalid) wait for the 30-day TTL.
+  - `Server.Start` ignores `Serve` errors; retries queued after `Kicker.Close` are dropped without being counted; `Server.Stop` hangs if `Start`'s context is never cancelled.
+- **Unverified risks the final review added** to the list above:
+  9. R5S-O1 under a real shard failover: per-master grouping has only run with one group on miniredis.
+  10. Review Focus 3 on a real cluster: batch order across MOVED/ASK or a NOSCRIPT re-run after failover.
+  11. How often one slow shard fails a whole Reconcile chunk or delete-phase page during a failover.
+  12. Guard clock source: `TIME` from one node against scores from each lease shard (ms-scale, low risk).
+  13. go-redis with a context cancelled mid-pipeline: the `OUTCOME_UNKNOWN` paths are tested only on miniredis.
+  14. `ReconcileEnd` wall time at 200k members with real Redis latency, against the 30s graces.
+  15. TCP dead-peer detection on the Kick path (node loss with no RST).
 - **Tier 2:** `make test-tier2 SCENARIO=store` runs `make test-redis`, which runs `./...`, so Plan 2's tests run on real Redis too, including `TestRevokeEndToEndOnRealRedis`. The scenario's no-skip check still applies: no test may skip with `TODO: Tier 2 integration`.
 - **For Plan 3 (gateway), the Logic contract this plan fixes:**
   - Read the Login stream to EOF. An entry with no result at EOF, a stream error, or `OUTCOME_UNKNOWN` has no definitive reply: fence (b).
