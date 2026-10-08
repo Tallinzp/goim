@@ -88,3 +88,29 @@ func TestScanConnsPagesThroughTheSet(t *testing.T) {
 		t.Fatalf("scanned %d uids, want 50", len(seen))
 	}
 }
+
+// An undecodable value carrying this epoch's prefix (an older format, or
+// written by hand) must not stop the delete phase for the other uids. It
+// can't name a tracked connection or a login in flight, so it is a ghost:
+// compare-and-deleted like any other (PI-3).
+func TestDeleteUntrackedDeletesUndecodableEntries(t *testing.T) {
+	s, rdb := newStore(t)
+	ref := EpochRef{Gateway: testredis.Gateway(), Epoch: 1<<63 + 9}
+	bad := testredis.UID()
+	ghost := testredis.UID()
+	rdb.HSet(ctx, sessKey(bad), field, ref.prefix()+"not-a-conn-id|d|1|1|1")
+	rdb.HSet(ctx, sessKey(ghost), field, session.Entry{Gateway: ref.Gateway, Epoch: ref.Epoch,
+		ConnID: 1, DeviceID: "d", ConnSeq: 1, LoginMs: 1, TokIatMs: 1}.Encode())
+	rdb.SAdd(ctx, ref.connsKey(), bad, ghost)
+
+	n, err := s.DeleteUntracked(ctx, ref, 10_000, []string{bad, ghost}, nil)
+	if err != nil || n != 2 {
+		t.Fatalf("DeleteUntracked = %d, %v; want 2 deleted and no error", n, err)
+	}
+	if rdb.Exists(ctx, sessKey(bad), sessKey(ghost)).Val() != 0 {
+		t.Fatal("both fields must be gone")
+	}
+	if m := rdb.SMembers(ctx, ref.connsKey()).Val(); len(m) != 0 {
+		t.Fatalf("gwconns = %v, want empty", m)
+	}
+}

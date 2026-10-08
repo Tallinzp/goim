@@ -22,7 +22,8 @@ func (s *Store) ScanConns(ctx context.Context, ref EpochRef, cursor uint64, coun
 // DeleteUntracked is the ReconcileEnd delete phase for one page of uids: it
 // compare-and-deletes every field that points at ref whose conn_id is not in
 // tracked and whose login_ms < asOfMs, then removes from gwconns the uids with
-// no field left for ref. It returns the number of fields deleted.
+// no field left for ref. A field with ref's prefix that does not decode is
+// deleted too. It returns the number of fields deleted.
 //
 // The SREM is not atomic with the sess check: a Login that writes and SADDs in
 // between can lose its gwconns membership. gwconns is only a cleanup hint; rule 2
@@ -54,12 +55,12 @@ func (s *Store) DeleteUntracked(ctx context.Context, ref EpochRef, asOfMs int64,
 				continue
 			}
 			ours++
-			e, err := session.Decode(v)
-			if err != nil {
-				return 0, err
-			}
-			if _, ok := tracked[e.ConnID]; ok || e.LoginMs >= asOfMs {
-				continue
+			// A value that does not decode can't name a tracked connection or
+			// a login in flight: it is a ghost like any other (PI-3).
+			if e, err := session.Decode(v); err == nil {
+				if _, ok := tracked[e.ConnID]; ok || e.LoginMs >= asOfMs {
+					continue
+				}
 			}
 			args = append(args, f, v)
 		}
