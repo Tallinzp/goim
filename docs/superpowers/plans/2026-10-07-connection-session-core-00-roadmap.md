@@ -2,13 +2,13 @@
 
 > Index of the implementation plans for sub-project 1. Each plan is a separate document and produces working, tested software on its own. Plans are written and reviewed one at a time: a later plan is written against the reviewed interfaces of the plans before it.
 
-**Spec:** `docs/superpowers/specs/2026-10-03-connection-session-core-design-rev5.md` (authoritative; the zh-CN translation is not).
+**Spec:** `docs/superpowers/specs/2026-10-03-connection-session-core-design-rev6.md` (authoritative; the zh-CN translation is not). Plan 1 Tasks 1–9 were written against rev5; rev6 (the rev5 system-design review, *R5S-O1*…*O9*) changes only Plan 1's Login/Logout batching (Task 10) and is otherwise additive for Plans 2–6.
 
 ## The plans
 
 | # | Plan | Builds | Depends on | Spec sections | Status |
 |---|---|---|---|---|---|
-| 1 | `2026-10-07-connection-session-core-01-session-store.md` | Repo skeleton, Tier 1a test Redis, `internal/session` (entry format, ordering rule), `internal/store` (every Redis key and Lua script: login, logout, revoke, Reconcile compare-and-set, ReconcileEnd delete, lease, sweeper ops) | — | *Redis schema*, *Login Lua*, *Logout Lua*, *Sweeper* (store side), *Revoke* (store side), *Reconcile handling* (store side) | written; Native execution approved 2026-10-07 |
+| 1 | `2026-10-07-connection-session-core-01-session-store.md` | Repo skeleton, Tier 1a test Redis, `internal/session` (entry format, ordering rule), `internal/store` (every Redis key and Lua script: login, logout, revoke, Reconcile compare-and-set, ReconcileEnd delete, lease, sweeper ops) | — | *Redis schema*, *Login Lua*, *Logout Lua*, *Sweeper* (store side), *Revoke* (store side), *Reconcile handling* (store side) | Tasks 1–9 implemented; Task 10 (per-node Login/Logout results, R5S-O1) written 2026-10-07, not yet implemented |
 | 2 | Logic service | `api/internal.proto` + generated code; JWT/JWKS verification with unknown-`kid` handling; `cmd/devtoken`; Logic RPCs (`Login`, `Logout`, `GatewayLease` on its own pool, `EpochEnded`, `Reconcile` rules 1–4, `ReconcileEnd`, `Revoke`); hardened Kick client; sweeper loop and mass-stale guard; readiness; Logic metrics; `cmd/logic` | 1 | *Logic*, *Sweeper*, *Auth*, *Observability* (Logic side) | not written |
 | 3 | Gateway core | Transport-independent gateway: loopState and `conn_id`, timing wheel, connection state machine on a fake transport, admission (connection cap, pending cap, Login-queue cap), Login batching, Logout fence (a)(b)(c) and retry queue, lease loop, Reconcile pass controller, Kick server, readiness, drain; gateway metrics; layer-rule import test (no gateway package imports `internal/store`) | 2 (proto) | *Gateway* (all but the TCP transport), *Timers* | not written |
 | 4 | TCP transport | Frame codec (6-byte header), Noise NK with `key_id` prologue, handshake limiter (semaphore + token bucket), gnet v2.10.0 integration, gnet loop-ownership `-race` test, `cmd/gateway` | 3 | *Client protocol*, *Transport seam*, *Noise key runbook* | not written |
@@ -31,6 +31,22 @@ Plan 1 makes these choices. They are listed here so they can be reviewed in one 
 8. **Login result `REGRESSED`** is reported separately from `REPLACED` so Logic can count `conn_seq_regressed`; both kick the old connection with `REPLACED`.
 9. **Input limits** that the `|`-separated value and Lua doubles need: uid `[A-Za-z0-9_-]{1,64}`; appid `[A-Za-z0-9_.-]{1,64}`; gateway id a DNS-1123 label; device_id 1–128 bytes without `|`; `conn_seq` ≤ 2^53 − 1. `epoch` and `conn_id` are full uint64s and are only ever compared as strings in Lua.
 10. **Revoke `WAIT` timeout** defaults to 1s (`store.Config.WaitTimeout`).
+
+Choices left to the plans by rev6, **decided by the user (2026-10-07), all as recommended:**
+
+11. **Per-entry Login results come from per-node grouping in the store** (R5S-O1). `store.LoginEach` / `LogoutEach` group a batch by owning master (`MasterForKey`), pipeline each group concurrently through the cluster client, and report each group as it returns (Plan 1 Task 10). Rejected: one `EVALSHA` per entry (20k round trips/s in a storm), and grouping by slot in Logic (Redis topology in Logic).
+12. **Kick queue per target** (R5S-O2): per Logic pod and target `gw|epoch`, **64 workers and a queue of 1024**, both configurable. A dead target drains 64 attempts/s at the ~1s deadline and drops the rest; a live target (~1ms per Kick) handles ~64k/s. Plan 2.
+13. **SDK clamp ranges** (R5S-O6), each window `[lo, hi]` clamped at both ends and `lo < hi` enforced. Plan 5.
+
+    | Window | Default | Allowed `hi` | Allowed `lo` |
+    |---|---|---|---|
+    | Storm wait | 0–20s | 10–120s | 0 |
+    | Local trigger | 0–1s | 1–10s | 0 |
+    | Pre-handshake retry | 0.5–1.5s | 1–5s | ≥ 0.25s |
+    | Other retryable | 1–3s | 2–10s | ≥ 0.5s |
+
+    The storm `hi` floor is 10s because 200k reconnects over 10s is 20k/s, exactly the headroom; rev6's example "storm 5–120s" was corrected to match.
+14. **Reconcile chunks stay unary** (R5S-O1 follow-up): a chunk is resolved as a whole (fence (c) per chunk, one `Execute` per chunk); a slow shard only delays that chunk and its deadline re-queues the entries. `CompareAndSet` and `ReadSlots` keep one pipeline per chunk. Plans 2 and 3.
 
 ## Invariant index (R4M-10)
 

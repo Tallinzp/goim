@@ -8,7 +8,7 @@
 
 **Tech Stack:** Go 1.27, `github.com/redis/go-redis/v9 v9.23.0`, `github.com/alicebob/miniredis/v2 v2.39.0` (in-process Redis for Tier 1a), Redis 7.4 in Docker Compose (Tier 2 host only), Lua 5.1 (Redis scripting).
 
-**Spec:** `docs/superpowers/specs/2026-10-03-connection-session-core-design-rev5.md`. Roadmap and invariant index: `docs/superpowers/plans/2026-10-07-connection-session-core-00-roadmap.md`.
+**Spec:** `docs/superpowers/specs/2026-10-03-connection-session-core-design-rev5.md` for Tasks 1–9; Task 10 implements `…-rev6.md` *R5S-O1*. Roadmap and invariant index: `docs/superpowers/plans/2026-10-07-connection-session-core-00-roadmap.md`.
 
 ## Global Constraints
 
@@ -42,7 +42,7 @@
   4. **Script cache.** `TestLoginSurvivesScriptFlush` exercises miniredis's `SCRIPT FLUSH` and `NOSCRIPT`. The exact error text a real Redis returns in a pipeline is untested locally.
   5. **`TIME` inside scripts.** miniredis serves `TIME` from the host clock. Real Redis 7 allows `TIME` before a write under effects replication; this needs a real-Redis run.
   6. **TTL and SET semantics.** `PEXPIRE`/`PTTL`, `SET ... PX ... GET` returning nil for a missing key, `SSCAN` paging, and `UNLINK` are emulated.
-  7. **Redis Cluster.** Neither tier runs a Cluster in this plan. `MasterForKey` (the Revoke and lease paths) and cross-slot pipelines are untested until Plan 5's compose cluster. `TestKeysShareSlotsWhereScriptsNeedIt` only checks the hash-tag rule offline.
+  7. **Redis Cluster.** Neither tier runs a Cluster in this plan. Task 10's grouping by `MasterForKey` is tested only with an injected grouping on one node. `MasterForKey` (the Revoke and lease paths) and cross-slot pipelines are untested until Plan 5's compose cluster. `TestKeysShareSlotsWhereScriptsNeedIt` only checks the hash-tag rule offline.
   8. **Lua global protection.** Real Redis rejects a script that creates a global variable; gopher-lua may not. The current scripts are clean, but a future script could pass locally and fail in production.
   9. **NOSCRIPT across Cluster nodes.** The fallback is tested on one node only, not in a ClusterClient pipeline spread over several nodes where only one node lost its script cache.
   10. **Revoke after a shard failover.** (a) The new master has no replica until one re-attaches, so every Revoke on that shard returns `ErrNotReplicated` until then (an availability cost; the account service retries). (b) Revoke's sticky `Conn` from `MasterForKey` gets `MOVED` back as a plain error. go-redis reloads the slot map only when cluster-routed traffic hits `MOVED`, or after `ClusterStateReloadInterval` (60s), so Revoke can fail for up to 60s on a quiet cluster. Logic's continuous cluster-routed traffic normally triggers the reload at once.
@@ -2922,6 +2922,349 @@ Expected: every package `ok`; `gofmt -l` and `go vet` print nothing; the count i
 git add internal/store
 git commit -m "feat(store): add sweeper primitives"
 ```
+
+---
+
+### Task 10: Per-node results for Login and Logout (rev6, R5S-O1)
+
+> Follow-up added 2026-10-07 after the rev6 spec. Rev6 requires that a Login entry on a slow or failing-over Redis shard never holds back an entry on a healthy one (*R5S-O1*). `Login` and `Logout` above send the whole batch as one cluster pipeline, and go-redis returns a cluster pipeline only when every node has answered. Roadmap choice #11 (user decision 2026-10-07): the store groups a batch by owning master, pipelines each group on its own and concurrently, and reports each group's results as soon as that group returns. `CompareAndSet` and `ReadSlots` stay as they are (roadmap choice #14: Reconcile chunks resolve as a whole).
+
+**Files:**
+- Modify: `internal/store/store.go`, `internal/store/login.go`, `internal/store/logout.go`
+- Test: `internal/store/each_test.go`
+
+**Interfaces:**
+- Consumes: `scriptCall`, `runBatch`, `loginScript`, `logoutScript`, `parseLogin`, `validLogout` (Tasks 3 and 4).
+- Produces (package `store`):
+  - `func (s *Store) LoginEach(ctx, reqs []LoginReq, done func(i int, r LoginResult))` — calls `done` exactly once per request, as soon as that request's node group returns; an invalid request is reported at once. `done` may be called from several goroutines at the same time and must be safe for that. `LoginEach` returns after every `done` call.
+  - `func (s *Store) LogoutEach(ctx, reqs []LogoutReq, done func(i int, r LogoutResult))` — the same contract for Logout.
+  - `Login` and `Logout` keep their signatures and now collect `LoginEach` / `LogoutEach` into a slice (request order), so every earlier test still covers them.
+  - unexported: `Store.groupOf` (the grouping function; tests replace it), `Store.masterAddr`, `Store.runEach`.
+
+How Plan 2 uses it: the Logic `Login` handler calls `LoginEach` and sends each result on the RPC stream from inside `done` (serialized by the handler, since `done` is concurrent), then queues the entry's Kick (*R5S-O2*). The Logout handler does the same with `LogoutEach`.
+
+Why grouping by master and not one call per entry: a 20k/s storm stays ~100 pipelines/s instead of 20k round trips/s. A slot that moves during a failover is still routed correctly: each group runs through the cluster client, whose per-command `MOVED` handling is unchanged; the grouping only decides which commands share a pipeline. If the owner of a key can't be resolved, the call goes into the `""` group, which the cluster client routes as before.
+
+- [ ] **Step 1: Write the failing tests**
+
+`internal/store/each_test.go`:
+
+```go
+package store
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/Tallinzp/goim/internal/testredis"
+	"github.com/redis/go-redis/v9"
+)
+
+// gateHook holds every pipeline that touches slowKey until release is closed
+// (or 2s pass, so a broken implementation fails instead of hanging).
+type gateHook struct {
+	slowKey string
+	release chan struct{}
+}
+
+func (h gateHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (h gateHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook { return next }
+func (h gateHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		for _, c := range cmds {
+			for _, a := range c.Args() {
+				if a == h.slowKey {
+					select {
+					case <-h.release:
+					case <-time.After(2 * time.Second):
+					}
+					return next(ctx, cmds)
+				}
+			}
+		}
+		return next(ctx, cmds)
+	}
+}
+
+// gatedStore puts every key in its own group (one miniredis node stands in for
+// a cluster) and holds the pipeline of slowUID's sess key until release closes.
+func gatedStore(t *testing.T, slowUID string) (*Store, chan struct{}) {
+	t.Helper()
+	s, rdb := newStore(t)
+	s.groupOf = func(_ context.Context, key string) string { return key }
+	release := make(chan struct{})
+	rdb.AddHook(gateHook{slowKey: sessKey(slowUID), release: release})
+	return s, release
+}
+
+func TestLoginEachSlowGroupDoesNotDelayOthers(t *testing.T) {
+	slow := testredis.UID()
+	s, release := gatedStore(t, slow)
+	now := nowMs(t, s)
+	fast := []string{testredis.UID(), testredis.UID(), testredis.UID()}
+
+	reqs := []LoginReq{{UID: slow, Field: field, Entry: entry(1, "d", 1, now)}}
+	for i, uid := range fast {
+		reqs = append(reqs, LoginReq{UID: uid, Field: field, Entry: entry(uint64(i+2), "d", 1, now)})
+	}
+
+	var mu sync.Mutex
+	var order []int
+	fastLeft := len(fast)
+	released := false
+	s.LoginEach(ctx, reqs, func(i int, r LoginResult) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.Err != nil || r.Code != LoginWritten {
+			t.Errorf("entry %d: %+v", i, r)
+		}
+		order = append(order, i)
+		if i != 0 {
+			fastLeft--
+			if fastLeft == 0 {
+				released = true
+				close(release) // the slow group may finish only now
+			}
+		}
+	})
+	if !released {
+		t.Fatalf("fast entries did not all arrive while the slow group was held; order %v", order)
+	}
+	if len(order) != len(reqs) || order[len(order)-1] != 0 {
+		t.Fatalf("want each entry once and the slow one last, got %v", order)
+	}
+}
+
+func TestLogoutEachSlowGroupDoesNotDelayOthers(t *testing.T) {
+	s, rdb := newStore(t)
+	s.groupOf = func(_ context.Context, key string) string { return key }
+	now := nowMs(t, s)
+	slow := testredis.UID()
+	fast := []string{testredis.UID(), testredis.UID()}
+	var reqs []LogoutReq
+	for i, uid := range append([]string{slow}, fast...) {
+		e := entry(uint64(i+1), "d", 1, now)
+		login1(t, s, uid, e) // before the gate is installed
+		reqs = append(reqs, LogoutReq{UID: uid, Field: field, Gateway: e.Gateway, Epoch: e.Epoch, ConnID: e.ConnID})
+	}
+	release := make(chan struct{})
+	rdb.AddHook(gateHook{slowKey: sessKey(slow), release: release})
+
+	var mu sync.Mutex
+	var order []int
+	fastLeft := len(fast)
+	s.LogoutEach(ctx, reqs, func(i int, r LogoutResult) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.Err != nil || !r.Deleted {
+			t.Errorf("entry %d: %+v", i, r)
+		}
+		order = append(order, i)
+		if i != 0 {
+			if fastLeft--; fastLeft == 0 {
+				close(release)
+			}
+		}
+	})
+	if len(order) != len(reqs) || order[len(order)-1] != 0 {
+		t.Fatalf("want each entry once and the slow one last, got %v", order)
+	}
+}
+
+func TestEachReportsInvalidAtOnceAndKeepsOrderInSlices(t *testing.T) {
+	s, _ := newStore(t)
+	now := nowMs(t, s)
+	good := testredis.UID()
+	reqs := []LoginReq{
+		{UID: "bad|uid", Field: field, Entry: entry(1, "d", 1, now)},
+		{UID: good, Field: field, Entry: entry(2, "d", 1, now)},
+	}
+	seen := map[int]int{}
+	var mu sync.Mutex
+	s.LoginEach(ctx, reqs, func(i int, r LoginResult) {
+		mu.Lock()
+		defer mu.Unlock()
+		seen[i]++
+	})
+	if seen[0] != 1 || seen[1] != 1 {
+		t.Fatalf("each request must be reported exactly once, got %v", seen)
+	}
+	out := s.Login(ctx, []LoginReq{reqs[0], {UID: testredis.UID(), Field: field, Entry: entry(3, "d", 1, now)}})
+	if out[0].Err == nil || out[1].Err != nil || out[1].Code != LoginWritten {
+		t.Fatalf("Login must keep request order: %+v", out)
+	}
+}
+
+func TestMasterAddrOnSingleNodeIsOneGroup(t *testing.T) {
+	s, _ := newStore(t)
+	if a, b := s.masterAddr(ctx, sessKey("u1")), s.masterAddr(ctx, sessKey("u2")); a != "" || b != "" {
+		t.Fatalf("a single node must form the one \"\" group: %q, %q", a, b)
+	}
+}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `go test ./internal/store -run 'Each|MasterAddr' -count=1`
+Expected: compile errors: `s.LoginEach undefined`, `s.LogoutEach undefined`, `s.groupOf undefined`, `s.masterAddr undefined`.
+
+- [ ] **Step 3: Implement grouping and the `Each` calls**
+
+In `internal/store/store.go`, add `"sync"` to the imports, add the field and set it in `New`:
+
+```go
+type Store struct {
+	rdb redis.UniversalClient
+	cfg Config
+	// groupOf names the node group of a key; calls in one group share a
+	// pipeline. It is masterAddr in production; tests replace it.
+	groupOf func(ctx context.Context, key string) string
+}
+
+// New returns a Store. rdb must be a *redis.ClusterClient or a *redis.Client.
+func New(rdb redis.UniversalClient, cfg Config) *Store {
+	s := &Store{rdb: rdb, cfg: cfg}
+	s.groupOf = s.masterAddr
+	return s
+}
+```
+
+Below `runBatch`:
+
+```go
+// masterAddr returns the address of the master that owns key, or "" on a
+// single node or when the owner can't be resolved (the cluster client then
+// routes those calls as usual).
+func (s *Store) masterAddr(ctx context.Context, key string) string {
+	c, ok := s.rdb.(*redis.ClusterClient)
+	if !ok {
+		return ""
+	}
+	n, err := c.MasterForKey(ctx, key)
+	if err != nil {
+		return ""
+	}
+	return n.Options().Addr
+}
+
+// runEach is runBatch split by owning master (R5S-O1): each group is
+// pipelined on its own, concurrently, and done(j, cmd) runs for its calls as
+// soon as that group returns, so a slow or failing-over shard delays only its
+// own calls. done may run on several goroutines at once. runEach returns
+// after every done call.
+func (s *Store) runEach(ctx context.Context, sc *redis.Script, calls []scriptCall, done func(j int, cmd *redis.Cmd)) {
+	groups := map[string][]int{}
+	for j, c := range calls {
+		g := s.groupOf(ctx, c.keys[0])
+		groups[g] = append(groups[g], j)
+	}
+	var wg sync.WaitGroup
+	for _, js := range groups {
+		wg.Add(1)
+		go func(js []int) {
+			defer wg.Done()
+			sub := make([]scriptCall, len(js))
+			for k, j := range js {
+				sub[k] = calls[j]
+			}
+			for k, cmd := range s.runBatch(ctx, sc, sub) {
+				done(js[k], cmd)
+			}
+		}(js)
+	}
+	wg.Wait()
+}
+```
+
+In `internal/store/login.go`, replace `Login` with:
+
+```go
+// LoginEach runs the login Lua for a batch, pipelined per owning master, and
+// calls done once per request as soon as its group returns (R5S-O1). An
+// invalid request is reported at once and not sent. done may be called from
+// several goroutines at the same time.
+func (s *Store) LoginEach(ctx context.Context, reqs []LoginReq, done func(i int, r LoginResult)) {
+	calls := make([]scriptCall, 0, len(reqs))
+	idx := make([]int, 0, len(reqs))
+	for i, r := range reqs {
+		if err := r.validate(); err != nil {
+			done(i, LoginResult{Err: err})
+			continue
+		}
+		e := r.Entry
+		calls = append(calls, scriptCall{
+			keys: []string{sessKey(r.UID), revKey(r.UID)},
+			args: []any{r.Field, e.Encode(), e.DeviceID, e.ConnSeq, e.LoginMs, e.TokIatMs,
+				ms(s.cfg.LoginDeadline), ms(s.cfg.SessTTL)},
+		})
+		idx = append(idx, i)
+	}
+	s.runEach(ctx, loginScript, calls, func(j int, cmd *redis.Cmd) {
+		done(idx[j], parseLogin(cmd.Slice()))
+	})
+}
+
+// Login is LoginEach collected in request order.
+func (s *Store) Login(ctx context.Context, reqs []LoginReq) []LoginResult {
+	out := make([]LoginResult, len(reqs))
+	s.LoginEach(ctx, reqs, func(i int, r LoginResult) { out[i] = r })
+	return out
+}
+```
+
+(`out[i]` is written by one goroutine per index, and `runEach`'s `wg.Wait` orders every write before `Login` returns, so no lock is needed.) Add `"github.com/redis/go-redis/v9"` to `login.go`'s imports if it isn't there.
+
+In `internal/store/logout.go`, replace `Logout` the same way:
+
+```go
+// LogoutEach runs the compare-and-delete for a batch, pipelined per owning
+// master, and calls done once per request as soon as its group returns.
+func (s *Store) LogoutEach(ctx context.Context, reqs []LogoutReq, done func(i int, r LogoutResult)) {
+	calls := make([]scriptCall, 0, len(reqs))
+	idx := make([]int, 0, len(reqs))
+	for i, r := range reqs {
+		if err := validLogout(r); err != nil {
+			done(i, LogoutResult{Err: err})
+			continue
+		}
+		owner := session.Entry{Gateway: r.Gateway, Epoch: r.Epoch, ConnID: r.ConnID}.OwnerPrefix()
+		calls = append(calls, scriptCall{keys: []string{sessKey(r.UID)}, args: []any{r.Field, owner}})
+		idx = append(idx, i)
+	}
+	s.runEach(ctx, logoutScript, calls, func(j int, cmd *redis.Cmd) {
+		n, err := cmd.Int()
+		done(idx[j], LogoutResult{Deleted: n == 1, Err: err})
+	})
+}
+
+// Logout is LogoutEach collected in request order.
+func (s *Store) Logout(ctx context.Context, reqs []LogoutReq) []LogoutResult {
+	out := make([]LogoutResult, len(reqs))
+	s.LogoutEach(ctx, reqs, func(i int, r LogoutResult) { out[i] = r })
+	return out
+}
+```
+
+Add `"github.com/redis/go-redis/v9"` to `logout.go`'s imports.
+
+- [ ] **Step 4: Run the tests to verify they pass, then the whole Tier 1a suite**
+
+Run: `CGO_ENABLED=1 go test -race -count=1 ./internal/store -run 'Each|MasterAddr' -v`
+Expected: all four tests `PASS`; no race report.
+
+Run: `make test && gofmt -l . && go vet ./... && CGO_ENABLED=1 go test -count=1 -v ./... | grep -c 'TODO: Tier 2 integration'`
+Expected: every package `ok` (all earlier `Login`/`Logout` tests pass through the new wrappers); `gofmt -l` and `go vet` print nothing; the count is still `3`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add internal/store
+git commit -m "feat(store): per-node results for Login and Logout (R5S-O1)"
+```
+
+Open risk, added to *Execution Notes* risk 7 (Redis Cluster): the grouping by `MasterForKey` and a group pipeline during a real slot migration are untested until a Cluster runs (Plan 5's compose cluster, and the rev6 Tier 2 shard-failover test).
 
 ---
 
