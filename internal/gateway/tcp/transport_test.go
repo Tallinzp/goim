@@ -3,6 +3,7 @@ package tcp
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -273,4 +274,27 @@ func TestSlowConsumerIsClosedAtTheOutboundCap(t *testing.T) {
 	}
 	waitFor(t, "closes_total{slow_consumer}", func() bool { return s.closes(closeSlowConsumer) == 1 })
 	waitFor(t, "fenced Logout reaches Logic", func() bool { return s.logic.loggedOut("u1") })
+}
+
+// P4I-1 on real gnet: a socket closed at accept is a pre-handshake close
+// for the client, whether its read of the reply sees EOF or a reset. (Its
+// one write can't fail: a reset only answers data it already sent.)
+func TestRejectAtAcceptIsAPreHandshakeCloseForTheClient(t *testing.T) {
+	s := newServer(t, func(c *gateway.Config, _ *Config) { c.MaxConns = 1 })
+	s.online("ua")
+	for i := range 50 {
+		nc, err := net.Dial("tcp", s.tr.Addr())
+		if err != nil {
+			t.Fatal(err)
+		}
+		nc.SetDeadline(time.Now().Add(5 * time.Second))
+		if i%2 == 1 {
+			time.Sleep(5 * time.Millisecond) // the close lands before the write
+		}
+		_, err = wire.ClientHandshake(nc, 1, s.keys[1].Public, uint16(clientpb.Cmd_CMD_HANDSHAKE))
+		nc.Close()
+		if !errors.Is(err, wire.ErrClosedBeforeReply) {
+			t.Fatalf("attempt %d: err %v, want ErrClosedBeforeReply", i, err)
+		}
+	}
 }

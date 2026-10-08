@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/flynn/noise"
 )
@@ -36,6 +37,10 @@ var (
 	ErrPayload   = errors.New("wire: handshake message carries a payload")
 	ErrHandshake = errors.New("wire: bad handshake frame")
 	ErrFrame     = errors.New("wire: bad frame")
+	// ErrClosedBeforeReply: the server closed or reset the connection before
+	// any byte of its handshake reply, which the SDK treats as a
+	// pre-handshake close (spec: Client SDK rules).
+	ErrClosedBeforeReply = errors.New("wire: closed before the handshake reply")
 )
 
 // Key is a server static key: X25519, 32 bytes each.
@@ -82,6 +87,9 @@ func LoadKeyDir(dir string) (KeySet, error) {
 		if err != nil {
 			continue
 		}
+		if _, dup := ks[uint16(id)]; dup {
+			return nil, fmt.Errorf("wire: two key files for key_id %d in %s", id, dir)
+		}
 		b, err := os.ReadFile(filepath.Join(dir, e.Name()))
 		if err != nil {
 			return nil, err
@@ -109,7 +117,8 @@ func KeyID(frame []byte) uint16 {
 func prologue(frame []byte) []byte { return frame[:HeaderLen+KeyIDLen] }
 
 // Session is one connection's pair of cipher states, one per direction, each
-// with its own nonce counter.
+// with its own nonce counter. One goroutine may Seal or WriteFrame while
+// another Opens or ReadFrames; neither side is safe for two goroutines.
 type Session struct {
 	send, recv *noise.CipherState
 }
@@ -236,7 +245,10 @@ func ClientHandshake(rw io.ReadWriter, keyID uint16, serverPub []byte, cmd uint1
 		return nil, err
 	}
 	reply := make([]byte, HeaderLen+HandshakeMsgLen)
-	if _, err := io.ReadFull(rw, reply); err != nil {
+	if n, err := io.ReadFull(rw, reply); err != nil {
+		if n == 0 && (errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET)) {
+			return nil, fmt.Errorf("%w: %w", ErrClosedBeforeReply, err)
+		}
 		return nil, err
 	}
 	return in.Finish(reply)
@@ -254,15 +266,16 @@ func (s *Session) WriteFrame(w io.Writer, cmd uint16, reqID uint32, body []byte)
 
 // ReadFrame reads and opens one frame.
 func (s *Session) ReadFrame(r io.Reader) (cmd uint16, reqID uint32, body []byte, err error) {
-	f := make([]byte, HeaderLen, HeaderLen+MaxLength)
-	if _, err := io.ReadFull(r, f); err != nil {
+	var hb [HeaderLen]byte
+	if _, err := io.ReadFull(r, hb[:]); err != nil {
 		return 0, 0, nil, err
 	}
-	h := ParseHeader(f)
+	h := ParseHeader(hb[:])
 	if err := h.Check(); err != nil {
 		return 0, 0, nil, err
 	}
-	f = f[:HeaderLen+int(h.Length)]
+	f := make([]byte, HeaderLen+int(h.Length)) // this frame's size, not the largest
+	copy(f, hb[:])
 	if _, err := io.ReadFull(r, f[HeaderLen:]); err != nil {
 		return 0, 0, nil, err
 	}

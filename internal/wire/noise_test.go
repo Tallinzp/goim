@@ -7,6 +7,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sync"
 	"testing"
 )
 
@@ -244,5 +246,136 @@ func TestLoadKeyDir(t *testing.T) {
 	}
 	if _, err := LoadKeyDir(t.TempDir()); err == nil {
 		t.Fatal("an empty key set loaded")
+	}
+}
+
+// P4I-1: a server that closes before any reply byte (at_capacity,
+// handshake_rate, bad_version, noise_unknown_key, draining) is reported as
+// ErrClosedBeforeReply, which the SDK counts as a pre-handshake close; a
+// close after part of the reply is not.
+func TestClientHandshakeReportsAPreHandshakeClose(t *testing.T) {
+	k := key(t)
+	for name, reply := range map[string][]byte{"no reply": nil, "part of a reply": {1, 0}} {
+		cli, srv := net.Pipe()
+		go func() {
+			io.ReadFull(srv, make([]byte, HeaderLen+HandshakeLen))
+			srv.Write(reply)
+			srv.Close()
+		}()
+		_, err := ClientHandshake(cli, 1, k.Public, cmdHandshake)
+		if got, want := errors.Is(err, ErrClosedBeforeReply), reply == nil; got != want || err == nil {
+			t.Errorf("%s: err %v, ErrClosedBeforeReply %v, want %v", name, err, got, want)
+		}
+		cli.Close()
+	}
+	// A reset (the transport's close of a rejected socket can be one).
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	go func() {
+		c, err := lis.Accept()
+		if err != nil {
+			return
+		}
+		io.ReadFull(c, make([]byte, HeaderLen+HandshakeLen))
+		c.(*net.TCPConn).SetLinger(0)
+		c.Close()
+	}()
+	c, err := net.Dial("tcp", lis.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err := ClientHandshake(c, 1, k.Public, cmdHandshake); !errors.Is(err, ErrClosedBeforeReply) {
+		t.Fatalf("reset: err %v, want ErrClosedBeforeReply", err)
+	}
+}
+
+// P4I-2: ReadFrame allocates for the frame it reads, not for the largest
+// possible one (Plan 6's loadgen reads millions of frames through it).
+func TestReadFrameAllocatesTheFrameNotTheMax(t *testing.T) {
+	k := key(t)
+	cli, srv, err := handshake(t, KeySet{1: k}, 1, k.Public, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 200
+	var stream bytes.Buffer
+	for i := range n {
+		if err := srv.WriteFrame(&stream, 7, uint32(i), []byte("pong")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	for i := range n {
+		if _, id, body, err := cli.ReadFrame(&stream); err != nil || id != uint32(i) || string(body) != "pong" {
+			t.Fatalf("frame %d: id %d body %q err %v", i, id, body, err)
+		}
+	}
+	runtime.ReadMemStats(&after)
+	// 64KB per frame would be 13MB; small frames stay far below 1MB even
+	// with the rest of the process allocating alongside.
+	if got := after.TotalAlloc - before.TotalAlloc; got > 1<<20 {
+		t.Fatalf("reading %d small frames allocated %d bytes", n, got)
+	}
+}
+
+// P4I-3: two key files naming the same key_id ("1" and "01") are an error,
+// not a silent choice by directory order.
+func TestLoadKeyDirRefusesADuplicateKeyID(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"1", "01"} {
+		p, _ := EncodeKey(key(t))
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(p), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := LoadKeyDir(dir); err == nil {
+		t.Fatal("files 1 and 01 both loaded as key_id 1")
+	}
+}
+
+// P4I-4: the SDK reads on one goroutine and writes on another; the two
+// directions share no state, so -race stays quiet.
+func TestSessionSendAndReceiveOnTwoGoroutines(t *testing.T) {
+	k := key(t)
+	cli, srv, err := handshake(t, KeySet{1: k}, 1, k.Public, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	up, down := make(chan []byte, 100), make(chan []byte, 100)
+	for i := range 100 {
+		f, _ := srv.Seal(nil, 7, uint32(i), []byte("down"))
+		down <- f
+	}
+	close(down)
+	var wg sync.WaitGroup
+	wg.Go(func() { // the SDK's writer
+		for i := range 100 {
+			f, err := cli.Seal(nil, 7, uint32(i), []byte("up"))
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			up <- f
+		}
+		close(up)
+	})
+	wg.Go(func() { // the SDK's reader
+		for f := range down {
+			if _, _, _, _, err := cli.Open(nil, f); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	})
+	wg.Wait()
+	for f := range up {
+		if _, _, _, _, err := srv.Open(nil, f); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

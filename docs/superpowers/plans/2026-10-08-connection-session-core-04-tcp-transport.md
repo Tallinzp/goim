@@ -86,14 +86,21 @@ The spec leaves these open. Each is restated in the task that implements it. The
 - **Deferred minors:**
   - `TestCloseInsideACoreCallIsReportedAfterIt` drives `l.closed` by hand; a real gnet write failure inside `Send` is left to Plan 5's race suite.
   - Task 5 overstates `loop.close`'s flush: `OnClose` runs first, then one non-blocking `writev`, so a Kick or `Reconnect` before a close is best-effort.
-  - `LoadKeyDir` maps files `1` and `01` to the same `key_id`; the winner depends on `ReadDir` order.
-  - `Session.ReadFrame` allocates 64KB per call (matters for Plan 6's loadgen).
+  - ~~`LoadKeyDir` maps files `1` and `01` to the same `key_id`~~ (fixed in Task 9, P4I-3).
+  - ~~`Session.ReadFrame` allocates 64KB per call~~ (fixed in Task 9, P4I-2).
   - The ownership test can call `t.Fatal` from a `wg.Go` goroutine (via `handshakeFrame`).
   - A second SIGTERM/SIGINT during the 85s drain can't force an exit; a failed `tr.Start` exits without `EpochEnded` (the lease TTL ends the epoch).
 - **Plan 3 deferred minor fixed here:** `Stop` and `Drain` before a successful `Start` no longer panic (Task 3).
+- **Interface review (2026-10-08), decisions P4I-1..P4I-6.** The surface Plan 5 consumes was read against the spec's *Client SDK rules* and *Race integration tests*. P4I-1..P4I-4 change Plan 4's code and were implemented as **Task 9** (no task text in this plan: tests first, each RED then GREEN, suite green under `-race`):
+  - **P4I-1** `wire.ClientHandshake` wraps `ErrClosedBeforeReply` when the server closes or resets before any reply byte, so the SDK can tell a pre-handshake close (0.5–1.5s retry, 10 in a row) from a failed handshake. A partial reply is not one. Tests: `TestClientHandshakeReportsAPreHandshakeClose` (pipe EOF, partial reply, TCP reset) and `TestRejectAtAcceptIsAPreHandshakeCloseForTheClient` (50 `at_capacity` rejects on real gnet). The client's single write can't fail on a fresh socket (a reset only answers data already sent), so write errors are not classified.
+  - **P4I-2** `Session.ReadFrame` allocates the frame it reads, not 64KB. Test: `TestReadFrameAllocatesTheFrameNotTheMax` (200 small frames: 14.7MB before, under the 1MB bar after).
+  - **P4I-3** `LoadKeyDir` refuses two files for one `key_id` (`1` and `01`): a broken Secret fails loudly at startup, as choice #43 wants. Test: `TestLoadKeyDirRefusesADuplicateKeyID`.
+  - **P4I-4** `Session` may be used by one writer goroutine and one reader goroutine at once (the directions share no state); documented and pinned by `TestSessionSendAndReceiveOnTwoGoroutines` under `-race`.
+  - **P4I-5** (Plan 5's work) The fake gateway clock the spec's clock-skew race test needs is `gateway.Deps.Clock`, already in the core; Plan 5 adds a test-profile flag on `cmd/gateway` (e.g. `-clock-offset`) to set it. No Plan 4 change.
+  - **P4I-6** (decision for Plan 5) **The Tier 1b compose race suite runs on the Tier 2 host** (Docker, 24 cores), as a new scenario `make test-tier2 SCENARIO=race` with the same report flow as `store`. The dev machine has no Docker and there is no CI runner. `internal/wire` stays internal (choice #38): the Go SDK lives in this module; the mobile SDKs are native code built against the spec.
 - **For Plan 5 (SDK and race suite):**
   - The SDK's byte layer is `wire.Initiate` / `Initiator.Finish` (or `wire.ClientHandshake`) and `Session.Seal` / `Open`. Handshake `Cmd` is `clientpb.Cmd_CMD_HANDSHAKE`; the server's reply is exactly `HeaderLen + HandshakeMsgLen` bytes.
-  - A pre-handshake close (`at_capacity`, `handshake_rate`, `bad_version`, `noise_unknown_key`, `draining`) is a close with no bytes before the handshake reply.
+  - A pre-handshake close (`at_capacity`, `handshake_rate`, `bad_version`, `noise_unknown_key`, `draining`) is a close with no bytes before the handshake reply; `wire.ClientHandshake` reports it as `errors.Is(err, wire.ErrClosedBeforeReply)` (P4I-1).
   - The test timing profile sets `-handshake-timeout`/`-auth-timeout` ≥ 3s (not scaled), `-handshake-concurrency` equal to `-loops` on a 2-core host, and small `-drain-window`/`-drain-flush`.
   - `deploy/compose` needs a Noise key directory (`gateway noise-keygen`) mounted at `-noise-keys`, with its public key given to the scripted client.
 
