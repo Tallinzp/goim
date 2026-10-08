@@ -78,13 +78,14 @@ The spec leaves these open. Each is restated in the task that implements it. The
 - **Implemented 2026-10-08** on `feat/plan3-gateway` (Native, 12 task commits `d358d0a`…`5294a48`). One test deviation: `TestFirstOpenOnALoopAllocatesNoTable` flaked once (5,640 B against a 1 KiB bar, because `TotalAlloc` counts the whole process). The bar is now 64 KiB; a table built on first use is ~590 KB and is still caught (`d73d423`).
 - **Final review** (a fresh Opus reviewer, verdict "with fixes"). Fixed, each with a test that failed first:
   - (Important) `Drain` left the lease loop running, so a renewal after `EpochEnded` re-created the key and reset the `gwepochs` score. `Drain` now stops the lease loop and waits for its last call before `EpochEnded`. Test: `TestNoLeaseRenewalAfterEpochEnded`, commit `a1597a5`. Open risk: a renewal that timed out at the gateway but still runs in Logic after `EpochEnded`.
-  - (re-graded Minor → Important) A pending Kick was replaced by `Busy` when the Login had no definitive reply, so the client's retry evicted the device that had replaced it. The pending Kick now wins. Test: `TestKickPendingWinsOverNoDefinitiveReply`, commit `23443f8`.
+  - (Important; the reviewer graded it Minor) A pending Kick was replaced by `Busy` when the Login had no definitive reply, so the client's retry evicted the device that had replaced it. The pending Kick now wins. Test: `TestKickPendingWinsOverNoDefinitiveReply`, commit `23443f8`.
 - **Deferred minors:**
   - The comment in `loginFrame` wrongly calls the channel-full branch unreachable.
   - `Stop` doesn't wait for Reconcile `call` goroutines or the `retryLogouts` timers.
   - `Stop` before or after a failed `Start` panics, and so does `Drain` before `Start` (fix with Plan 4's `cmd/gateway`).
   - `TestRenewalAfterFailuresForALeaseTTLTriggersAPass` has a thin timing margin under `-race`.
-  - Plan 2's *Execution Notes* still say a lease error counts as `missing`; choice #28 replaced that rule.
+- **Stale note elsewhere:** Plan 2's *Execution Notes* still say a lease error counts as `missing`; choice #28 replaced that rule.
+- **Open risk after the lease fix** (confirmed by a second review of the fixes, which found nothing else): a renewal whose Lua reached Redis before the gateway's `LeaseTimeout` cut it can land after `EpochEnded`. Cleanup of that epoch is then delayed by at most a lease TTL, or by 2 × TTL + guard if its `ZADD` landed too. If wanted: when the last renewal failed, wait `LeaseTimeout` before `EpochEnded`, or repeat `EpochEnded` once (it is idempotent).
 - **For Plan 4 (TCP transport), the seam this plan fixes:**
   - Build `NumLoops` from gnet's `NumEventLoop` and use `gnet.WithLoadBalancing(gnet.RoundRobin)`.
   - In `OnOpen`: `conn, reason := g.Open(loopOf(c.EventLoop()), link)`; on a reason, close before any crypto. The `Loop` passed must be the same comparable value every time for the same loop (e.g. a struct wrapping the `EventLoop`).
