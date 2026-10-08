@@ -3276,30 +3276,32 @@ Open risk, added to *Execution Notes* risk 7 (Redis Cluster): the grouping by `M
 
 ---
 
-### Task 11: Interface review follow-ups (PI-2, PI-3, PI-6)
+### Task 11: Interface review follow-ups (PI-2, PI-3, PI-6) and login over an unreadable entry
 
 > Follow-up added 2026-10-08 after the user's review of the store interfaces (decisions PI-1..PI-6 in *Execution Notes*). Three decisions change code:
 > - **PI-2 (Revoke part):** a re-run of Revoke's delete step must return the entries the request already deleted, so their kicks are not lost. Login keeps `LoginAlready` without `Prev` (Reconcile closes the old connection).
 > - **PI-3:** `Err` means only "outcome unknown". A stored entry that does not decode goes in its own field (`LoginResult.PrevErr`, `SlotState.StoredErr`, `Revoked.EntryErr`), and the rest of the result stays valid.
 > - **PI-6:** after a Cluster failover, Revoke reloads the slot map and retries the marker write and `WAIT` once on the new master.
+> - **Login over an unreadable entry** (found during the review, added at the user's request): `login.lua` reads the stored entry's `conn_seq` and `login_ms` with `tonumber`. A value that is not 7 fields, or whose numbers aren't numbers, made the script fail with a Lua error, so every login to that slot failed until the 30-day `sess:` TTL ran out. The script now writes the login over such a value with no kick and returns the new code `REPAIRED`.
 >
-> PI-4 (`before_ms` from the account service) needs no store change beyond rejecting `beforeMs <= 0`: the store already takes `beforeMs`, and the value now also names the request for PI-2. The code below was prototyped against commit `6556a68`; `go vet ./...` and `go test -race -count=1 ./...` pass on miniredis.
+> PI-4 (`before_ms` from the account service) needs no store change beyond rejecting `beforeMs <= 0`: the store already takes `beforeMs`, and the value now also names the request for PI-2. The code below was prototyped against commit `6556a68` (the login repair against `066c39c`); `go vet ./...` and `go test -race -count=1 ./...` pass on miniredis.
 
 **Files:**
-- Modify: `internal/store/login.go`, `internal/store/reconcile.go`, `internal/store/keys.go`, `internal/store/store.go`, `internal/store/revoke.go`, `internal/store/lua/rev_delete.lua`
-- Test: `internal/store/prev_err_test.go` (new), `internal/store/revoke_reroute_test.go` (new), `internal/store/revoke_test.go`, `internal/store/keys_test.go`
+- Modify: `internal/store/login.go`, `internal/store/lua/login.lua`, `internal/store/reconcile.go`, `internal/store/keys.go`, `internal/store/store.go`, `internal/store/revoke.go`, `internal/store/lua/rev_delete.lua`
+- Test: `internal/store/prev_err_test.go` (new), `internal/store/login_repair_test.go` (new), `internal/store/revoke_reroute_test.go` (new), `internal/store/revoke_test.go`, `internal/store/keys_test.go`
 
 **Interfaces:**
 - Consumes: `LoginResult`, `parseLogin` (Task 3); `SlotState`, `readSlot`, `CompareAndSet` (Task 6); `Revoke`, `deleteRevoked`, `markRevoked`, `revMarkScript` (Task 5); `nodeFor`, `Store.groupOf` (Tasks 3 and 10); test helpers `newStore`, `entry`, `nowMs`, `login1`, `markScript`, `field`.
 - Produces (package `store`):
   - `LoginResult.PrevErr error`: set, with `Prev` nil, when the stored entry the script returned does not decode. `Err` is now set only when the outcome is unknown; if `Err == nil`, `Code` is what the script did.
+  - `LoginRepaired` (`"REPAIRED"`): the stored value was unreadable even to the Lua (not 7 fields, or `conn_seq` / `login_ms` not numbers). The login was written over it with no kick, `Prev` is nil and `PrevErr` is set. A value the Lua can read but Go can't decode (for example a bad epoch) still goes through the normal login table, with `PrevErr` set.
   - `SlotState.StoredErr error`: set, with `Stored` nil, when `Raw` does not decode. `Raw` is still set and works as `CASReq.ExpectRaw`. `MarkerMs` is still read. `Err` means only "outcome unknown".
   - `Revoked.EntryErr error`: set, with `Entry` zero, when a deleted value does not decode. `Revoke` no longer stops at such a value: every deleted field is reported.
   - `Revoke(ctx, uid, scope, beforeMs)`: same signature. It rejects `beforeMs <= 0`. A re-run with the same `(uid, scope, beforeMs)` returns every entry that request has deleted, for `revDeletedTTL` (5 min). Results are sorted by field. After a `MOVED`, `READONLY` or connection error on the cached master, it waits up to `rerouteWait` (2s) for the slot map to name another master and retries once there.
   - unexported: `revDeletedKey(uid, scope, beforeMs)` (`revdel:{uid}:<scope>:<before_ms>`), `revDeletedTTL`, `Store.masterFor`, `Store.reloadSlots`, `Store.rerouteWait`, `markOn`, `staleMaster`, `rerouteMaster`.
 
 How Plan 2 uses it:
-- **Login handler.** If `Err != nil`, the entry failed and the gateway retries. Otherwise answer by `Code`. When `PrevErr != nil`, do not kick, and count `login_prev_undecodable`.
+- **Login handler.** If `Err != nil`, the entry failed and the gateway retries. Otherwise answer by `Code`. When `PrevErr != nil`, do not kick, and count `login_prev_undecodable`. Answer `REPAIRED` like `WRITTEN` (success, no kick), and count it as `login_repaired`.
 - **Reconcile handler.** A slot with `StoredErr` set can't be a valid owner, so the chunk wins (rule 3 is skipped) and the CAS uses `Raw` as `ExpectRaw`. Count `reconcile_stored_undecodable`.
 - **Revoke handler.** Kick every `Revoked` whose `EntryErr` is nil with reason `REVOKED`, and count the others. The connections behind the others are closed by Reconcile rule 1.
 
@@ -3363,6 +3365,45 @@ func TestReadSlotsReportsUndecodableStoredSeparately(t *testing.T) {
 	cas := s.CompareAndSet(ctx, []CASReq{{UID: uid, Field: field, ExpectRaw: st.Raw, Entry: e, SentMs: nowMs(t, s)}})[0]
 	if cas.Err != nil || cas.Code != CASWritten {
 		t.Fatalf("CompareAndSet over the undecodable value = %+v; want WRITTEN", cas)
+	}
+}
+```
+
+`internal/store/login_repair_test.go`:
+
+```go
+package store
+
+import (
+	"testing"
+
+	"github.com/Tallinzp/goim/internal/testredis"
+)
+
+// A stored value the login Lua itself cannot read must not block the slot:
+// the login is written over it with no kick (REPAIRED), Err stays nil and
+// PrevErr reports the unreadable value.
+func TestLoginRepairsUnreadableStoredValue(t *testing.T) {
+	for name, bad := range map[string]string{
+		"not an entry":       "garbage",
+		"too few fields":     "gw-1|1|1|d|1|1",
+		"conn_seq not a num": "gw-1|1|1|d|x|1|1000",
+		"login_ms not a num": "gw-1|1|1|d|1|x|1000",
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, rdb := newStore(t)
+			uid := testredis.UID()
+			rdb.HSet(ctx, sessKey(uid), field, bad)
+			e := entry(7, "d", 1, nowMs(t, s))
+
+			r := login1(t, s, uid, e)
+			if r.Code != LoginRepaired || r.Prev != nil || r.PrevErr == nil {
+				t.Fatalf("result = %+v; want REPAIRED with PrevErr set", r)
+			}
+			if got := rdb.HGet(ctx, sessKey(uid), field).Val(); got != e.Encode() {
+				t.Fatalf("stored = %q, want the new entry", got)
+			}
+		})
 	}
 }
 ```
@@ -3673,7 +3714,7 @@ index b8156ce..0c437dc 100644
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `go vet ./internal/store`
-Expected: FAIL to build. The errors include `not enough arguments in call to s.deleteRevoked`, `r.PrevErr undefined`, `st.StoredErr undefined`, `undefined: revDeletedKey`, `s.reloadSlots undefined` and `undefined: staleMaster`.
+Expected: FAIL to build. The errors include `not enough arguments in call to s.deleteRevoked`, `r.PrevErr undefined`, `st.StoredErr undefined`, `undefined: revDeletedKey`, `undefined: LoginRepaired`, `s.reloadSlots undefined` and `undefined: staleMaster`.
 
 - [ ] **Step 3: Implement**
 
@@ -3716,6 +3757,49 @@ index 4bdb154..19bd506 100644
  			return res
  		}
  		res.Prev = &e
+```
+
+`internal/store/login.go`, the new code after `LoginAlready`:
+
+```go
+	// LoginRepaired: the stored value was unreadable even to the Lua (not 7
+	// fields, or conn_seq / login_ms not numbers), so it cannot be a valid
+	// owner. The login was written over it with no kick; PrevErr is set.
+	// Logic answers it like WRITTEN and counts it.
+	LoginRepaired LoginCode = "REPAIRED"
+```
+
+`internal/store/lua/login.lua`:
+
+```diff
+diff --git a/internal/store/lua/login.lua b/internal/store/lua/login.lua
+index b07e4af..5a38f72 100644
+--- a/internal/store/lua/login.lua
++++ b/internal/store/lua/login.lua
+@@ -4,7 +4,8 @@
+ -- ARGV[3] device_id         ARGV[4] conn_seq
+ -- ARGV[5] recv_ms           ARGV[6] tok_iat_ms
+ -- ARGV[7] login_deadline_ms ARGV[8] sess TTL ms
+--- Returns {code, stored value or ''}; code ALREADY means this exact entry is already stored.
++-- Returns {code, stored value or ''}; code ALREADY means this exact entry is already stored,
++-- REPAIRED that the stored value was unreadable and has been overwritten.
+ -- epoch and conn_id are uint64 and are never converted to Lua numbers (doubles).
+ local function split(s)
+   local out = {}
+@@ -42,7 +43,12 @@ local stored = redis.call('HGET', KEYS[1], field)
+ if stored then
+   local s = split(stored)
+   local s_seq, s_login = tonumber(s[5]), tonumber(s[6])
+-  if s[4] == ARGV[3] then
++  if #s ~= 7 or s_seq == nil or s_login == nil then
++    -- Unreadable (an older format, or written by hand): it cannot be a valid
++    -- owner, so this login replaces it with no kick. Failing here instead
++    -- would block every login to the slot until the sess TTL runs out.
++    code = 'REPAIRED'
++  elseif s[4] == ARGV[3] then
+     if tonumber(ARGV[4]) > s_seq then
+       code = 'REPLACED'
+     elseif recv <= s_login + deadline then
 ```
 
 `internal/store/reconcile.go`:
