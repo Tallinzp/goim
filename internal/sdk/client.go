@@ -30,7 +30,8 @@ type Config struct {
 	// by New, so a second Client on it fails with ErrStoreInUse.
 	Store Store
 	// OnEvent receives every event in order, on the client's goroutine. It
-	// must not block or call the Client.
+	// must not block, and calling any Client method from it deadlocks: the
+	// method waits for the run loop, which is running OnEvent.
 	OnEvent func(Event)
 
 	Windows        Windows        // built-in defaults (DefaultWindows)
@@ -43,7 +44,7 @@ type Config struct {
 	LogoutTimeout  time.Duration  // Logout → LogoutResp (2s)
 
 	Dial func(ctx context.Context, addr string) (net.Conn, error) // nil: TCP
-	Rand *rand.Rand                                               // nil: randomly seeded
+	Rand *rand.Rand                                               // nil: randomly seeded; one per Client, used without a lock
 }
 
 // DefaultConfig returns the timing defaults; the caller sets the rest. New
@@ -228,10 +229,12 @@ func (c *Client) Foreground() { c.do(func() { c.local(true) }) }
 
 // Logout cancels every pending reconnect and retry, sends Logout if logged
 // in and waits up to LogoutTimeout for LogoutResp, then closes. The client
-// stays idle until Connect.
+// stays idle until Connect. It blocks the caller, and the run loop, for up
+// to LogoutTimeout (2s): a mobile port calls it off the UI thread.
 func (c *Client) Logout() { c.do(func() { c.logout() }) }
 
-// SwitchAccount logs out, then connects with the new account's tokens.
+// SwitchAccount logs out, then connects with the new account's tokens. Like
+// Logout, it blocks for up to LogoutTimeout.
 func (c *Client) SwitchAccount(token func(ctx context.Context, refresh bool) (string, error)) {
 	c.do(func() {
 		c.logout()
