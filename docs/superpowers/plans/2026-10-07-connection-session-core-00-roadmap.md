@@ -151,12 +151,27 @@ Every race, consistency-contract row and spec test maps to the plan and test tha
 | Live connection missing from Redis, ≤ 1 cycle / ~1 min after `missing` | P1 `TestCompareAndSet`, `TestRenewLease`; P3 `TestFirstLeaseMissingIsIgnoredAndALaterOneTriggersAPass`, `TestRenewalAfterFailuresForALeaseTTLTriggersAPass`, `TestE2EReconcileRestoresAndDeletesGhosts`; P5b `TestForcedSweepOfALiveGatewayIsRestored`, `TestStaleLeaseObservationIsCorrectedByTheOwner`, `TestRefusedChunkIsRequeuedAndRestoredInThePass` |
 | Healthy session reads invalid during an outage | P5b `TestRedisPausedNothingIsSwept`, `TestGatewaysCutOffFromLogicNothingIsSwept` (lease keys gone during the cut, back after) |
 
+### Race integration tests (spec bullets not covered above)
+
+The full bullet-by-bullet map is in Plan 5b1's *Execution Notes* (*Spec test map*).
+
+| Spec bullet | Pinned by (all P5b, Tier 1b) |
+|---|---|
+| Reconcile refusal (R3-O6) | `TestRefusedChunkIsRequeuedAndRestoredInThePass`, `TestRefusedRule3WriteSendsNoKick` |
+| Reconcile restores missing and deletes ghosts | `TestReconcileRestoresMissingAndDeletesGhosts` |
+| Clock skew (R4M-5) | `TestClockAheadAlertsAndItsLateWriteIsCleanedUp`, `TestClockBehindLoginsExpireAndTheClientLogsInElsewhere` |
+| Revoke on two slots; `WAIT` fails and the retry is idempotent (R2-O4); `before_ms` (PI-4) | `TestRevokeClosesConnectionsOnTwoSlots`, `TestRevokeWhoseWAITFailsIsRetried`, `TestRevokeBeforeMs` |
+| Key rotation (R4H-O10) | `TestKeyRotation` |
+| JWKS fallback and no key set (R2-O7) | `TestLogicStartsFromTheJWKSFallback`, `TestLogicWithNoKeySetIsNeverReady` |
+| Test timing profile: a broken ratio is refused | `TestProfileBreakingARatioIsRefused` |
+| Harness self-checks (not spec bullets) | `TestHarnessFailsWhatAssertionsMiss`, `TestRedisFaultsDoWhatTheyClaim`, `TestProcessesDieWithTheSuite`, `TestSeriesCheckRefusesUnregisteredSeries`, `TestStackComesUp`, `TestForceSweepWaitsOutARenewalInFlight` |
+
 ### Tiers
 
 | Tier | Plans that add tests to it |
 |---|---|
 | 1a (every change, dev machine) | 1, 2, 3, 4, 5a (SDK and scripted-client tests) |
-| 1b (before every commit, dev machine, test timing profile) | 5b (on the dev machine with miniredis, and on the Tier 2 host with real Redis, choice #47) |
+| 1b (before every commit, dev machine, test timing profile) | 5b (a `redis-server` 7.4.11 primary and replica per scenario, on the dev machine and on the Tier 2 host alike, choice #62) |
 | 2 (dedicated host) | 6 |
 | 3 (`TARGET=local` or `cloud`) | 6 |
 

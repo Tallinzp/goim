@@ -1769,7 +1769,7 @@ git commit -m "test(tier2): make test-tier2 SCENARIO=race (choice #64)"
 
 Every race integration test in the spec runs on the dev machine before each commit (`make test-race-suite`), against the real binaries and a real Redis primary and replica on the test timing profile, and again on the Tier 2 host (`make test-tier2 SCENARIO=race`). The suite found one gateway bug, fixed in Task 9. The roadmap records #58–#64 and this plan's test names in the invariant index.
 
-Plan 6 builds `cmd/loadgen` and the Tier 2/3 load scenarios. It can reuse the harness's process and port handling and the fault API (a slowed Logic), and it decides the client per load test as P5I-2 records.
+Plan 6 builds `cmd/loadgen` and the Tier 2/3 load scenarios, and it decides the client per load test as P5I-2 records. It runs its processes from `scripts/tier2` rather than reusing the test-only harness, and it slows Logic by CPU rather than with the `login` fault (5b1 *Execution Notes*, P5bI-1..P5bI-6).
 
 The open risks are listed in 5b1's *Execution Notes*.
 
