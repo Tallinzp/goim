@@ -89,7 +89,7 @@ if ! make redis-server >"$out/redis-build.log" 2>&1; then
 fi
 
 # 1 + 2: the suite. Each scenario starts its own Redis primary and replica.
-listed=$(go test -list '.*' ./internal/racetest/ | grep -c '^Test')
+listed=$(GOIM_RACE_SUITE= go test -list '.*' ./internal/racetest/ | grep -c '^Test') # no suite: lists without building the binaries
 go test -count=1 -v -timeout 45m ./internal/racetest/ >"$out/tests.log" 2>&1
 tests_rc=$?
 passed=$(grep -cE '^--- PASS' "$out/tests.log")
@@ -99,11 +99,14 @@ failed=$(grep -E '^[[:space:]]*--- FAIL' "$out/tests.log" | sed 's/^[[:space:]]*
 # connection's Logout as soon as it closes while its Login is in flight
 # (fence (a) removed): the Logout lands before the write and a ghost stays.
 mutdir=$(mktemp -d)
-git worktree add --detach "$mutdir" HEAD >/dev/null 2>&1
-sed -i.orig 's/if c.outcome == loginOK || c.fenceB { \/\/ fence (a) or (b)/if c.outcome == loginOK || c.outcome == loginPending || c.fenceB { \/\/ MUTANT: no fence (a)/' "$mutdir/internal/gateway/gateway.go"
-if ! grep -q 'MUTANT: no fence (a)' "$mutdir/internal/gateway/gateway.go"; then
+if ! git worktree add --detach "$mutdir" HEAD >"$out/mutation.log" 2>&1; then
+  rmdir "$mutdir" 2>/dev/null
+  mutdir=""
+  mutation="error: git worktree add failed, see mutation.log"
+elif ! sed -i.orig 's/if c.outcome == loginOK || c.fenceB { \/\/ fence (a) or (b)/if c.outcome == loginOK || c.outcome == loginPending || c.fenceB { \/\/ MUTANT: no fence (a)/' "$mutdir/internal/gateway/gateway.go" ||
+  ! grep -q 'MUTANT: no fence (a)' "$mutdir/internal/gateway/gateway.go"; then
   mutation="error: could not apply the mutation"
-elif ! (cd "$mutdir" && go vet ./internal/gateway/) >"$out/mutation.log" 2>&1; then
+elif ! (cd "$mutdir" && go vet ./internal/gateway/) >>"$out/mutation.log" 2>&1; then
   mutation="error: the mutant does not compile"
 elif (cd "$mutdir" && GOIM_RACE_LOGS= go test -count=1 -v -run '^TestRace5CloseWhileLoginInFlight$' ./internal/racetest/) >>"$out/mutation.log" 2>&1; then
   mutation="fail: race 5 still passes without fence (a)"

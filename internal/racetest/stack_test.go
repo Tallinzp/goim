@@ -405,9 +405,12 @@ func (s *Stack) Reconcile(i int) {
 
 // Metric returns the value of one series from admin's /metrics, written as
 // the exposition prints it, e.g. `goim_gateway_kicks_total{result="ignored"}`;
-// 0 if absent.
+// 0 if absent. It fails t on a series no binary registers (checkSeries).
 func (s *Stack) Metric(admin, series string) float64 {
 	s.t.Helper()
+	if err := checkSeries(series); err != nil {
+		s.t.Fatal(err)
+	}
 	resp, err := http.Get("http://" + admin + "/metrics")
 	if err != nil {
 		s.t.Fatal(err)

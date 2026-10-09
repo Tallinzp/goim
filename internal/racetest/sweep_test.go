@@ -95,15 +95,28 @@ func TestThreeKilledWhileOneRenewsAreAllSwept(t *testing.T) {
 	}
 }
 
-// Redis paused for 9s (the spec's 90s): nothing is swept, and the sessions
-// are still there afterwards (each gateway's lease reply reports missing,
-// and its triggered pass refreshes them).
+// Redis paused for 9s (the spec's 90s): every epoch looks stale when Redis
+// resumes, the guard holds them back until the gateways renew, and nothing is
+// swept. The gateways' renewals keep failing for 1.5s after the pause, so the
+// sweeper is sure to look before they land (otherwise it is a race, and a
+// run where they win proves nothing about the guard). The sessions are still there afterwards: each gateway's renewals
+// failed for longer than a lease TTL, so it runs a triggered pass that
+// refreshes them (its lease reply may or may not report missing).
 func TestRedisPausedNothingIsSwept(t *testing.T) {
 	s := New(t, Options{})
 	uids := s.onlineOnEach("sw4-")
+	for i := range s.GW {
+		s.Fault(i, fault.Rule{Op: gateway.FaultLogic, Key: "GatewayLease", Fail: true, For: dur(10500 * time.Millisecond)})
+	}
 	s.Redis.PauseFor(9 * time.Second)
 	time.Sleep(9 * time.Second)
 	s.noSweepFor(8 * time.Second)
+	if s.logicMetric(logicGuardHolds) == 0 {
+		t.Fatal("the guard never held: the sweeper saw no stale epoch, so the scenario proved nothing")
+	}
+	for i := range s.GW {
+		s.passDone(i, 1, time.Second)
+	}
 	for _, uid := range uids {
 		if !s.Redis.has(uid) {
 			t.Fatalf("%s is gone after the Redis pause", uid)
@@ -167,12 +180,33 @@ func TestLogicRestartWithLateRenewalsSweepsNothing(t *testing.T) {
 }
 
 // forceSweep makes gateway i's live epoch look dead to the sweeper: its
-// renewals are blocked, its lease key deleted and its score aged.
+// renewals are blocked, its lease key deleted and its score aged. A renewal
+// already past the fault check would re-create the key and renew the score,
+// so it waits until a renewal has failed: they are serial, so none is left
+// in flight.
 func (s *Stack) forceSweep(i int) {
+	s.t.Helper()
 	g := s.GW[i]
+	failed := s.gwMetric(i, sprintf(gwLeaseCalls, "error"))
 	s.Fault(i, fault.Rule{Op: gateway.FaultLogic, Key: "GatewayLease", Fail: true})
+	eventually(s.t, g.ID+": a renewal hit the fault", 3*time.Second, func() bool {
+		return s.gwMetric(i, sprintf(gwLeaseCalls, "error")) > failed
+	})
 	s.Redis.DelLease(g.ID, g.Epoch)
 	s.Redis.SetScore(g.ID, g.Epoch, s.Redis.Now()-10_000)
+}
+
+// forceSweep works with a renewal in flight: one that already passed the
+// fault check (here: in its 800ms delay) would re-create the lease key behind
+// DelLease and keep the epoch from being swept.
+func TestForceSweepWaitsOutARenewalInFlight(t *testing.T) {
+	s := New(t, Options{})
+	const uid = "sw10"
+	s.Online(0, uid, "d1", 1)
+	s.Fault(0, fault.Rule{Op: gateway.FaultLogic, Key: "GatewayLease", Delay: dur(800 * time.Millisecond)})
+	time.Sleep(1500 * time.Millisecond) // a renewal is most likely in its delay
+	s.forceSweep(0)
+	eventually(t, "the live epoch was swept", 5*time.Second, func() bool { return s.swept(s.GW[0]) && !s.Redis.has(uid) })
 }
 
 // A forced sweep of a live gateway: its sessions are deleted, then restored

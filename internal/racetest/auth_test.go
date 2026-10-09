@@ -49,15 +49,20 @@ func TestLogicStartsFromTheJWKSFallback(t *testing.T) {
 func TestLogicWithNoKeySetIsNeverReady(t *testing.T) {
 	s := base(t, Options{NoJWKS: true, NoFallback: true})
 	l := s.launchLogic()
+	answered := false
 	holds(t, "Logic stays NotReady and running", 3*time.Second, func() bool {
 		if l.exited() {
 			return false
 		}
 		resp, err := http.Get("http://" + l.Admin + "/readyz")
 		if err != nil {
-			return true // not listening yet
+			return !answered // not listening yet; once it has, it must keep answering
 		}
 		resp.Body.Close()
+		answered = true
 		return resp.StatusCode == http.StatusServiceUnavailable
 	})
+	if !answered {
+		t.Fatal("Logic never answered /readyz: the check saw no NotReady")
+	}
 }
