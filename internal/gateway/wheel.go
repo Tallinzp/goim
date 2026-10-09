@@ -36,8 +36,9 @@ func newWheel(now time.Time) *wheel {
 }
 
 // schedule arms t to run fn at the first tick at or after at: deadlines round
-// up, so a timer never fires early (it may fire up to one tick late). An
-// armed t is moved.
+// up, so a timer never fires early. It fires at most one tick late, because
+// runTicker advances the wheel just after each tick begins (untilNextTick).
+// An armed t is moved.
 func (w *wheel) schedule(t *timer, at time.Time, fn func()) {
 	w.stop(t)
 	ms := at.UnixMilli()
@@ -112,4 +113,13 @@ func (w *wheel) advance(now time.Time) {
 		fn()
 	}
 	w.due = due[:0]
+}
+
+// untilNextTick is how long from now until the next whole tick of the clock.
+// The ticker waits that long, so advance runs just after each boundary and a
+// timer fires at most one tick after its deadline (the deadline rounds up to
+// a tick, and that tick is processed as soon as it begins).
+func untilNextTick(now time.Time) time.Duration {
+	ms := now.UnixMilli() % wheelTick.Milliseconds()
+	return wheelTick - time.Duration(ms)*time.Millisecond
 }

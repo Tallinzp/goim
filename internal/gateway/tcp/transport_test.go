@@ -12,6 +12,7 @@ import (
 	pb "github.com/Tallinzp/goim/api/internalpb"
 	"github.com/Tallinzp/goim/internal/gateway"
 	"github.com/Tallinzp/goim/internal/wire"
+	"github.com/panjf2000/gnet/v2"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -230,7 +231,7 @@ func TestKickReachesTheClient(t *testing.T) {
 // of it only after its current call returns.
 func TestCloseInsideACoreCallIsReportedAfterIt(t *testing.T) {
 	s := newServer(t, nil)
-	l := &loop{g: s.g}
+	l := &loop{el: idleLoop{}, g: s.g}
 	tc := &conn{t: s.tr, l: l}
 	var reason string
 	l.run(func() { tc.c, reason = s.g.Open(l, tc) })
@@ -250,6 +251,13 @@ func TestCloseInsideACoreCallIsReportedAfterIt(t *testing.T) {
 		t.Fatal("Closed not reported after the call")
 	}
 }
+
+// idleLoop is a gnet event loop for a loop the test drives by hand: the
+// gateway's ticker reaches every loop that opened a connection, and here it
+// has nothing to run.
+type idleLoop struct{ gnet.EventLoop }
+
+func (idleLoop) Execute(context.Context, gnet.Runnable) error { return nil }
 
 // A logged-in client that pipelines Pings and never reads must not grow the
 // gateway's outbound buffer without bound: past MaxOutbound the connection

@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -135,5 +136,59 @@ func TestWheelScheduleDoesNotAllocate(t *testing.T) {
 	})
 	if allocs != 0 {
 		t.Fatalf("%v allocations per schedule+stop", allocs)
+	}
+}
+
+// The ticker waits until the next whole tick of the clock, so advance runs
+// just after each boundary.
+func TestUntilNextTick(t *testing.T) {
+	for _, tc := range []struct {
+		after, want time.Duration // after t0, a boundary
+	}{
+		{0, time.Second},
+		{time.Millisecond, 999 * time.Millisecond},
+		{300 * time.Millisecond, 700 * time.Millisecond},
+		{999 * time.Millisecond, time.Millisecond},
+	} {
+		if got := untilNextTick(t0.Add(tc.after)); got != tc.want {
+			t.Errorf("at +%v: %v, want %v", tc.after, got, tc.want)
+		}
+	}
+}
+
+// On a running gateway a timer fires at most one tick after its deadline:
+// the deadline rounds up to a whole second, and the ticker advances the
+// wheel just after each one. A free-running 1s ticker adds up to another
+// second, and fence (b) then came 6–8s after recv instead of 6–7s (found by
+// Plan 5b's race suite).
+func TestRunningWheelFiresAtMostOneTickLate(t *testing.T) {
+	l := newLive(t, nil)
+	l.authed(0) // binds loop 0, so the ticker advances its wheel
+	ls := l.g.loops.states[0]
+	start := l.g.now()
+	var mu sync.Mutex
+	late := map[time.Duration]time.Duration{}
+	timers := make([]timer, 5)
+	l.loops[0].do(func() {
+		for i := range timers {
+			d := 1100*time.Millisecond + time.Duration(i)*200*time.Millisecond // phases .1 to .9 of a second
+			deadline := start.Add(d)
+			ls.wheel.schedule(&timers[i], deadline, func() {
+				mu.Lock()
+				late[d] = l.g.now().Sub(deadline)
+				mu.Unlock()
+			})
+		}
+	})
+	time.Sleep(3500 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(late) != len(timers) {
+		t.Fatalf("%d of %d timers fired", len(late), len(timers))
+	}
+	for d, l := range late {
+		if l < 0 || l > wheelTick+100*time.Millisecond {
+			t.Errorf("timer at +%v fired %v after its deadline, want at most one tick (+100ms slack)", d, l)
+		}
 	}
 }

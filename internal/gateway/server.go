@@ -224,9 +224,11 @@ func (g *Gateway) watchLogic(ctx context.Context, cc *grpc.ClientConn) {
 }
 
 // runTicker advances every loop's wheel once per tick, through Execute
-// (spec: Timers; gnet's engine-wide OnTick is not used).
+// (spec: Timers; gnet's engine-wide OnTick is not used). It wakes just after
+// each whole tick of the gateway's clock, not on a free-running ticker whose
+// phase would add up to another tick to every timer.
 func (g *Gateway) runTicker(ctx context.Context) {
-	t := time.NewTicker(wheelTick)
+	t := time.NewTimer(untilNextTick(g.now()))
 	defer t.Stop()
 	for {
 		select {
@@ -234,6 +236,7 @@ func (g *Gateway) runTicker(ctx context.Context) {
 			return
 		case <-t.C:
 			g.advanceWheels()
+			t.Reset(untilNextTick(g.now()))
 		}
 	}
 }
