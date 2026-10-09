@@ -20,6 +20,7 @@ type proc struct {
 	name    string
 	cmd     *exec.Cmd
 	log     string
+	logFrom int64         // the log's size at start: a restart appends to its predecessor's log
 	done    chan struct{} // closed when the process has exited
 	stopped atomic.Bool   // the scenario killed or terminated it
 	crashed atomic.Bool   // it had exited on its own when the scenario stopped it
@@ -27,8 +28,13 @@ type proc struct {
 
 // startProc starts bin (in binDir unless the path is absolute) with args. t's cleanup fails the scenario if
 // the process exited on its own (a crash the assertions may not see), then
-// kills it. The process also dies with the test binary (Pdeathsig), so a
-// go test timeout leaves no gateway holding its ports.
+// kills it and fails the scenario if its race detector reported a data race
+// (the kill means the race exit code reaches no one; the report is in the
+// log). The process also dies with the test binary (Pdeathsig), so a go
+// test timeout leaves no gateway holding its ports. Pdeathsig fires when the
+// OS thread that started the process exits (Go issue #27505), not the test
+// binary: nothing here may call runtime.LockOSThread, or a process could be
+// killed under a live scenario.
 func startProc(t *testing.T, dir, name, bin string, args ...string) *proc {
 	t.Helper()
 	path := filepath.Join(dir, name+".log")
@@ -42,11 +48,15 @@ func startProc(t *testing.T, dir, name, bin string, args ...string) *proc {
 	cmd := exec.Command(bin, args...)
 	cmd.Stdout, cmd.Stderr = f, f
 	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
+	var from int64
+	if fi, err := f.Stat(); err == nil {
+		from = fi.Size()
+	}
 	if err := cmd.Start(); err != nil {
 		f.Close()
 		t.Fatal(err)
 	}
-	p := &proc{name: name, cmd: cmd, log: path, done: make(chan struct{})}
+	p := &proc{name: name, cmd: cmd, log: path, logFrom: from, done: make(chan struct{})}
 	go func() {
 		cmd.Wait()
 		f.Close()
@@ -57,8 +67,18 @@ func startProc(t *testing.T, dir, name, bin string, args ...string) *proc {
 			t.Errorf("%s exited on its own (%v):\n%s", name, p.cmd.ProcessState, strings.Join(p.tail(30), "\n"))
 		}
 		p.kill()
+		p.checkRace(t)
 	})
 	return p
+}
+
+// checkRace fails t if this run of the process logged a data race.
+func (p *proc) checkRace(t *testing.T) {
+	b, _ := os.ReadFile(p.log)
+	b = b[min(p.logFrom, int64(len(b))):]
+	if i := strings.Index(string(b), "WARNING: DATA RACE"); i >= 0 {
+		t.Errorf("%s: the race detector reported a data race:\n%s", p.name, string(b[i:min(len(b), i+4000)]))
+	}
 }
 
 func (p *proc) signal(s syscall.Signal) { _ = p.cmd.Process.Signal(s) }

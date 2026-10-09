@@ -117,29 +117,12 @@ func base(t *testing.T, opt Options) *Stack {
 		}
 	}
 	s := &Stack{t: t, dir: dir, opt: opt, kicks: map[string]string{}, kickFile: filepath.Join(dir, "kick.json")}
-	t.Cleanup(s.dumpOnFailure) // cleanups run last-in first-out: after checkRaces
-	t.Cleanup(s.checkRaces)
+	t.Cleanup(s.dumpOnFailure) // cleanups run last-in first-out: after every process's checks
 	s.Redis = startRedis(t, dir)
 	s.startJWKS()
 	s.startNoise()
 	s.setKick("", "")
 	return s
-}
-
-// checkRaces fails the scenario if any process's race detector reported a
-// data race. The processes are killed, not stopped, so their exit code
-// can't carry it; the report is in the log.
-func (s *Stack) checkRaces() {
-	ents, _ := os.ReadDir(s.dir)
-	for _, e := range ents {
-		if !strings.HasSuffix(e.Name(), ".log") {
-			continue
-		}
-		b, _ := os.ReadFile(filepath.Join(s.dir, e.Name()))
-		if i := strings.Index(string(b), "WARNING: DATA RACE"); i >= 0 {
-			s.t.Errorf("%s: the race detector reported a data race:\n%s", e.Name(), string(b[i:min(len(b), i+4000)]))
-		}
-	}
 }
 
 // dumpOnFailure logs the end of every process log when the scenario failed.
@@ -365,6 +348,7 @@ func (s *Stack) ClearFault(i int, op string) { s.clearFault(s.GW[i].Admin, op) }
 
 func (s *Stack) setFault(p *proc, admin string, r fault.Rule) {
 	s.t.Helper()
+	s.retire(admin, r.Op) // Put replaces the rule and its count: keep what the old one fired
 	faultPut(s.t, admin, r)
 	sr := &setRule{p: p, admin: admin, op: r.Op}
 	s.rules = append(s.rules, sr)
@@ -375,12 +359,19 @@ func (s *Stack) setFault(p *proc, admin string, r fault.Rule) {
 
 func (s *Stack) clearFault(admin, op string) {
 	s.t.Helper()
+	s.retire(admin, op)
+	faultClear(s.t, admin, op)
+}
+
+// retire records the fired count of the live rule for op on admin, before
+// the scenario clears or replaces it.
+func (s *Stack) retire(admin, op string) {
+	s.t.Helper()
 	for _, r := range s.rules {
-		if r.admin == admin && r.op == op && !r.cleared {
+		if r.admin == admin && r.op == op && !r.cleared && !r.p.exited() {
 			r.fired, r.cleared = faultFired(s.t, admin, op), true
 		}
 	}
-	faultClear(s.t, admin, op)
 }
 
 // checkFired fails the scenario if rule r never matched, unless the

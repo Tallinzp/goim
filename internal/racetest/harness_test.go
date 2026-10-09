@@ -27,8 +27,10 @@ func TestHarnessFailsWhatAssertionsMiss(t *testing.T) {
 		{mode: "race-report", want: "the race detector reported a data race"},
 		{mode: "crash-then-kill", want: "exited on its own"},
 		{mode: "unfired-fault-after-restart", want: "never fired"},
+		{mode: "unfired-fault-replaced", want: "never fired"},
+		{mode: "race-report-bare", want: "the race detector reported a data race"},
 	} {
-		cmd := exec.Command(os.Args[0], "-test.run=^TestHelperScenario$", "-test.count=1", "-test.v")
+		cmd := childTest("TestHelperScenario", "-test.v")
 		cmd.Env = append(os.Environ(), "GOIM_RACETEST_HELPER="+c.mode, "GOIM_RACE_BIN="+binDir, "GOIM_RACE_LOGS=",
 			"GOIM_REDIS_SERVER="+redisServer)
 		out, err := cmd.CombinedOutput()
@@ -39,11 +41,28 @@ func TestHarnessFailsWhatAssertionsMiss(t *testing.T) {
 	}
 }
 
+// childTest runs test name of this test binary in a child process. Like
+// every process the suite starts, it dies with its parent (Pdeathsig), and a
+// timeout ends it if it hangs, taking its own stack down with it.
+func childTest(name string, args ...string) *exec.Cmd {
+	cmd := exec.Command(os.Args[0], append([]string{"-test.run=^" + name + "$", "-test.count=1", "-test.timeout=3m"}, args...)...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
+	return cmd
+}
+
 // TestHelperScenario is the broken scenario TestHarnessFailsWhatAssertionsMiss
 // runs in a child process. Run on its own, it does nothing.
 func TestHelperScenario(t *testing.T) {
 	mode := os.Getenv("GOIM_RACETEST_HELPER")
 	if mode == "" {
+		return
+	}
+	if mode == "race-report-bare" { // a process started outside a Stack, as the profile test does
+		sleep, _ := exec.LookPath("sleep")
+		p := startProc(t, t.TempDir(), "sleep", sleep, "60")
+		f, _ := os.OpenFile(p.log, os.O_APPEND|os.O_WRONLY, 0)
+		f.WriteString("==================\nWARNING: DATA RACE\nWrite at 0x00c000123456 by goroutine 7:\n")
+		f.Close()
 		return
 	}
 	s := New(t, Options{Gateways: 1})
@@ -68,6 +87,10 @@ func TestHelperScenario(t *testing.T) {
 		s.GW[0].kill()
 		s.RestartGateway(0)
 		s.Fault(0, fault.Rule{Op: gateway.FaultKick, Key: "nobody", Fail: true})
+	case "unfired-fault-replaced": // a typo in a rule the scenario then replaces with one that fires
+		s.LogicFault(fault.Rule{Op: logic.FaultLogin, Key: "nobody", Fail: true})
+		s.LogicFault(fault.Rule{Op: logic.FaultLogin, Key: "somebody", Delay: fault.Duration(time.Millisecond)})
+		s.Online(0, "somebody", "d1", 1)
 	}
 }
 
@@ -146,7 +169,7 @@ func TestProcessesDieWithTheSuite(t *testing.T) {
 	}
 	spawnDir := t.TempDir()
 	before := leftovers()
-	cmd := exec.Command(os.Args[0], "-test.run=^TestProcessesDieWithTheSuite$", "-test.count=1")
+	cmd := childTest("TestProcessesDieWithTheSuite")
 	// The child exits without cleanups: it gets a directory this test removes,
 	// and no suite switch, so its TestMain builds no binaries it would leak.
 	cmd.Env = append(os.Environ(), "GOIM_RACETEST_SPAWN="+spawnDir, envSuite+"=")
