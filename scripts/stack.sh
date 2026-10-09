@@ -66,9 +66,29 @@ stack_wait() {
 # that hangs (a DROP rule) counts as busy instead of blocking for minutes.
 stack_port_free() { timeout 2 bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$0"' "$1" 2>/dev/null; [ $? -eq 1 ]; }
 
+# stack_ports: every port stack_up listens on.
+stack_ports() {
+  local base=${STACK_PORT_BASE:-17000} i
+  seq "$base" $((base + 4))
+  for ((i = 0; i < ${STACK_GATEWAYS:-1}; i++)); do
+    echo $((base + 100 + 10 * i)) $((base + 101 + 10 * i)) $((base + 102 + 10 * i))
+  done
+}
+
+# stack_busy_ports: one line per port of the stack in use, naming its holder
+# when ss can see it (our own processes); nothing when all are free.
+stack_busy_ports() {
+  local p holder
+  for p in $(stack_ports); do
+    stack_port_free "$p" && continue
+    holder=$(ss -Hltnp "sport = :$p" 2>/dev/null | grep -o 'users:(([^)]*))' | head -n 1)
+    echo "port $p is in use${holder:+ by $holder}"
+  done
+}
+
 stack_up() {
   : "${STACK_DIR:?set STACK_DIR}"
-  local n=${STACK_GATEWAYS:-1} base=${STACK_PORT_BASE:-17000} bin=$STACK_DIR/bin i p
+  local n=${STACK_GATEWAYS:-1} base=${STACK_PORT_BASE:-17000} bin=$STACK_DIR/bin i
   local redis=${STACK_REDIS_SERVER:-$(command -v redis-server || echo "$PWD/.cache/redis/bin/redis-server")}
   local gw_cpus=${T2_CPUS_GATEWAY:-} logic_cpus=${T2_CPUS_LOGIC:-}
   if [ "${STACK_PIN:-0}" = 1 ] && { [ -z "$gw_cpus" ] || [ -z "$logic_cpus" ]; }; then
@@ -76,9 +96,13 @@ stack_up() {
     return 1
   fi
   [ -x "$redis" ] || { echo "stack: $redis not found (make redis-server)" >&2; return 1; }
-  for p in $(seq "$base" $((base + 4))) $(for ((i = 0; i < n; i++)); do echo $((base + 100 + 10 * i)) $((base + 101 + 10 * i)) $((base + 102 + 10 * i)); done); do
-    stack_port_free "$p" || { echo "stack: port $p is in use; pick another STACK_PORT_BASE" >&2; return 1; }
-  done
+  local busy
+  busy=$(stack_busy_ports)
+  if [ -n "$busy" ]; then
+    printf 'stack: %s\n' "$busy" >&2
+    echo "stack: stop whatever holds them first (a leftover stack?); a second stack beside it distorts the numbers" >&2
+    return 1
+  fi
   mkdir -p "$STACK_DIR/keys/noise" "$STACK_DIR/logs" "$STACK_DIR/artifacts" "$STACK_DIR/redis"
 
   # Keys: the Noise static key (key_id 1) and the token signing key.

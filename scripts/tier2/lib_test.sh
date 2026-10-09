@@ -86,6 +86,11 @@ for sig in TERM INT; do
   expect "exit: SIG$sig runs the hooks" "$(cat "$tmp/run/hooks" 2>/dev/null)" hook
   [ -s "$tmp/run/out.report.txt" ] && ok "exit: SIG$sig writes the report" || bad "exit: SIG$sig wrote no report"
 done
+# A second Ctrl-C or SIGTERM during teardown must not cut it short.
+rc=$(fake_run 't2_on_exit "echo first >>$tmp/run/hooks"; t2_on_exit "kill -TERM \$BASHPID; echo second >>$tmp/run/hooks"; exit 3')
+expect "exit: a signal during teardown keeps the exit code" "$rc" 3
+expect "exit: a signal during teardown runs every hook" "$(paste -sd' ' "$tmp/run/hooks" 2>/dev/null)" "second first"
+[ -s "$tmp/run/out.report.txt" ] && ok "exit: a signal during teardown writes the report" || bad "exit: a signal during teardown wrote no report"
 
 # Run recording.
 expect "cpulist: expands ranges" "$(t2_cpulist_expand 4-6,9,16-17)" "4 5 6 9 16 17"
@@ -111,6 +116,7 @@ rc=$(fake_run '
   "$tmp/t2ours" -c "end=\$((\${EPOCHREALTIME/./} + 1200000)); while ((\${EPOCHREALTIME/./} < end)); do :; done; sleep 30; true" & mine=$!
   sleep 2.7
   t2_record_end
+  echo "[${T2_SAMPLER:-}]" >"$tmp/run/sampler"
   kill $other $mine
   t2_finish')
 expect "record: result.json is JSON" "$(valid_json "$tmp/run/out/result.json")" ""
@@ -121,6 +127,7 @@ top = {t["comm"]: t["cpu_s"] for t in b["top_outside"]}
 print(top.get("t2outside", 0) >= 0.5, "t2ours" not in top, b["outside_user_cpu_s"] >= 0.5, "no_swap_in" in d["checks"], b["window_s"] >= 2)' "$tmp/run/out/result.json")
 expect "record: the other group counts, ours does not" "$r" "True True True True True"
 [ -s "$tmp/run/out/background-before.txt" ] && ok "record: background-before.txt" || bad "record: background-before.txt missing"
+expect "record: no sampler pid is left for the exit hook to kill" "$(cat "$tmp/run/sampler")" "[]"
 
 # Host setup.
 mkdir -p "$tmp/hs"
@@ -165,6 +172,12 @@ for bad_args in "add 80" "add 01167" "add 70000" "add 21100x" "add" "add 1 2" "d
   # shellcheck disable=SC2086
   scripts/tier2/goim-netdrop $bad_args >/dev/null 2>&1; expect "netdrop: refuses '$bad_args'" "$?" 2
 done
+# Without root, iptables fails: list and flush must say so, not exit 0.
+if [ "$(id -u)" != 0 ]; then
+  for c in list flush; do
+    scripts/tier2/goim-netdrop $c >/dev/null 2>&1 && bad "netdrop: $c exits 0 when iptables fails" || ok "netdrop: $c fails when iptables fails"
+  done
+fi
 
 # make test-tier2 shows the script's own exit code (make itself exits 2 on any failure).
 out=$(GOIM_TEST_TIER= make -s test-tier2 SCENARIO=race 2>&1)

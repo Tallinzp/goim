@@ -45,6 +45,11 @@ grep -q '^redis_version:' "$STACK_DIR/artifacts/idle/redis.info" && ok "snapshot
 # A second stack on the same ports is refused before it starts anything.
 (STACK_DIR=$(mktemp -d); STACK_ORDER=(); stack_up 2>"$STACK_DIR/err"; echo $? >"$STACK_DIR/rc"; cat "$STACK_DIR/err" "$STACK_DIR/rc") >"$STACK_DIR/second" 2>&1
 grep -q "is in use" "$STACK_DIR/second" && ok "up: busy ports are refused" || bad "up: busy ports: $(cat "$STACK_DIR/second")"
+grep -q "port $STACK_PORT_BASE is in use by .*redis-server" "$STACK_DIR/second" && ok "up: names the holder" || bad "up: holder not named: $(cat "$STACK_DIR/second")"
+grep -q "stop" "$STACK_DIR/second" && ok "up: says to stop it" || bad "up: no advice: $(cat "$STACK_DIR/second")"
+grep -q "STACK_PORT_BASE" "$STACK_DIR/second" && bad "up: still advises another STACK_PORT_BASE" || ok "up: no port-base advice"
+busy=$(stack_busy_ports)
+expect "busy: every port of the stack" "$(echo "$busy" | wc -l)" 11
 
 pids=("${STACK_PIDS[@]}")
 stack_down

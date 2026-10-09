@@ -59,7 +59,10 @@ fi
 stack_build >"$T2_OUT/build.log" 2>&1 || { echo "build failed, see $T2_OUT/build.log" >&2; exit 1; }
 t2_duration setup $((SECONDS - t))
 
-# 1: the stack.
+# 1: the stack. Busy ports (a leftover stack) refuse the run: a second
+# stack beside the first would distort the numbers.
+busy=$(stack_busy_ports)
+[ -z "$busy" ] || t2_refuse "$(printf 'refused: the stack ports are in use (a leftover stack?):\n%s\nstop whatever holds them first' "$busy")"
 stack_up 2>"$T2_OUT/stack-up.err"
 up=$?
 t2_check stack "$(t2_bool [ $up -eq 0 ])" "\"gateways\": $STACK_GATEWAYS, \"error\": $(t2_json_str "$(cat "$T2_OUT/stack-up.err")")"
@@ -71,7 +74,7 @@ for name in "${STACK_ORDER[@]}"; do
   case $name in gw-*) want=$T2_CPUS_GATEWAY ;; *) want=$T2_CPUS_LOGIC ;; esac
   stack_pinned "$name" "$want" || wrong+="${wrong:+ }$name"
 done
-t2_check pinning "$(t2_bool [ -z "$wrong" ])" "\"gateway_cpus\": \"$T2_CPUS_GATEWAY\", \"logic_cpus\": \"$T2_CPUS_LOGIC\", \"wrong\": $(t2_json_str "$wrong")"
+t2_check pinning "$(t2_bool [ -z "$wrong" ])" "\"gateway_cpus\": $(t2_json_str "$T2_CPUS_GATEWAY"), \"logic_cpus\": $(t2_json_str "$T2_CPUS_LOGIC"), \"wrong\": $(t2_json_str "$wrong")"
 
 # 5 (window): 30s idle, recorded.
 t2_record_start

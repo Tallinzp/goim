@@ -58,12 +58,14 @@ case $cmd in
     [ $# -eq 1 ] && [ $print = 0 ] || usage
     # Delete by rule spec, never by line number: a rule another tool inserts
     # meanwhile cannot shift what is deleted.
-    $IPT -w -S INPUT | grep -- "--comment $TAG -j DROP\$" |
+    rules=$($IPT -w -S INPUT)
+    printf '%s\n' "$rules" | grep -- "--comment $TAG -j DROP\$" |
       while read -r -a r; do r[0]=-D; $IPT -w "${r[@]}"; done
     ;;
   list)
     [ $# -eq 1 ] && [ $print = 0 ] || usage
-    $IPT -w -S INPUT | grep -- "--comment $TAG -j DROP\$" || true
+    rules=$($IPT -w -S INPUT)
+    printf '%s\n' "$rules" | grep -- "--comment $TAG -j DROP\$" || true
     ;;
   *) usage ;;
 esac

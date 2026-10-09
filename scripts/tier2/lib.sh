@@ -165,6 +165,7 @@ t2_write_report() {
 t2_exit() {
   local rc=$? i
   trap - EXIT
+  trap '' INT TERM # a second Ctrl-C must not cut the teardown short
   for ((i = ${#T2_EXIT_HOOKS[@]} - 1; i >= 0; i--)); do
     eval "${T2_EXIT_HOOKS[i]}" >/dev/null 2>&1
   done
@@ -355,7 +356,7 @@ t2_record_start() {
   T2_REC_T0=$SECONDS
   t2_clock_sampler "$T2_OUT/clocks.tsv" &
   T2_SAMPLER=$!
-  t2_on_exit 'kill $T2_SAMPLER'
+  t2_on_exit '[ -n "$T2_SAMPLER" ] && kill "$T2_SAMPLER"'
 }
 
 # t2_record_end: end of the window: the background member and no_swap_in.
@@ -363,6 +364,7 @@ t2_record_end() {
   local hz busy swap1 delta in out
   kill "$T2_SAMPLER" 2>/dev/null
   wait "$T2_SAMPLER" 2>/dev/null
+  T2_SAMPLER="" # reaped: its pid may be reused before the exit hook runs
   hz=$(getconf CLK_TCK)
   t2_proc_stats >"$T2_OUT/.procs-after"
   t2_top >"$T2_OUT/background-after.txt"
