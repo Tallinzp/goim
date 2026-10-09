@@ -25,6 +25,10 @@ import (
 // pre-handshake close (spec: Client SDK rules).
 var ErrClosedBeforeReply = wire.ErrClosedBeforeReply
 
+// ErrNoHandshake is Send or Recv on a Conn whose Handshake has not
+// succeeded (P5I-5).
+var ErrNoHandshake = errors.New("clientconn: no handshake")
+
 // Frame is one decrypted server frame.
 type Frame struct {
 	Cmd   clientpb.Cmd
@@ -82,6 +86,9 @@ func (c *Conn) Send(cmd clientpb.Cmd, reqID uint32, msg proto.Message) error {
 			return err
 		}
 	}
+	if c.sess == nil {
+		return ErrNoHandshake
+	}
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
 	return c.sess.WriteFrame(c.nc, uint16(cmd), reqID, body)
@@ -98,6 +105,9 @@ func (c *Conn) SendRaw(b []byte) error {
 // Recv reads one frame. A read past deadline (zero: none) fails with an
 // error matching os.ErrDeadlineExceeded.
 func (c *Conn) Recv(deadline time.Time) (Frame, error) {
+	if c.sess == nil {
+		return Frame{}, ErrNoHandshake
+	}
 	if err := c.nc.SetReadDeadline(deadline); err != nil {
 		return Frame{}, err
 	}
@@ -146,9 +156,11 @@ func (c *Conn) ExpectClosed(deadline time.Time) error {
 }
 
 // IsClosed reports whether err means the peer closed (FIN) or reset the
-// connection, or it was closed locally.
+// connection, or it was closed locally. A write after the reset was read
+// fails with EPIPE (P5I-6).
 func IsClosed(err error) bool {
 	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
-		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNABORTED) || errors.Is(err, net.ErrClosed) ||
 		errors.Is(err, io.ErrClosedPipe)
 }

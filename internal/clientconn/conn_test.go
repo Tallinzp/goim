@@ -250,3 +250,50 @@ func TestSendFromSeveralGoroutinesWhileReceiving(t *testing.T) {
 		t.Fatalf("got %d distinct Pongs, want %d (a frame was interleaved or lost)", len(seen), n)
 	}
 }
+
+// Send and Recv before Handshake return ErrNoHandshake, not a panic, so a
+// mistake in a race script fails the test (P5I-5). SendRaw needs no session.
+func TestSendAndRecvBeforeTheHandshakeFail(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	c := New(client)
+	defer c.Close()
+	if err := c.Send(clientpb.Cmd_CMD_PING, 1, nil); !errors.Is(err, ErrNoHandshake) {
+		t.Fatalf("Send: %v, want ErrNoHandshake", err)
+	}
+	if _, err := c.Recv(time.Now().Add(time.Second)); !errors.Is(err, ErrNoHandshake) {
+		t.Fatalf("Recv: %v, want ErrNoHandshake", err)
+	}
+	go io.Copy(io.Discard, server)
+	if err := c.SendRaw([]byte{1, 2, 3}); err != nil {
+		t.Fatalf("SendRaw: %v", err)
+	}
+}
+
+// A Send after the server reset the connection fails with EPIPE once the
+// reset has been read, and IsClosed reports it (P5I-6).
+func TestSendAfterAResetIsClosed(t *testing.T) {
+	addr, key := listen(t, func(p *peer, key wire.Key) {
+		if p.respond(key) != nil {
+			return
+		}
+		p.nc.(*net.TCPConn).SetLinger(0)
+	})
+	c := dial(t, addr, key)
+	if _, err := c.Recv(time.Now().Add(5 * time.Second)); !IsClosed(err) {
+		t.Fatalf("Recv: %v, want a close", err)
+	}
+	err := c.Send(clientpb.Cmd_CMD_PING, 1, nil)
+	if err == nil || !IsClosed(err) {
+		t.Fatalf("Send after the reset: %v, want an error IsClosed accepts", err)
+	}
+}
+
+func TestIsClosedAcceptsEveryPeerClose(t *testing.T) {
+	for _, errno := range []syscall.Errno{syscall.ECONNRESET, syscall.EPIPE, syscall.ECONNABORTED} {
+		err := &net.OpError{Op: "write", Err: os.NewSyscallError("write", errno)}
+		if !IsClosed(err) {
+			t.Errorf("IsClosed(%v) = false", err)
+		}
+	}
+}
