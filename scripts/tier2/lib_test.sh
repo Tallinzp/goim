@@ -120,4 +120,45 @@ print(top.get("t2outside", 0) >= 0.5, "t2ours" not in top, b["outside_user_cpu_s
 expect "record: the other group counts, ours does not" "$r" "True True True True True"
 [ -s "$tmp/run/out/background-before.txt" ] && ok "record: background-before.txt" || bad "record: background-before.txt missing"
 
+# Host setup.
+mkdir -p "$tmp/hs"
+(cd "$tmp/hs" && "$OLDPWD/scripts/tier2/host-setup.sh" --root "$tmp/hs/root" --user alice) >"$tmp/hs/out" 2>&1
+expect "setup: test mode exits 0" "$?" 0
+expect "setup: sudoers line" "$(cat "$tmp/hs/root/etc/sudoers.d/goim-netdrop")" "alice ALL=(root) NOPASSWD: /usr/local/sbin/goim-netdrop"
+expect "setup: sudoers mode" "$(stat -c %a "$tmp/hs/root/etc/sudoers.d/goim-netdrop")" 440
+expect "setup: helper mode" "$(stat -c %a "$tmp/hs/root/usr/local/sbin/goim-netdrop")" 755
+again=$(scripts/tier2/host-setup.sh --root "$tmp/hs/root" --user alice | grep -c '^unchanged')
+expect "setup: idempotent" "$again" 4
+scripts/tier2/host-setup.sh --root "$tmp/hs/root" --user 'a b' >/dev/null 2>&1; expect "setup: odd user refused" "$?" 2
+scripts/tier2/host-setup.sh --root "$tmp/hs/root" >/dev/null 2>&1 </dev/null; rc=$?
+[ -n "${SUDO_USER:-}" ] || expect "setup: no user refused" "$rc" 2
+# A fake /proc/sys and /sys/module that match sysctl.conf, then break them.
+fake=$tmp/fake
+while IFS='=' read -r k v; do
+  k=${k// /}; mkdir -p "$fake/proc/$(dirname "${k//.//}")"; echo "${v# }" >"$fake/proc/${k//.//}"
+done < <(grep -vE '^[[:space:]]*(#|$)' scripts/tier2/sysctl.conf)
+for m in $(grep -vE '^[[:space:]]*(#|$)' scripts/tier2/modules.conf); do mkdir -p "$fake/mod/$m"; done
+cp scripts/tier2/goim-netdrop "$fake/netdrop"
+expect "setup check: a set-up host" "$(t2_host_setup_missing scripts/tier2 "$fake/proc" "$fake/mod" "$fake/netdrop")" ""
+printf '1048576\t1000000\t2097152\n' >"$fake/proc/net/ipv4/tcp_mem"
+echo 262144 >"$fake/proc/net/netfilter/nf_conntrack_max"
+rmdir "$fake/mod/ip_vs"
+echo "# old" >>"$fake/netdrop"
+m=$(t2_host_setup_missing scripts/tier2 "$fake/proc" "$fake/mod" "$fake/netdrop")
+contains "setup check: low conntrack" "$m" "sysctl net.netfilter.nf_conntrack_max is 262144, want >= 4194304"
+contains "setup check: one low tcp_mem field" "$m" "sysctl net.ipv4.tcp_mem is 1048576 1000000 2097152"
+contains "setup check: module" "$m" "module ip_vs is not loaded"
+contains "setup check: outdated helper" "$m" "differs from scripts/tier2/goim-netdrop"
+expect "setup check: nothing else" "$(echo "$m" | wc -l)" 4
+
+# goim-netdrop prints its rules and refuses anything else.
+expect "netdrop: add" "$(scripts/tier2/goim-netdrop --print add 21100)" \
+"iptables -w -I INPUT -i lo -p tcp --dport 21100 -m comment --comment goim-netdrop -j DROP
+iptables -w -I INPUT -i lo -p tcp --sport 21100 -m comment --comment goim-netdrop -j DROP"
+contains "netdrop: del" "$(scripts/tier2/goim-netdrop --print del 21100)" "iptables -w -D INPUT -i lo -p tcp --dport 21100"
+for bad_args in "add 80" "add 70000" "add 21100x" "add" "add 1 2" "drop 21100" "--print flush"; do
+  # shellcheck disable=SC2086
+  scripts/tier2/goim-netdrop $bad_args >/dev/null 2>&1; expect "netdrop: refuses '$bad_args'" "$?" 2
+done
+
 [ "$fails" -eq 0 ] && echo "lib_test: all passed" || { echo "lib_test: $fails failed"; exit 1; }

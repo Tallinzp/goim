@@ -373,3 +373,37 @@ t2_record_end() {
   t2_field background "{\"window_s\": $((SECONDS - T2_REC_T0)), \"host_busy_cpu_s\": $(awk -v b="$busy" -v h="$hz" 'BEGIN { printf "%.1f", b / h }'), \"outside_user_cpu_s\": $user, \"kernel_threads_cpu_s\": $kern, \"top_outside\": $top, \"swap_in_pages\": $in, \"swap_out_pages\": $out, \"cpu_clocks\": $(t2_clock_summary "$T2_OUT/clocks.tsv")}"
   t2_check no_swap_in "$(t2_bool [ "$in" -eq 0 ])" "\"swap_in_pages\": $in"
 }
+
+# ---- Host setup (choice #68) ----
+
+# t2_host_setup_missing DIR PROC_SYS SYS_MODULE NETDROP: prints one line per
+# item host-setup.sh would fix: a sysctl below sysctl.conf (every field of a
+# multi-value one), a module of modules.conf not loaded, the installed
+# goim-netdrop missing or differing from DIR's. Tests pass fake paths.
+t2_host_setup_missing() {
+  local dir=$1 proc=$2 mods=$3 netdrop=$4 key want have m
+  while IFS=$'\t' read -r key want; do
+    have=$(tr -s '\t ' '  ' <"$proc/${key//.//}" 2>/dev/null)
+    awk -v w="$want" -v h="$have" 'BEGIN {
+      n = split(w, a, " "); if (split(h, b, " ") != n) exit 1
+      for (i = 1; i <= n; i++) if (b[i] + 0 < a[i] + 0) exit 1 }' ||
+      echo "sysctl $key is ${have:-absent}, want >= $want"
+  done < <(awk -F= '!/^[[:space:]]*(#|$)/ { gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $2); print $1 "\t" $2 }' "$dir/sysctl.conf")
+  while read -r m; do
+    [ -d "$mods/$m" ] || echo "module $m is not loaded"
+  done < <(grep -vE '^[[:space:]]*(#|$)' "$dir/modules.conf")
+  cmp -s "$dir/goim-netdrop" "$netdrop" || echo "$netdrop is missing or differs from scripts/tier2/goim-netdrop"
+}
+
+# t2_require_host_setup: load scenarios call it after t2_init; refuses
+# (exit 2) until host-setup.sh has run with this checkout's files.
+t2_require_host_setup() {
+  local missing
+  missing=$(t2_host_setup_missing scripts/tier2 /proc/sys /sys/module /usr/local/sbin/goim-netdrop)
+  if [ -z "$missing" ] && ! sudo -n /usr/local/sbin/goim-netdrop list >/dev/null 2>&1; then
+    missing="sudo -n /usr/local/sbin/goim-netdrop fails (no sudoers line?)"
+  fi
+  if [ -n "$missing" ]; then
+    t2_refuse "$(printf 'refused: the host is not set up for load tests:\n%s\nrun once: sudo scripts/tier2/host-setup.sh' "$missing")"
+  fi
+}

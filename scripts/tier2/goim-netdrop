@@ -1,0 +1,69 @@
+#!/bin/bash
+# goim-netdrop: the one root action Tier 2 runs need (choice #68): silently
+# drop a gateway's loopback traffic for scenario (b2), silent node loss.
+# host-setup.sh installs it root-owned in /usr/local/sbin, and a sudoers
+# line lets the Tier 2 user run it, and only it, without a password.
+#
+#   sudo -n /usr/local/sbin/goim-netdrop add PORT   drop TCP to and from PORT on lo
+#   sudo -n /usr/local/sbin/goim-netdrop del PORT   remove that port's rules
+#   sudo -n /usr/local/sbin/goim-netdrop flush      remove every goim-netdrop rule
+#   sudo -n /usr/local/sbin/goim-netdrop list       show them
+#   goim-netdrop --print add|del PORT               print the iptables commands, run nothing
+#
+# It runs only iptables, from a fixed path, with a fixed rule shape: DROP in
+# INPUT on lo, by destination port (client to gateway) and by source port
+# (gateway to client), tagged with the comment goim-netdrop. PORT must be
+# 1024-65535. It reads no environment variable.
+set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+IPT=/usr/sbin/iptables
+TAG=goim-netdrop
+
+usage() { echo "usage: goim-netdrop [--print] add|del PORT | flush | list" >&2; exit 2; }
+
+print=0
+if [ "${1:-}" = --print ]; then print=1; shift; fi
+cmd=${1:-}
+port=${2:-}
+
+if [ $print = 0 ] && [ ! -x $IPT ]; then
+  echo "goim-netdrop: $IPT not found (apt install iptables)" >&2
+  exit 1
+fi
+
+# rule DIR: the match for one direction.
+rule() { echo "-i lo -p tcp --$1 $port -m comment --comment $TAG -j DROP"; }
+
+case $cmd in
+  add|del)
+    [ $# -eq 2 ] || usage
+    case $port in ''|*[!0-9]*) usage ;; esac
+    { [ "$port" -ge 1024 ] && [ "$port" -le 65535 ]; } || usage
+    if [ $print = 1 ]; then
+      for dir in dport sport; do
+        if [ "$cmd" = add ]; then echo "iptables -w -I INPUT $(rule $dir)"; else echo "iptables -w -D INPUT $(rule $dir)"; fi
+      done
+      exit 0
+    fi
+    for dir in dport sport; do
+      # shellcheck disable=SC2046
+      if [ "$cmd" = add ]; then
+        $IPT -w -C INPUT $(rule $dir) 2>/dev/null || $IPT -w -I INPUT $(rule $dir)
+      else
+        while $IPT -w -C INPUT $(rule $dir) 2>/dev/null; do $IPT -w -D INPUT $(rule $dir); done
+      fi
+    done
+    ;;
+  flush)
+    [ $# -eq 1 ] && [ $print = 0 ] || usage
+    # Delete by rule spec, never by line number: a rule another tool inserts
+    # meanwhile cannot shift what is deleted.
+    $IPT -w -S INPUT | grep -- "--comment $TAG -j DROP\$" |
+      while read -r -a r; do r[0]=-D; $IPT -w "${r[@]}"; done
+    ;;
+  list)
+    [ $# -eq 1 ] && [ $print = 0 ] || usage
+    $IPT -w -S INPUT | grep -- "--comment $TAG -j DROP\$" || true
+    ;;
+  *) usage ;;
+esac
