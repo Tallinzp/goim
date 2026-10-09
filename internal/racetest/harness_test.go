@@ -1,0 +1,147 @@
+package racetest
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/Tallinzp/goim/internal/fault"
+	"github.com/Tallinzp/goim/internal/logic"
+)
+
+// The harness fails a scenario for problems its assertions can't see
+// (Review Focus 1–3). Each case runs TestHelperScenario, a deliberately
+// broken scenario, in a child go test process and expects it to fail with
+// the reason.
+func TestHarnessFailsWhatAssertionsMiss(t *testing.T) {
+	suite(t)
+	for _, c := range []struct{ mode, want string }{
+		{mode: "unexpected-exit", want: "exited on its own"},
+		{mode: "unfired-fault", want: "never fired"},
+		{mode: "race-report", want: "the race detector reported a data race"},
+	} {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestHelperScenario$", "-test.count=1", "-test.v")
+		cmd.Env = append(os.Environ(), "GOIM_RACETEST_HELPER="+c.mode, "GOIM_RACE_BIN="+binDir, "GOIM_RACE_LOGS=",
+			"GOIM_REDIS_SERVER="+redisServer)
+		out, err := cmd.CombinedOutput()
+		if err == nil || !strings.Contains(string(out), c.want) {
+			t.Errorf("%s: the helper scenario %s; want it to fail with %q:\n%s", c.mode,
+				map[bool]string{true: "passed", false: "failed otherwise"}[err == nil], c.want, out)
+		}
+	}
+}
+
+// TestHelperScenario is the broken scenario TestHarnessFailsWhatAssertionsMiss
+// runs in a child process. Run on its own, it does nothing.
+func TestHelperScenario(t *testing.T) {
+	mode := os.Getenv("GOIM_RACETEST_HELPER")
+	if mode == "" {
+		return
+	}
+	s := New(t, Options{Gateways: 1})
+	switch mode {
+	case "unexpected-exit": // a gateway dies, and nothing the scenario checks notices
+		s.GW[0].signal(syscall.SIGKILL)
+		<-s.GW[0].done
+	case "unfired-fault": // a typo in the key: the scenario injects nothing
+		s.LogicFault(fault.Rule{Op: logic.FaultLogin, Key: "nobody", Fail: true})
+		s.Online(0, "somebody", "d1", 1)
+	case "race-report": // as -race prints it, then keeps running
+		f, _ := os.OpenFile(s.Logic.log, os.O_APPEND|os.O_WRONLY, 0)
+		f.WriteString("==================\nWARNING: DATA RACE\nWrite at 0x00c000123456 by goroutine 7:\n")
+		f.Close()
+	}
+}
+
+// The two Redis faults the scenarios use do what they claim (Review Focus
+// 4). The replica is linked when the stack starts, so WAIT gets its ack;
+// while the replica is stopped WAIT runs out its timeout with 0, and after
+// it resumes it acknowledges again. A paused primary answers nothing until
+// it resumes, and a key whose TTL ran out meanwhile is gone after.
+func TestRedisFaultsDoWhatTheyClaim(t *testing.T) {
+	suite(t)
+	r := startRedis(t, t.TempDir())
+	conn := r.Client().Conn() // WAIT counts the writes made on its own connection
+	defer conn.Close()
+	acked := func(timeout time.Duration) int64 {
+		t.Helper()
+		if err := conn.Incr(ctx, "w").Err(); err != nil {
+			t.Fatal(err)
+		}
+		n, err := conn.Wait(ctx, 1, timeout).Result()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if n := acked(time.Second); n != 1 {
+		t.Fatalf("WAIT with the replica up = %d, want 1", n)
+	}
+	r.ReplicaDownFor(time.Second)
+	start := time.Now()
+	if n := acked(300 * time.Millisecond); n != 0 {
+		t.Fatalf("WAIT with the replica stopped = %d, want 0", n)
+	}
+	if d := time.Since(start); d < 300*time.Millisecond {
+		t.Fatalf("WAIT returned after %v, before its 300ms timeout", d)
+	}
+	time.Sleep(time.Second)
+	if n := acked(2 * time.Second); n != 1 {
+		t.Fatalf("WAIT after the replica resumed = %d, want 1", n)
+	}
+
+	if err := conn.Set(ctx, "lease", "1", 300*time.Millisecond).Err(); err != nil {
+		t.Fatal(err)
+	}
+	r.PauseFor(time.Second)
+	start = time.Now()
+	if err := r.Client().Ping(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d < 800*time.Millisecond {
+		t.Fatalf("the paused primary answered after %v", d)
+	}
+	if r.Client().Exists(ctx, "lease").Val() != 0 {
+		t.Fatal("a key whose 300ms TTL ran out during the pause still exists")
+	}
+}
+
+// A process startProc started dies with the test binary (Pdeathsig): a go
+// test timeout or a panic, which skip the cleanups, leaves no gateway
+// holding its ports (Review Focus 5). It needs no binaries: it runs at
+// Tier 1a too.
+func TestProcessesDieWithTheSuite(t *testing.T) {
+	if os.Getenv("GOIM_RACETEST_SPAWN") != "" { // the child: start a process, then die without cleanups
+		sleep, err := exec.LookPath("sleep")
+		if err != nil {
+			t.Skip("no sleep binary")
+		}
+		binDir = filepath.Dir(sleep)
+		p := startProc(t, t.TempDir(), "sleep", "sleep", "60")
+		os.Stdout.WriteString("pid " + strconv.Itoa(p.cmd.Process.Pid) + "\n")
+		os.Exit(0)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestProcessesDieWithTheSuite$", "-test.count=1")
+	cmd.Env = append(os.Environ(), "GOIM_RACETEST_SPAWN=1")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("child: %v\n%s", err, out)
+	}
+	var pid int
+	for _, line := range strings.Split(string(out), "\n") {
+		if v, ok := strings.CutPrefix(line, "pid "); ok {
+			pid, _ = strconv.Atoi(v)
+		}
+	}
+	if pid == 0 {
+		t.Fatalf("no pid in %q", out)
+	}
+	eventually(t, "the grandchild died with its parent", 5*time.Second, func() bool {
+		return syscall.Kill(pid, 0) != nil
+	})
+}
