@@ -12,6 +12,14 @@
 
 **This part:** Tasks 6–12, the race scenarios on 5b2's harness, the gateway fix the suite found (Task 9), and the Tier 2 entry point. **Branch:** continue on `feat/plan5b-race` after 5b2's last commit.
 
+**Changed since this part was written (5b2 final review, `ab1653d`, `13ca1c6`).** The harness is stricter than the prototype these scenarios ran on:
+- **A process that exits by itself, then is killed, fails the scenario.** `kill()`/`term()` on a process that had already exited on its own now reports it ("exited on its own"). Before, the scenario's kill silently covered it. If a scenario here fails that way, decide which of two cases it is:
+  - The exit is a real crash (a panic or fatal in the log tail): it is a finding, so debug it.
+  - The scenario expects that exit (a gateway that shuts itself down by design): mark it with `p.stopped.Store(true)` once the exit is observed, as `TestProfileBreakingARatioIsRefused` does, and ledger a ruling.
+  - Either way, never weaken `proc.stop`.
+- **Every fault rule is checked.** That includes a rule set on a restarted process, and a rule later replaced by a second `Put` on the same op. A scenario that sets a rule it does not need will now fail "never fired"; drop or narrow that rule, with a ruling.
+- **Race reports are scanned per process run.** `proc.checkRace` replaces `Stack.checkRaces`. No scenario calls either directly.
+
 ## Global Constraints
 
 - Module path `github.com/Tallinzp/goim`. No new module dependencies.
