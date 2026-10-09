@@ -193,6 +193,8 @@ The spec leaves these open. Each one is restated in the task that implements it.
     - fault hooks: gRPC interceptors in Logic and on the gateway's Kick server, and a go-redis hook in Logic for "`ZADD gwepochs` fails while the `SET` succeeds", all behind a test-only flag;
     - pause: SIGSTOP on the miniredis process at Tier 1b, `CLIENT PAUSE` at Tier 2;
     - a `WAIT` failure only at Tier 2 (e.g. `DEBUG SLEEP` on the replica).
+  - **Dev machine budget (measured 2026-10-08 on 2 cores / 2GB, commit e56e848).** All binaries built with `-race`, in a scratch clone: a miniredis server process (a 15-line `miniredis.StartAddr` wrapper), `devtoken serve`, Logic and 4 gateways (`-loops 1`). Idle RSS: miniredis 27MB, devtoken 24MB, Logic 51MB, each gateway 70MB, about 380MB in all. With 400 SDK clients online across the 4 gateways: miniredis 44MB, Logic 77MB, each gateway 91–96MB, about 520MB, plus 207MB for the client process. About 750MB of memory was still available, and idle CPU was ~9%. No errors in any log. The harness of choice #47 fits on the dev machine at the race suite's scale (tens of clients) with room to spare. CPU contention under the lowered timing profile is untested; that is a flakiness risk for the prototype, not a memory one.
+  - The branches keep stacking: Plan 5b is written and implemented on `feat/plan5b-race`, branched from `feat/plan5a-sdk`, and the stack is merged later (the user's decision, 2026-10-08).
 
 ---
 
