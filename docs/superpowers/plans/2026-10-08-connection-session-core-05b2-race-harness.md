@@ -1943,3 +1943,15 @@ git commit -m "test(racetest): process harness, timing profile and self-checks (
 ## After this part
 
 Next is Plan 5b3 (`2026-10-08-connection-session-core-05b3-race-scenarios.md`, Tasks 6–12), in a fresh session on the same branch.
+
+## Execution Notes (5b2)
+
+Executed inline 2026-10-09 on `feat/plan5b-race`: Task 4 `6e69b5f`, Task 5 `057e63c`, plan code verbatim. Step 3's `grep -c 'TODO: Tier 2 integration'` counts 0 without `-v` whatever happens (go test prints skip reasons only with `-v`); re-run with `-v`: 0 such skips, 8 skips that are miniredis-only by design (plus the race suite's own opt-in skips).
+
+Fresh Opus final review, fixed in `ab1653d`, each with a test that failed first:
+- **C-1** `make test-redis-local` had lost its recipe line (an execution splice error in Task 5's Makefile edit, not a plan defect) and did nothing with exit 0.
+- **I-1** `TestProcessesDieWithTheSuite`'s child inherited `GOIM_RACE_SUITE`, built the race binaries into a `goim-race-bin-*` temp dir and exited without removing it (~85MB per suite run), and leaked its `t.TempDir`. The child now runs with the suite switch empty, in a directory the parent owns; the test checks nothing is left in the temp dir.
+- **I-2** (Review Focus 1) `kill()`/`term()` marked a process stopped even if it had already exited on its own, hiding a crash in the window a scenario then "crashes" it. They now record it; new helper case `crash-then-kill`.
+- **I-3** (Review Focus 2) the fired check was one cleanup registered at the first rule, so rules on processes started later (restarts) were skipped as killed. Now one check per rule, registered after its process started; new helper case `unfired-fault-after-restart`.
+
+Deferred minors: M-1 a re-`Put` of the same op on the same process resets `Fired`, so an earlier unfired rule passes if the later one fired; M-2 the helper child test binaries have no `Pdeathsig`/`-test.timeout`; M-3 `Pdeathsig` follows the forking OS thread (Go #27505), harmless without `LockOSThread` — worth a comment; M-4 `race-report` proves only the log scan, so re-run the `data_race` mutation after 5b3; M-5 `TestProfileBreakingARatioIsRefused`'s processes are not race-scanned.
