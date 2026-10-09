@@ -16,25 +16,36 @@ type kickServer struct {
 }
 
 func (k kickServer) Kick(ctx context.Context, req *pb.KickRequest) (*pb.KickReply, error) {
-	g := k.g
-	if err := g.kickFault(ctx, req.GetConnId()); err != nil {
+	after, err := k.g.kickFault(ctx, req.GetConnId())
+	if err != nil {
 		return nil, err
 	}
+	reply := k.kick(req)
+	if after != nil { // the Kick was carried out; its reply is late or lost
+		if err := faultErr(ctx, *after, "Kick reply lost"); err != nil {
+			return nil, err
+		}
+	}
+	return reply, nil
+}
+
+func (k kickServer) kick(req *pb.KickRequest) *pb.KickReply {
+	g := k.g
 	// A Kick for another epoch of this pod name is ignored (race 4).
 	if req.GetGw().GetGateway() != g.cfg.GatewayID || req.GetGw().GetEpoch() != g.cfg.Epoch {
 		g.m.Kicks.WithLabelValues("ignored").Inc()
-		return &pb.KickReply{}, nil
+		return &pb.KickReply{}
 	}
 	ls := g.loops.byWorker(req.GetConnId() >> 48)
 	if ls == nil {
 		g.m.Kicks.WithLabelValues("ignored").Inc()
-		return &pb.KickReply{}, nil
+		return &pb.KickReply{}
 	}
 	id, reason := req.GetConnId(), clientpb.KickReason(req.GetReason())
 	if ls.loop().Execute(func() { g.kickOnLoop(ls, id, reason) }) != nil {
 		g.m.Kicks.WithLabelValues("ignored").Inc()
 	}
-	return &pb.KickReply{}, nil
+	return &pb.KickReply{}
 }
 
 // kickOnLoop: ONLINE → Kick frame and close; AUTH_PENDING with a Login in

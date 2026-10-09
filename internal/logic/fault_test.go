@@ -235,3 +235,45 @@ func TestFaultEndpointOnlyWithFaults(t *testing.T) {
 		srv.Stop()
 	}
 }
+
+// EndEpoch's ZADD gwepochs 0 is not the renewal's index write: a gwepochs
+// rule leaves it alone and does not count it (a draining gateway still ends
+// its epoch).
+func TestFaultHookLeavesEndEpochAlone(t *testing.T) {
+	rdb := testredis.New(t)
+	f := fault.New()
+	rdb.AddHook(FaultHook(f))
+	st := store.New(rdb, testConfig().Store)
+	a := store.EpochRef{Gateway: testredis.Gateway(), Epoch: 1}
+	f.Put(fault.Rule{Op: FaultGWEpochs, Key: a.Gateway})
+	if err := st.EndEpoch(ctx, a); err != nil {
+		t.Fatalf("EndEpoch: %v", err)
+	}
+	if score, ok, _ := st.EpochScoreOf(ctx, a); !ok || score != 0 {
+		t.Fatalf("score %v %v, want 0", score, ok)
+	}
+	if n := f.Fired(FaultGWEpochs); n != 0 {
+		t.Fatalf("Fired = %d, want 0", n)
+	}
+}
+
+// Delayed Logout entries run side by side, as delayed Logins do.
+func TestFaultLogoutDelaysEntriesInParallel(t *testing.T) {
+	fs, st, ref := faultEnv(t)
+	a, b := testredis.UID(), testredis.UID()
+	st.LoginEach(ctx, []store.LoginReq{loginReq(t, st, ref, a, 1), loginReq(t, st, ref, b, 2)}, func(int, store.LoginResult) {})
+	fs.f.Put(fault.Rule{Op: FaultLogout, Delay: fault.Duration(300 * time.Millisecond)})
+	var mu sync.Mutex
+	res := make([]store.LogoutResult, 2)
+	start := time.Now()
+	fs.LogoutEach(ctx, []store.LogoutReq{
+		{UID: a, Field: field, Gateway: ref.Gateway, Epoch: ref.Epoch, ConnID: 1},
+		{UID: b, Field: field, Gateway: ref.Gateway, Epoch: ref.Epoch, ConnID: 2},
+	}, func(i int, r store.LogoutResult) { mu.Lock(); res[i] = r; mu.Unlock() })
+	if d := time.Since(start); d >= 550*time.Millisecond {
+		t.Fatalf("two delayed entries took %v, want about 300ms", d)
+	}
+	if !res[0].Deleted || !res[1].Deleted {
+		t.Fatalf("results %+v", res)
+	}
+}

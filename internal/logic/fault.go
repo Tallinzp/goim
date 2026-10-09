@@ -25,7 +25,7 @@ const (
 	FaultLogout       = "logout"        // LogoutEach, per entry
 	FaultReconcile    = "reconcile"     // ReadSlots: the whole chunk, if any entry matches
 	FaultReconcileEnd = "reconcile_end" // the ReconcileEnd RPC, before its delete phase; key: gateway id
-	FaultGWEpochs     = "gwepochs"      // ZADD gwepochs after a lease SET; key: gateway id (R4M-3)
+	FaultGWEpochs     = "gwepochs"      // ZADD gwepochs after a lease SET (not EndEpoch's score 0); key: gateway id (R4M-3)
 )
 
 // faultStore breaks Store calls on the race suite's request. A matched Login
@@ -79,14 +79,33 @@ func (s faultStore) LoginEach(ctx context.Context, reqs []store.LoginReq, done f
 }
 
 func (s faultStore) LogoutEach(ctx context.Context, reqs []store.LogoutReq, done func(i int, r store.LogoutResult)) {
+	var wg sync.WaitGroup
 	plain := make([]int, 0, len(reqs))
-	hits := map[int]fault.Hit{}
 	for i, r := range reqs {
-		if h, ok := s.f.Match(FaultLogout, r.UID); ok {
-			hits[i] = h
-		} else {
+		h, ok := s.f.Match(FaultLogout, r.UID)
+		if !ok {
 			plain = append(plain, i)
+			continue
 		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx := context.WithoutCancel(ctx)
+			if !h.After {
+				if err := h.Wait(ctx); err != nil {
+					done(i, store.LogoutResult{Err: err})
+					return
+				}
+			}
+			var res store.LogoutResult
+			s.Store.LogoutEach(ctx, reqs[i:i+1], func(_ int, r store.LogoutResult) { res = r })
+			if h.After {
+				if err := h.Wait(ctx); err != nil {
+					res = store.LogoutResult{Err: err}
+				}
+			}
+			done(i, res)
+		}()
 	}
 	if len(plain) > 0 {
 		sub := make([]store.LogoutReq, len(plain))
@@ -95,23 +114,7 @@ func (s faultStore) LogoutEach(ctx context.Context, reqs []store.LogoutReq, done
 		}
 		s.Store.LogoutEach(ctx, sub, func(j int, r store.LogoutResult) { done(plain[j], r) })
 	}
-	ctx = context.WithoutCancel(ctx)
-	for i, h := range hits {
-		if !h.After {
-			if err := h.Wait(ctx); err != nil {
-				done(i, store.LogoutResult{Err: err})
-				continue
-			}
-		}
-		var res store.LogoutResult
-		s.Store.LogoutEach(ctx, reqs[i:i+1], func(_ int, r store.LogoutResult) { res = r })
-		if h.After {
-			if err := h.Wait(ctx); err != nil {
-				res = store.LogoutResult{Err: err}
-			}
-		}
-		done(i, res)
-	}
+	wg.Wait()
 }
 
 // ReadSlots is the first Store call of a Reconcile chunk, so a delay here
@@ -165,8 +168,9 @@ func (gwepochsFault) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.P
 
 func (h gwepochsFault) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 	return func(ctx context.Context, cmd redis.Cmder) error {
-		// ZADD gwepochs <score> <gw>:<epoch>
-		if a := cmd.Args(); len(a) == 4 && strings.EqualFold(fmt.Sprint(a[0]), "zadd") && a[1] == "gwepochs" {
+		// ZADD gwepochs <score> <gw>:<epoch>. Score 0 is EndEpoch's write,
+		// not the index write after a lease SET: it is left alone.
+		if a := cmd.Args(); len(a) == 4 && strings.EqualFold(fmt.Sprint(a[0]), "zadd") && a[1] == "gwepochs" && a[2] != float64(0) {
 			m := fmt.Sprint(a[3])
 			if i := strings.LastIndexByte(m, ':'); i > 0 {
 				if _, ok := h.f.Match(FaultGWEpochs, m[:i]); ok {

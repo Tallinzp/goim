@@ -11,6 +11,7 @@ import (
 
 	pb "github.com/Tallinzp/goim/api/internalpb"
 	"github.com/Tallinzp/goim/internal/fault"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -97,5 +98,80 @@ func TestNoFaultEndpointInProduction(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("/fault/info = %d, want 404", resp.StatusCode)
+	}
+}
+
+// After + Fail: the Kick is carried out, but Logic sees UNAVAILABLE (a Kick
+// whose reply was lost), so it retries one that already closed the conn.
+func TestKickFaultAfterKicksThenFails(t *testing.T) {
+	l, f := liveWithFaults(t)
+	kc := l.kickClient(t)
+	k := l.loginLive(t, 1, "u1")
+	f.Put(fault.Rule{Op: FaultKick, Key: strconv.FormatUint(k.c.id, 10), After: true, Fail: true})
+	_, err := kc.Kick(context.Background(), &pb.KickRequest{Gw: &pb.GatewayRef{Gateway: "gw-1", Epoch: 0xE1},
+		ConnId: k.c.id, Reason: pb.KickReason_KICK_REASON_REPLACED})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("Kick: %v, want UNAVAILABLE", err)
+	}
+	waitFor(t, "closed by the Kick whose reply was lost", k.isClosed)
+}
+
+// After + Fail on a unary call: Logic gets it, the gateway sees UNAVAILABLE.
+func TestLogicFaultAfterCallsThenFails(t *testing.T) {
+	f := fault.New()
+	g := &Gateway{}
+	g.faults = f
+	f.Put(fault.Rule{Op: FaultLogic, Key: "Logout", After: true, Fail: true})
+	called := false
+	invoker := func(context.Context, string, any, any, *grpc.ClientConn, ...grpc.CallOption) error {
+		called = true
+		return nil
+	}
+	err := g.faultUnary(context.Background(), "/goim.internal.Logic/Logout", nil, nil, nil, invoker)
+	if !called || status.Code(err) != codes.Unavailable {
+		t.Fatalf("called %v, err %v; want the call made, then UNAVAILABLE", called, err)
+	}
+}
+
+type recvStream struct {
+	grpc.ClientStream
+	recvs int
+}
+
+func (s *recvStream) Context() context.Context { return context.Background() }
+func (s *recvStream) RecvMsg(any) error        { s.recvs++; return nil }
+
+// After + Fail on the Login stream: the batch is sent, its replies are lost.
+func TestLogicFaultAfterOnAStreamLosesTheReplies(t *testing.T) {
+	f := fault.New()
+	g := &Gateway{}
+	g.faults = f
+	f.Put(fault.Rule{Op: FaultLogic, Key: "Login", After: true, Fail: true})
+	inner := &recvStream{}
+	streamer := func(context.Context, *grpc.StreamDesc, *grpc.ClientConn, string, ...grpc.CallOption) (grpc.ClientStream, error) {
+		return inner, nil
+	}
+	cs, err := g.faultStream(context.Background(), &grpc.StreamDesc{ServerStreams: true}, nil, "/goim.internal.Logic/Login", streamer)
+	if err != nil {
+		t.Fatalf("stream opened with %v; want it opened (the batch reaches Logic)", err)
+	}
+	if err := cs.RecvMsg(nil); status.Code(err) != codes.Unavailable || inner.recvs != 0 {
+		t.Fatalf("RecvMsg: %v after %d inner reads; want UNAVAILABLE and no reply", err, inner.recvs)
+	}
+}
+
+// A delay-only rule before the call waits once, not again after it.
+func TestLogicFaultDelayBeforeWaitsOnce(t *testing.T) {
+	f := fault.New()
+	g := &Gateway{}
+	g.faults = f
+	f.Put(fault.Rule{Op: FaultLogic, Key: "Logout", Delay: fault.Duration(200 * time.Millisecond)})
+	invoker := func(context.Context, string, any, any, *grpc.ClientConn, ...grpc.CallOption) error { return nil }
+	start := time.Now()
+	if err := g.faultUnary(context.Background(), "/goim.internal.Logic/Logout", nil, nil, nil, invoker); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d < 200*time.Millisecond || d >= 350*time.Millisecond {
+		t.Fatalf("took %v, want one 200ms delay", d)
 	}
 }

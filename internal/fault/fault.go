@@ -1,9 +1,11 @@
 // Package fault is the test-only fault injection the race suite drives
 // (Plan 5b, choice #58). A Logic or gateway process started with -faults
 // serves /fault/ on its admin port; without the flag its *Set is nil, and
-// every method on a nil *Set reports no fault, so production code paths are
-// unchanged. Rules are keyed by op (one rule per op); the hooks that consult
-// them live next to the code they break (internal/logic, internal/gateway).
+// Match and Fired on a nil *Set report no fault, so production code paths
+// are unchanged. Put, Clear and Handler need a Set from New: they run only
+// behind -faults. Rules are keyed by op (one rule per op); the hooks that
+// consult them live next to the code they break (internal/logic,
+// internal/gateway).
 package fault
 
 import (
