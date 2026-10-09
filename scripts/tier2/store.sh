@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Tier 2: run Plan 1's store tests against a real Redis primary + replica.
 #
-# Usage (on the Tier 2 host, from the repo root): scripts/tier2/store.sh
-#   GOIM_TEST_TIER=2 is set by this script; the host guard refuses smaller hosts.
+# Usage (on the Tier 2 host, from the repo root):
+#   GOIM_TEST_TIER=2 make test-tier2 SCENARIO=store
+#   The host guard (scripts/tier2/lib.sh) refuses smaller hosts.
 #   Results: tier2-results/store-<timestamp>/ (result.json and the raw logs), plus
 #   ONE file to send back if anything fails: tier2-results/store-<timestamp>.report.txt
 #   Exit code: 0 if every check passes, 1 if any check fails, 2 if the host is refused.
@@ -15,76 +16,36 @@
 #   4. eviction: the test Redis reports maxmemory-policy noeviction
 set -uo pipefail
 
-cd "$(git rev-parse --show-toplevel)"
-export GOIM_TEST_TIER=2 CGO_ENABLED=1
+. "$(dirname "$0")/lib.sh"
+t2_init store
+t2_need docker
 export GOIM_REDIS_PORT="${GOIM_REDIS_PORT:-16379}" GOIM_REDIS_REPLICA_PORT="${GOIM_REDIS_REPLICA_PORT:-16380}"
 export GOIM_TEST_REDIS="127.0.0.1:$GOIM_REDIS_PORT" GOIM_TEST_REDIS_REPLICA="127.0.0.1:$GOIM_REDIS_REPLICA_PORT"
-
-# Host guard (spec: Tier 2 host is 12 cores / 26GB; never the dev machine).
-# Works on Linux and macOS; a host it cannot measure is refused, never let through.
-cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null)
-if [ -r /proc/meminfo ]; then
-  mem_gb=$(awk '/MemTotal/ {printf "%d", $2 / 1024 / 1024}' /proc/meminfo)
-else
-  mem_bytes=$(sysctl -n hw.memsize 2>/dev/null)
-  mem_gb=$(( ${mem_bytes:-0} / 1024 / 1024 / 1024 ))
-fi
-for v in "$cores" "$mem_gb"; do
-  case "$v" in
-    ''|*[!0-9]*|0) echo "refused: cannot determine cores/RAM (cores='$cores', mem_gb='$mem_gb')" >&2; exit 2 ;;
-  esac
-done
-if [ "$cores" -lt 12 ] || [ "$mem_gb" -lt 24 ]; then
-  echo "refused: Tier 2 needs >= 12 cores and >= 24GB RAM (have $cores cores, ${mem_gb}GB)" >&2
-  exit 2
-fi
-for tool in docker go gcc make git; do
-  command -v "$tool" >/dev/null || { echo "refused: $tool not installed" >&2; exit 2; }
-done
-
-out="tier2-results/store-$(date +%Y%m%d-%H%M%S)"
-report="$out.report.txt"
-mkdir -p "$out"
+out=$T2_OUT
 mutdir=""
+t2_on_exit 'make redis-down'
+# Exit hooks run before the report, newest first: save the Redis logs before redis-down.
+t2_on_exit 'docker compose -f deploy/compose/redis-test.yml logs --no-color --tail 100 >"$out/redis.log" 2>&1'
+t2_on_exit '[ -n "$mutdir" ] && git worktree remove --force "$mutdir"'
 
-section() { printf '\n===== %s =====\n' "$1"; }
-# write_report gathers everything needed to diagnose a failure into one file:
-# environment, result.json, and the log lines that matter (passing-test noise removed).
-write_report() {
-  {
-    echo "goim Tier 2 report: scenario store"
-    section "environment"
-    echo "date:    $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    echo "commit:  $(git rev-parse HEAD) ($(git rev-parse --abbrev-ref HEAD))"
-    echo "dirty:   $(git status --porcelain | wc -l) changed files"
-    echo "host:    $cores cores, ${mem_gb}GB RAM, $(uname -sr)"
-    echo "go:      $(go version)"
-    echo "gcc:     $(gcc --version | head -1)"
-    echo "docker:  $(docker --version); $(docker compose version 2>&1 | head -1)"
-    echo "ports:   primary $GOIM_REDIS_PORT, replica $GOIM_REDIS_REPLICA_PORT"
-    section "result.json"
-    cat "$out/result.json" 2>/dev/null || echo "(not written: the run stopped early)"
-    section "redis-up.log"
-    cat "$out/redis-up.log" 2>/dev/null
-    section "tests.log (RUN/PASS lines removed)"
-    if [ -f "$out/tests.log" ]; then
-      grep -vE '^[[:space:]]*(=== (RUN|PAUSE|CONT)|--- PASS)' "$out/tests.log" | head -n 3000
-    fi
-    section "mutation.log"
-    tail -n 200 "$out/mutation.log" 2>/dev/null
-    section "redis logs (last 100 lines each)"
-    docker compose -f deploy/compose/redis-test.yml logs --no-color --tail 100 2>&1
-  } >"$report" 2>&1
+# The report: the log lines that matter (passing-test noise removed).
+t2_report_extra() {
+  t2_section "tools"
+  echo "gcc:     $(gcc --version | head -1)"
+  echo "docker:  $(docker --version); $(docker compose version 2>&1 | head -1)"
+  echo "ports:   primary $GOIM_REDIS_PORT, replica $GOIM_REDIS_REPLICA_PORT"
+  t2_section "redis-up.log"
+  cat "$out/redis-up.log" 2>/dev/null
+  t2_section "tests.log (RUN/PASS lines removed)"
+  if [ -f "$out/tests.log" ]; then
+    grep -vE '^[[:space:]]*(=== (RUN|PAUSE|CONT)|--- PASS)' "$out/tests.log" | head -n 3000
+  fi
+  t2_section "mutation.log"
+  tail -n 200 "$out/mutation.log" 2>/dev/null
+  t2_section "redis logs (last 100 lines each)"
+  cat "$out/redis.log" 2>/dev/null
 }
-teardown() {
-  write_report
-  [ -n "$mutdir" ] && git worktree remove --force "$mutdir" >/dev/null 2>&1
-  make redis-down >/dev/null 2>&1
-  echo "report: $report"
-}
-trap teardown EXIT
 
-t0=$SECONDS # durations in result.json: whole seconds, bash's SECONDS
 make redis-down >/dev/null 2>&1   # idempotent: start from a clean Redis
 
 # The host ports must be free; name whatever holds them.
@@ -105,7 +66,7 @@ if ! make redis-up >"$out/redis-up.log" 2>&1; then
   exit 1
 fi
 
-setup_s=$((SECONDS - t0))
+t2_duration setup $((SECONDS - T2_T0))
 
 # 1 + 2: full suite on real Redis.
 t=$SECONDS
@@ -141,31 +102,11 @@ mutation_s=$((SECONDS - t))
 policy=$(docker compose -f deploy/compose/redis-test.yml exec -T redis-primary \
   redis-cli -p 6379 config get maxmemory-policy | tail -1 | tr -d '\r')
 
-ok=true
-[ "$tests_rc" -eq 0 ] || ok=false
-[ "$skips" -eq 0 ] || ok=false
-[ "$mutation" = "pass" ] || ok=false
-[ "$policy" = "noeviction" ] || ok=false
-
-cat >"$out/result.json" <<JSON
-{
-  "scenario": "store",
-  "tier": 2,
-  "commit": "$(git rev-parse HEAD)",
-  "host": {"cores": $cores, "mem_gb": $mem_gb},
-  "redis": "$(docker compose -f deploy/compose/redis-test.yml exec -T redis-primary redis-server --version | tr -d '\r')",
-  "pass": $ok,
-  "duration_s": {"total": $((SECONDS - t0)), "setup": $setup_s},
-  "checks": {
-    "tests": {"pass": $([ "$tests_rc" -eq 0 ] && echo true || echo false), "failed": "$failed", "duration_s": $tests_s},
-    "no_skips": {"pass": $([ "$skips" -eq 0 ] && echo true || echo false), "tier2_skips": $skips},
-    "mutation": {"pass": $([ "$mutation" = "pass" ] && echo true || echo false), "detail": "$mutation", "duration_s": $mutation_s},
-    "eviction": {"pass": $([ "$policy" = "noeviction" ] && echo true || echo false), "maxmemory_policy": "$policy"}
-  },
-  "not_covered": ["Redis Cluster: MasterForKey, MOVED after failover, multi-node NOSCRIPT, CRC16 key slots",
-                  "lost replies after a write (needs a fault-injecting proxy)"]
-}
-JSON
-
-cat "$out/result.json"
-$ok && exit 0 || exit 1
+t2_field redis "$(t2_json_str "$(docker compose -f deploy/compose/redis-test.yml exec -T redis-primary redis-server --version | tr -d '\r')")"
+t2_check tests "$(t2_bool [ "$tests_rc" -eq 0 ])" "\"failed\": $(t2_json_str "$failed"), \"duration_s\": $tests_s"
+t2_check no_skips "$(t2_bool [ "$skips" -eq 0 ])" "\"tier2_skips\": $skips"
+t2_check mutation "$(t2_bool [ "$mutation" = pass ])" "\"detail\": $(t2_json_str "$mutation"), \"duration_s\": $mutation_s"
+t2_check eviction "$(t2_bool [ "$policy" = noeviction ])" "\"maxmemory_policy\": $(t2_json_str "$policy")"
+t2_not_covered "Redis Cluster: MasterForKey, MOVED after failover, multi-node NOSCRIPT, CRC16 key slots" \
+  "lost replies after a write (needs a fault-injecting proxy)"
+t2_finish
