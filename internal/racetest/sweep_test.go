@@ -31,10 +31,14 @@ func (s *Stack) onlineOnEach(prefix string) []string {
 	return uids
 }
 
-// noSweepFor checks that Logic sweeps nothing for d.
+// noSweepFor checks that Logic sweeps nothing for d: no sweep finishes, and
+// none deletes a field before it aborts (the triggered pass would restore
+// those sessions by the time the scenario looks).
 func (s *Stack) noSweepFor(d time.Duration) {
 	s.t.Helper()
-	holds(s.t, "nothing is swept", d, func() bool { return s.logicMetric(sprintf(logicSweeps, "done")) == 0 })
+	holds(s.t, "nothing is swept", d, func() bool {
+		return s.logicMetric(sprintf(logicSweeps, "done")) == 0 && s.logicMetric(logicSweepDeleted) == 0
+	})
 }
 
 // Gateway crash: its lease expires, and the sweeper deletes its entries and

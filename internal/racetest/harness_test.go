@@ -29,6 +29,7 @@ func TestHarnessFailsWhatAssertionsMiss(t *testing.T) {
 		{mode: "unfired-fault-after-restart", want: "never fired"},
 		{mode: "unfired-fault-replaced", want: "never fired"},
 		{mode: "race-report-bare", want: "the race detector reported a data race"},
+		{mode: "panic-on-term", want: "panicked"},
 	} {
 		cmd := childTest("TestHelperScenario", "-test.v")
 		cmd.Env = append(os.Environ(), "GOIM_RACETEST_HELPER="+c.mode, "GOIM_RACE_BIN="+binDir, "GOIM_RACE_LOGS=",
@@ -63,6 +64,13 @@ func TestHelperScenario(t *testing.T) {
 		f, _ := os.OpenFile(p.log, os.O_APPEND|os.O_WRONLY, 0)
 		f.WriteString("==================\nWARNING: DATA RACE\nWrite at 0x00c000123456 by goroutine 7:\n")
 		f.Close()
+		return
+	}
+	if mode == "panic-on-term" { // a process that crashes in its drain, after the scenario sent SIGTERM
+		sh, _ := exec.LookPath("sh")
+		p := startProc(t, t.TempDir(), "sh", sh, "-c", `trap 'echo "panic: drain"; exit 2' TERM; sleep 60 & wait`)
+		time.Sleep(200 * time.Millisecond) // the trap is set
+		p.term(5 * time.Second)
 		return
 	}
 	s := New(t, Options{Gateways: 1})

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -68,6 +69,7 @@ func startProc(t *testing.T, dir, name, bin string, args ...string) *proc {
 		}
 		p.kill()
 		p.checkRace(t)
+		p.checkPanic(t)
 	})
 	return p
 }
@@ -80,6 +82,20 @@ func (p *proc) checkRace(t *testing.T) {
 		t.Errorf("%s: the race detector reported a data race:\n%s", p.name, string(b[i:min(len(b), i+4000)]))
 	}
 }
+
+// checkPanic fails t if this run of the process panicked or hit a fatal
+// error. It catches a crash after the scenario's own term (a panic in the
+// drain), which the exit check above ignores: the scenario stopped it.
+func (p *proc) checkPanic(t *testing.T) {
+	b, _ := os.ReadFile(p.log)
+	b = b[min(p.logFrom, int64(len(b))):]
+	if loc := panicLine.FindIndex(b); loc != nil {
+		t.Errorf("%s panicked:\n%s", p.name, string(b[loc[0]:min(len(b), loc[0]+4000)]))
+	}
+}
+
+// panicLine is how the Go runtime starts a crash report.
+var panicLine = regexp.MustCompile(`(?m)^(panic: |fatal error: )`)
 
 func (p *proc) signal(s syscall.Signal) { _ = p.cmd.Process.Signal(s) }
 
