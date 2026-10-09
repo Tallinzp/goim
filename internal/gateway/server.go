@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	pb "github.com/Tallinzp/goim/api/internalpb"
+	"github.com/Tallinzp/goim/internal/fault"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
@@ -45,6 +47,7 @@ func DefaultServerConfig() ServerConfig {
 type server struct {
 	registry    *prometheus.Registry
 	readyChecks []func() error
+	faults      *fault.Set // nil in production
 	limits      limitSource
 	limitsErr   error
 
@@ -94,6 +97,7 @@ func (g *Gateway) Start(ctx context.Context, sc ServerConfig) error {
 	ctx, g.cancel = context.WithCancel(ctx)
 	logic := pb.NewLogicClient(g.clients[0])
 	g.leaseC = pb.NewLeaseClient(g.clients[1])
+	g.recon = newReconciler(g, logic)
 
 	g.kick = grpc.NewServer()
 	pb.RegisterGatewayServer(g.kick, kickServer{g: g})
@@ -107,6 +111,12 @@ func (g *Gateway) Start(ctx context.Context, sc ServerConfig) error {
 		}
 		w.WriteHeader(http.StatusOK)
 	})
+	if g.faults != nil {
+		mux.Handle("/fault/", g.faults.Handler(func() any {
+			kick, admin := g.Addrs()
+			return faultInfo{Gateway: g.cfg.GatewayID, Epoch: strconv.FormatUint(g.cfg.Epoch, 10), Kick: kick, Admin: admin}
+		}, map[string]func(){"reconcile": g.recon.Trigger}))
+	}
 	g.admin = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	g.goRun(func() { g.kick.Serve(g.lis[0]) })
 	g.goRun(func() {
@@ -119,7 +129,6 @@ func (g *Gateway) Start(ctx context.Context, sc ServerConfig) error {
 	g.goRun(func() { g.watchLogic(ctx, g.clients[0]) })
 	g.startLogin(ctx, logic)
 	g.startLogout(ctx, logic)
-	g.recon = newReconciler(g, logic)
 	rctx, stop := context.WithCancel(ctx)
 	g.stopRecon = stop
 	g.goRun(func() { g.recon.run(rctx) })
@@ -254,8 +263,8 @@ func (g *Gateway) dial(target string) (*grpc.ClientConn, error) {
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultServiceConfig(`{"loadBalancingConfig":[{"round_robin":{}}]}`),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{Time: 20 * time.Second, Timeout: 5 * time.Second, PermitWithoutStream: true}),
-		grpc.WithChainUnaryInterceptor(g.observeUnary),
-		grpc.WithChainStreamInterceptor(g.observeStream))
+		grpc.WithChainUnaryInterceptor(g.observeUnary, g.faultUnary),
+		grpc.WithChainStreamInterceptor(g.observeStream, g.faultStream))
 }
 
 // rpcCtx bounds a call to Logic and tags it with a request ID (at most 64

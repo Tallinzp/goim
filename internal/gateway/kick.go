@@ -15,8 +15,11 @@ type kickServer struct {
 	g *Gateway
 }
 
-func (k kickServer) Kick(_ context.Context, req *pb.KickRequest) (*pb.KickReply, error) {
+func (k kickServer) Kick(ctx context.Context, req *pb.KickRequest) (*pb.KickReply, error) {
 	g := k.g
+	if err := g.kickFault(ctx, req.GetConnId()); err != nil {
+		return nil, err
+	}
 	// A Kick for another epoch of this pod name is ignored (race 4).
 	if req.GetGw().GetGateway() != g.cfg.GatewayID || req.GetGw().GetEpoch() != g.cfg.Epoch {
 		g.m.Kicks.WithLabelValues("ignored").Inc()

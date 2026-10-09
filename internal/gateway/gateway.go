@@ -8,6 +8,7 @@ import (
 
 	"github.com/Tallinzp/goim/api/clientpb"
 	pb "github.com/Tallinzp/goim/api/internalpb"
+	"github.com/Tallinzp/goim/internal/fault"
 	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/protobuf/proto"
 )
@@ -46,6 +47,10 @@ type Deps struct {
 	// ReadyChecks are the transport's readiness conditions, e.g. the Noise
 	// key set is loaded (Plan 4).
 	ReadyChecks []func() error
+	// Faults, if set, drops Kicks and blocks calls to Logic on request and
+	// serves /fault/ on the admin port (the race suite, -faults). Nil in
+	// production.
+	Faults *fault.Set
 }
 
 // New builds the gateway core. Call Start to connect it to Logic.
@@ -64,7 +69,7 @@ func New(cfg Config, d Deps) (*Gateway, error) {
 		loginCh:  make(chan *loginItem, cfg.LoginQueueCap),
 		logoutCh: make(chan *logoutItem, cfg.LogoutQueue),
 	}
-	g.server = server{registry: d.Registry, readyChecks: d.ReadyChecks, limits: hostLimits}
+	g.server = server{registry: d.Registry, readyChecks: d.ReadyChecks, limits: hostLimits, faults: d.Faults}
 	for s := range g.gauges {
 		gauge := m.Conns.WithLabelValues(stateLabel[s])
 		g.gauges[s] = stateGauges{gauge.Inc, gauge.Dec}

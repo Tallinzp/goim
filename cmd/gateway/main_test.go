@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -44,6 +45,18 @@ func TestDefaultFlagsAreValid(t *testing.T) {
 	}
 	if tc.HandshakeConcurrency != 8 || cfg.Windows.StormWait.Lo != 5*time.Second || cfg.Windows.StormWait.Hi != time.Minute {
 		t.Fatalf("concurrency %d, storm wait %+v", tc.HandshakeConcurrency, cfg.Windows.StormWait)
+	}
+}
+
+// The race suite's flags (Plan 5b).
+func TestRaceSuiteFlags(t *testing.T) {
+	cfg, _, _, o, err := parseFlags([]string{"-id", "gw-0", "-faults", "-clock-offset", "-5s",
+		"-retry-backoff", "100ms", "-retry-max-delay", "1s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !o.faults || o.clockOffset != -5*time.Second || cfg.RetryBackoff != 100*time.Millisecond || cfg.RetryMaxDelay != time.Second {
+		t.Fatalf("parsed %+v %+v", cfg, o)
 	}
 }
 
@@ -101,6 +114,7 @@ type fakeLogic struct {
 	logouts       atomic.Int32
 	ended         atomic.Int32
 	endedLoggedIn atomic.Int32 // EpochEnded calls made before any Logout
+	leaseSkewMs   atomic.Int64 // gw_now_ms − local time of the last GatewayLease
 }
 
 func (f *fakeLogic) Login(b *pb.LoginBatch, s grpc.ServerStreamingServer[pb.LoginResult]) error {
@@ -119,7 +133,8 @@ func (f *fakeLogic) Logout(_ context.Context, b *pb.LogoutBatch) (*pb.LogoutRepl
 	return r, nil
 }
 
-func (f *fakeLogic) GatewayLease(context.Context, *pb.LeaseRequest) (*pb.LeaseReply, error) {
+func (f *fakeLogic) GatewayLease(_ context.Context, r *pb.LeaseRequest) (*pb.LeaseReply, error) {
+	f.leaseSkewMs.Store(r.GetGwNowMs() - time.Now().UnixMilli())
 	return &pb.LeaseReply{}, nil
 }
 
@@ -129,6 +144,49 @@ func (f *fakeLogic) EpochEnded(context.Context, *pb.EpochEndedRequest) (*pb.Epoc
 		f.endedLoggedIn.Add(1)
 	}
 	return &pb.EpochEndedReply{}, nil
+}
+
+// -clock-offset shifts the clock the gateway stamps on everything it sends
+// Logic, here gw_now_ms (P4I-5).
+func TestClockOffsetShiftsTheGatewayClock(t *testing.T) {
+	logic := &fakeLogic{}
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := grpc.NewServer()
+	pb.RegisterLogicServer(s, logic)
+	pb.RegisterLeaseServer(s, logic)
+	go s.Serve(l)
+	defer s.Stop()
+	keys := t.TempDir()
+	if err := keygen([]string{"-key-id", "1", "-out", filepath.Join(keys, "1")}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	started, done := make(chan string, 1), make(chan error, 1)
+	go func() {
+		done <- run(ctx, []string{"-id", "gw-0", "-listen", "tcp://127.0.0.1:0", "-noise-keys", keys,
+			"-logic", l.Addr().String(), "-lease", l.Addr().String(), "-kick-addr", "127.0.0.1:0",
+			"-admin-addr", "127.0.0.1:0", "-loops", "1", "-conntrack-notrack", "-clock-offset", "2s",
+			"-drain-window", "100ms", "-drain-flush", "0s"}, func(a string) { started <- a })
+	}()
+	select {
+	case <-started:
+	case err := <-done:
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for logic.leaseSkewMs.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if skew := logic.leaseSkewMs.Load(); skew < 1500 || skew > 2500 {
+		t.Fatalf("gw_now_ms is %dms ahead, want about 2000", skew)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
 }
 
 // The whole binary: serve, log a client in over TCP + Noise, then SIGTERM

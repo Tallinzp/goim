@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Tallinzp/goim/internal/fault"
 	"github.com/Tallinzp/goim/internal/gateway"
 	"github.com/Tallinzp/goim/internal/gateway/tcp"
 	"github.com/Tallinzp/goim/internal/wire"
@@ -81,6 +82,12 @@ func keygen(args []string, out io.Writer) error {
 type options struct {
 	keyDir       string
 	drainTimeout time.Duration
+	faults       bool
+	// clockOffset shifts the gateway's wall clock for the race suite's
+	// clock-skew scenario (R4M-5, P4I-5). It is fixed at start: the clock
+	// also drives the timing wheel, and a step at run time would fire
+	// timers early.
+	clockOffset time.Duration
 }
 
 // window is a flag holding a uniform wait "lo-hi", e.g. "1s-3s".
@@ -124,6 +131,8 @@ func parseFlags(args []string) (gateway.Config, gateway.ServerConfig, tcp.Config
 	fs.StringVar(&tc.Addr, "listen", tc.Addr, "client TCP listen address (gnet)")
 	fs.StringVar(&o.keyDir, "noise-keys", o.keyDir, "Noise key Secret directory: one file per key_id")
 	fs.DurationVar(&o.drainTimeout, "drain-timeout", o.drainTimeout, "SIGTERM drain limit; keep below terminationGracePeriodSeconds")
+	fs.BoolVar(&o.faults, "faults", false, "serve the test-only fault API on the admin port (race suite only, never in production)")
+	fs.DurationVar(&o.clockOffset, "clock-offset", 0, "shift the wall clock by this much (race suite clock skew only)")
 
 	fs.StringVar(&sc.LogicTarget, "logic", sc.LogicTarget, "Logic gRPC target (Login/Logout/Reconcile)")
 	fs.StringVar(&sc.LeaseTarget, "lease", sc.LeaseTarget, "Logic Lease gRPC target (dedicated channel)")
@@ -146,6 +155,8 @@ func parseFlags(args []string) (gateway.Config, gateway.ServerConfig, tcp.Config
 	fs.DurationVar(&cfg.LeaseTimeout, "lease-timeout", cfg.LeaseTimeout, "GatewayLease call timeout")
 	fs.DurationVar(&cfg.LeaseTTL, "lease-ttl", cfg.LeaseTTL, "Logic's lease TTL (the trigger rule)")
 	fs.DurationVar(&cfg.RetryFor, "retry-for", cfg.RetryFor, "Logout and ReconcileEnd retry budget")
+	fs.DurationVar(&cfg.RetryBackoff, "retry-backoff", cfg.RetryBackoff, "first Logout and ReconcileEnd retry delay, doubled per attempt")
+	fs.DurationVar(&cfg.RetryMaxDelay, "retry-max-delay", cfg.RetryMaxDelay, "longest delay between retries")
 	fs.DurationVar(&cfg.Reconcile.Cycle, "reconcile-cycle", cfg.Reconcile.Cycle, "periodic Reconcile cycle")
 	fs.DurationVar(&cfg.Reconcile.Jitter, "reconcile-jitter", cfg.Reconcile.Jitter, "periodic Reconcile jitter")
 	fs.IntVar(&cfg.Reconcile.TriggeredRate, "triggered-rate", cfg.Reconcile.TriggeredRate, "triggered pass entries/s")
@@ -193,8 +204,17 @@ func run(ctx context.Context, args []string, started func(addr string)) error {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	var tr *tcp.Transport // set before Start; Ready reads it only after
-	g, err := gateway.New(cfg, gateway.Deps{Metrics: gateway.NewMetrics(reg), Registry: reg,
-		ReadyChecks: []func() error{func() error { return tr.Ready() }}})
+	d := gateway.Deps{Metrics: gateway.NewMetrics(reg), Registry: reg,
+		ReadyChecks: []func() error{func() error { return tr.Ready() }}}
+	if o.faults {
+		d.Faults = fault.New()
+		slog.Warn("gateway: -faults is set: the test-only fault API is on the admin port")
+	}
+	if off := o.clockOffset; off != 0 {
+		d.Clock = func() time.Time { return time.Now().Add(off) }
+		slog.Warn("gateway: -clock-offset is set: the wall clock is shifted", "offset", off)
+	}
+	g, err := gateway.New(cfg, d)
 	if err != nil {
 		return err
 	}
