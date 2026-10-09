@@ -1772,3 +1772,20 @@ Every race integration test in the spec runs on the dev machine before each comm
 Plan 6 builds `cmd/loadgen` and the Tier 2/3 load scenarios. It can reuse the harness's process and port handling and the fault API (a slowed Logic), and it decides the client per load test as P5I-2 records.
 
 The open risks are listed in 5b1's *Execution Notes*.
+
+## Execution Notes (5b3)
+
+Executed inline 2026-10-09 on `feat/plan5b-race`: Task 6 `2bacce3`, Task 7 `275b540`, Task 8 `2449ca8`, Task 9 `a3cb70c`, Task 10 `385c00b`, Task 11 `56b2343`, Task 12 `b2f1b5e`, plan code verbatim, every plan mutation caught, no rulings. `make test-race-suite` green (~272s), and the `data_race` mutation (5b2 M-4) re-run once more on `TestStackComesUp`: caught on all four gateways.
+
+Fresh Opus final review: no Critical. Two Important findings, fixed in `f43550f`, each with a test that failed first:
+- **I-1** (Review Focus 1) a process the scenario `term()`ed was ignored by the exit check, so a gateway that panicked in its drain passed (`TestDrainingGatewayStillReceivesKicks`, `TestEndedEpochIsSweptAtOnce`). Each process now also scans its run's log for `panic: ` / `fatal error: ` (`proc.checkPanic`); new helper case `panic-on-term`.
+- **I-2** `noSweepFor` counted only finished sweeps: a sweep that deleted a batch and then aborted on a renewal passed, as the triggered pass restored the sessions before the scenario looked. It now also requires `goim_logic_sweep_deleted_total == 0`. Proven with a mutant guard that counts the hold but sweeps anyway, aborting after the first batch: the old check passed `TestGatewaysCutOffFromLogicNothingIsSwept` and `TestLogicRestartWithLateRenewalsSweepsNothing`, the new one fails both.
+
+Minors M1–M5, fixed afterwards at the user's request in `bcb46ce`:
+- **M1** `TestRedisPausedNothingIsSwept` never showed the guard was exercised: after the pause, whether the sweeper looks before the gateways renew is a race (asserting the guard held failed 1 run in 5). The gateways' renewals now fail 1.5s past the pause, and the test asserts the guard held and each gateway ran a triggered pass. Measured: the pass is triggered by the renewal gap (≥ lease TTL), the reply was mostly not `missing`, so the comment was corrected. Both guard mutants (guard off; hold-but-sweep) now fail it; the second passed before.
+- **M2** `TestLogicWithNoKeySetIsNeverReady` counted "not listening" as success; it now requires a 503. A mutant Logic that never listens without a key set passed before and fails now.
+- **M3** `Stack.Metric` fails on a series that names no metric Logic or the gateway registers, or names it with other label names (`checkSeries`, built from both `NewMetrics` through a recording `prometheus.Registerer`; `TestSeriesCheckRefusesUnregisteredSeries`, Tier 1a too). Label values cannot be checked: an unused one is as absent from `/metrics` as a misspelled one.
+- **M4** `race.sh` lists the tests with the suite switch empty (no second race build, 5.8s → 1.3s warm), and a failed `git worktree add` is named in `mutation.log` and removes its empty temp dir. The mutation block was run on its own both ways: `pass` with `HEAD`, the worktree error with a bad ref.
+- **M5** `forceSweep` waits until a renewal has hit the fault (renewals are serial) before deleting the lease. `TestForceSweepWaitsOutARenewalInFlight` (a renewal held in an 800ms delay) failed 5/5 before, passes 5/5 after.
+
+Full suite after the fixes: `make test-race-suite` green (58 tests, ~278s), `go vet ./...` and `make test` green.
