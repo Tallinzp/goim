@@ -7,7 +7,7 @@ export GOIM_REDIS_REPLICA_PORT ?= 16380
 COMPOSE_REDIS := docker compose -f deploy/compose/redis-test.yml
 TIER2_GUARD := test "$$GOIM_TEST_TIER" = 2 || { echo "Tier 2 host only: set GOIM_TEST_TIER=2"; exit 1; }
 
-.PHONY: test test-race-suite redis-server test-redis-local proto redis-up redis-down test-redis test-tier2
+.PHONY: test test-race-suite test-scripts redis-server test-redis-local proto redis-up redis-down test-redis test-tier2
 
 # Tier 1a (dev machine): unit and Lua tests on in-process miniredis, race detector on.
 test:
@@ -19,6 +19,12 @@ test:
 # keeps every scenario's logs.
 test-race-suite:
 	GOIM_RACE_SUITE=1 GOIM_REDIS_SERVER=$(REDIS_SERVER) go test -count=1 -timeout 30m ./internal/racetest/
+
+# The Tier 2 and load-run scripts (Plan 6a1), on any machine: lib.sh's guard,
+# result.json, recording and host-setup checks, and a real stack.sh stack.
+# Needs python3, curl and redis-server (make redis-server).
+test-scripts:
+	scripts/tier2/lib_test.sh
 
 # The race suite's Redis: redis-server on PATH, else the pinned 7.4.11 that
 # make redis-server builds into .cache/redis (cc and make, no Docker).
@@ -53,6 +59,8 @@ test-redis:
 	@$(TIER2_GUARD)
 	GOIM_TEST_REDIS=127.0.0.1:$(GOIM_REDIS_PORT) GOIM_TEST_REDIS_REPLICA=127.0.0.1:$(GOIM_REDIS_REPLICA_PORT) go test -race -count=1 ./...
 
-# Tier 2 scenario entry point (spec: automation contract), e.g. make test-tier2 SCENARIO=store
+# Tier 2 scenario entry point (spec: automation contract). The caller sets
+# GOIM_TEST_TIER (P5bI-5), e.g. GOIM_TEST_TIER=2 make test-tier2 SCENARIO=race;
+# scenarios: store, race, foundation, probe (read-only, no guard).
 test-tier2:
 	scripts/tier2/$(SCENARIO).sh
