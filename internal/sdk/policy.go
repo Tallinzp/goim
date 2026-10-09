@@ -9,29 +9,36 @@ import (
 	"github.com/Tallinzp/goim/api/clientpb"
 )
 
-// endKind is what ended a connection attempt or an established connection.
-type endKind int
+// EndKind is what ended a connection attempt or an established connection
+// (Event.End).
+type EndKind int
 
 const (
-	endLost         endKind = iota + 1 // an established connection closed or reset (RST/FIN)
-	endPongTimeout                     // no frame within the Pong timeout of a Ping
-	endReconnect                       // Reconnect{jitter_ms} from a draining gateway
-	endKicked                          // Kick{reason}
-	endPreHandshake                    // closed before the handshake reply
-	endBusy                            // Busy{retry_after}
-	endRejected                        // Error{code}
-	endNoReply                         // closed after the handshake, before LoginResp or Error
-	endFailed                          // dial, token, persistence or handshake failure
+	EndLost         EndKind = iota + 1 // an established connection closed or reset (RST/FIN)
+	EndPongTimeout                     // no frame within the Pong timeout of a Ping
+	EndReconnect                       // Reconnect{jitter_ms} from a draining gateway
+	EndKicked                          // Kick{reason}
+	EndPreHandshake                    // closed before the handshake reply
+	EndBusy                            // Busy{retry_after}
+	EndRejected                        // Error{code}
+	EndNoReply                         // closed after the handshake, before LoginResp or Error
+	EndFailed                          // dial, token, persistence or handshake failure
 )
+
+var endNames = map[EndKind]string{EndLost: "lost", EndPongTimeout: "pong-timeout", EndReconnect: "reconnect",
+	EndKicked: "kicked", EndPreHandshake: "pre-handshake", EndBusy: "busy", EndRejected: "rejected",
+	EndNoReply: "no-reply", EndFailed: "failed"}
+
+func (k EndKind) String() string { return endNames[k] }
 
 // end is one ending, with what the server sent.
 type end struct {
-	kind       endKind
-	retryAfter time.Duration       // endBusy; 0: none sent
-	jitter     time.Duration       // endReconnect
-	kick       clientpb.KickReason // endKicked
-	code       clientpb.ErrorCode  // endRejected
-	storedSeq  uint64              // endRejected STALE
+	kind       EndKind
+	retryAfter time.Duration       // EndBusy; 0: none sent
+	jitter     time.Duration       // EndReconnect
+	kick       clientpb.KickReason // EndKicked
+	code       clientpb.ErrorCode  // EndRejected
+	storedSeq  uint64              // EndRejected STALE
 	err        error               // the cause, for events (a failure, an undecodable reply)
 }
 
@@ -130,21 +137,21 @@ func (p *policy) first() clientpb.ReconnectReason {
 // user or the app acts (a Kick, REVOKED).
 func (p *policy) after(e end) (w Wait, ok bool) {
 	switch e.kind {
-	case endLost:
+	case EndLost:
 		return p.wait(WaitStorm, p.w.Storm.Sample(p.r), clientpb.ReconnectReason_RECONNECT_REASON_RST_FIN), true
-	case endPongTimeout:
+	case EndPongTimeout:
 		return p.wait(WaitStorm, p.w.Storm.Sample(p.r), clientpb.ReconnectReason_RECONNECT_REASON_PONG_TIMEOUT), true
-	case endReconnect:
+	case EndReconnect:
 		return p.wait(WaitDrain, Window{0, min(e.jitter, maxDrainJitter)}.Sample(p.r), clientpb.ReconnectReason_RECONNECT_REASON_DRAIN), true
-	case endKicked:
+	case EndKicked:
 		return Wait{}, false
-	case endPreHandshake:
+	case EndPreHandshake:
 		p.other, p.pre = 0, p.pre+1
 		if p.pre > preHandshakeLimit {
 			return p.next(WaitBackoff, 0, clientpb.ReconnectReason_RECONNECT_REASON_BUSY_RETRY), true
 		}
 		return p.wait(WaitPreHandshake, p.w.PreHandshake.Sample(p.r), clientpb.ReconnectReason_RECONNECT_REASON_BUSY_RETRY), true
-	case endRejected:
+	case EndRejected:
 		switch ruleOf(e.code) {
 		case ruleRevoked:
 			return Wait{}, false
@@ -153,11 +160,11 @@ func (p *policy) after(e end) (w Wait, ok bool) {
 		default: // never a fast loop
 			return p.next(WaitBackoff, 0, p.reason), true
 		}
-	case endBusy:
+	case EndBusy:
 		return p.retryable(min(e.retryAfter, p.backoff.Max)), true
-	case endNoReply:
+	case EndNoReply:
 		return p.retryable(0), true
-	default: // endFailed
+	default: // EndFailed
 		return p.next(WaitFailure, 0, p.reason), true
 	}
 }
@@ -168,14 +175,14 @@ func (p *policy) after(e end) (w Wait, ok bool) {
 func (p *policy) anomaly(e end) error {
 	var why error
 	switch {
-	case e.kind == endRejected && ruleOf(e.code) == ruleBackoff:
+	case e.kind == EndRejected && ruleOf(e.code) == ruleBackoff:
 		why = fmt.Errorf("sdk: Login error %v", e.code)
-	case e.kind == endKicked && e.kick != clientpb.KickReason_KICK_REASON_KICKED_BY_OTHER_DEVICE &&
+	case e.kind == EndKicked && e.kick != clientpb.KickReason_KICK_REASON_KICKED_BY_OTHER_DEVICE &&
 		e.kick != clientpb.KickReason_KICK_REASON_REVOKED:
 		why = fmt.Errorf("sdk: Kick %v", e.kick)
-	case e.kind == endBusy && e.retryAfter > p.backoff.Max:
+	case e.kind == EndBusy && e.retryAfter > p.backoff.Max:
 		why = fmt.Errorf("sdk: retry_after %v capped at %v", e.retryAfter, p.backoff.Max)
-	case e.kind == endReconnect && e.jitter > maxDrainJitter:
+	case e.kind == EndReconnect && e.jitter > maxDrainJitter:
 		why = fmt.Errorf("sdk: jitter_ms %v capped at %v", e.jitter, maxDrainJitter)
 	default:
 		return nil

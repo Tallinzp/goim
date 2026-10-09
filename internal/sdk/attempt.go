@@ -14,7 +14,7 @@ import (
 
 // endLogoutResp ends a connection the client logged out of; the policy
 // never sees it.
-const endLogoutResp endKind = 100
+const endLogoutResp EndKind = 100
 
 // attempt is one connection attempt and, once it logs in, the connection.
 // Its goroutine reports to the client's run loop; cancel aborts it.
@@ -64,7 +64,7 @@ func (a *attempt) run(ctx context.Context, cfg *Config, addr string, req *client
 func (a *attempt) login(ctx context.Context, cfg *Config, addr string, req *clientpb.LoginReq) (*clientpb.LoginResp, end) {
 	tok, err := token(ctx, cfg, a.refresh)
 	if err != nil {
-		return nil, end{kind: endFailed, err: err}
+		return nil, end{kind: EndFailed, err: err}
 	}
 	req.Token = tok
 	connectBy := time.Now().Add(cfg.ConnectTimeout) // dial and handshake together
@@ -72,28 +72,28 @@ func (a *attempt) login(ctx context.Context, cfg *Config, addr string, req *clie
 	defer cancel()
 	nc, err := cfg.Dial(dctx, addr)
 	if err != nil {
-		return nil, end{kind: endFailed, err: err}
+		return nil, end{kind: EndFailed, err: err}
 	}
 	context.AfterFunc(ctx, func() { nc.Close() }) // cancel aborts any read or write
 	a.cc = clientconn.New(nc)
 	switch err := a.cc.Handshake(cfg.KeyID, cfg.ServerKey, connectBy); {
 	case errors.Is(err, clientconn.ErrClosedBeforeReply):
 		nc.Close()
-		return nil, end{kind: endPreHandshake, err: err}
+		return nil, end{kind: EndPreHandshake, err: err}
 	case err != nil:
 		nc.Close()
-		return nil, end{kind: endFailed, err: err}
+		return nil, end{kind: EndFailed, err: err}
 	}
 	if err := a.cc.Send(clientpb.Cmd_CMD_LOGIN, 1, req); err != nil {
 		nc.Close()
-		return nil, end{kind: endNoReply, err: err}
+		return nil, end{kind: EndNoReply, err: err}
 	}
 	deadline := time.Now().Add(cfg.LoginTimeout)
 	for {
 		f, err := a.cc.Recv(deadline)
 		if err != nil { // closed, reset, timed out or undecryptable: no reply
 			nc.Close()
-			return nil, end{kind: endNoReply, err: err}
+			return nil, end{kind: EndNoReply, err: err}
 		}
 		if resp, e, done := loginReply(f); done {
 			if resp == nil {
@@ -134,21 +134,21 @@ func loginReply(f clientconn.Frame) (resp *clientpb.LoginResp, e end, done bool)
 	case clientpb.Cmd_CMD_LOGIN_RESP:
 		resp = &clientpb.LoginResp{}
 		if err := f.Decode(resp); err != nil {
-			return nil, end{kind: endNoReply, err: err}, true
+			return nil, end{kind: EndNoReply, err: err}, true
 		}
 		return resp, end{}, true
 	case clientpb.Cmd_CMD_ERROR: // undecodable: code 0, an unknown code
 		var m clientpb.Error
 		err := f.Decode(&m)
-		return nil, end{kind: endRejected, code: m.GetCode(), storedSeq: m.GetStoredConnSeq(), err: err}, true
+		return nil, end{kind: EndRejected, code: m.GetCode(), storedSeq: m.GetStoredConnSeq(), err: err}, true
 	case clientpb.Cmd_CMD_BUSY:
 		var m clientpb.Busy
 		err := f.Decode(&m)
-		return nil, end{kind: endBusy, retryAfter: time.Duration(m.GetRetryAfterMs()) * time.Millisecond, err: err}, true
+		return nil, end{kind: EndBusy, retryAfter: time.Duration(m.GetRetryAfterMs()) * time.Millisecond, err: err}, true
 	case clientpb.Cmd_CMD_KICK: // kick-pending: the Kick replaces the Login reply
 		var m clientpb.Kick
 		err := f.Decode(&m)
-		return nil, end{kind: endKicked, kick: m.GetReason(), err: err}, true
+		return nil, end{kind: EndKicked, kick: m.GetReason(), err: err}, true
 	}
 	return nil, end{}, false
 }
@@ -171,20 +171,20 @@ func (a *attempt) serve(ctx context.Context, cfg *Config, resp *clientpb.LoginRe
 		f, err := a.cc.Recv(time.Time{})
 		if err != nil {
 			if pongTimedOut.Load() {
-				return end{kind: endPongTimeout, err: err}
+				return end{kind: EndPongTimeout, err: err}
 			}
-			return end{kind: endLost, err: err}
+			return end{kind: EndLost, err: err}
 		}
 		lastRecv.Store(int64(time.Since(start)))
 		switch f.Cmd {
 		case clientpb.Cmd_CMD_KICK:
 			var m clientpb.Kick
 			err := f.Decode(&m)
-			return end{kind: endKicked, kick: m.GetReason(), err: err}
+			return end{kind: EndKicked, kick: m.GetReason(), err: err}
 		case clientpb.Cmd_CMD_RECONNECT:
 			var m clientpb.Reconnect
 			err := f.Decode(&m)
-			return end{kind: endReconnect, jitter: time.Duration(m.GetJitterMs()) * time.Millisecond, err: err}
+			return end{kind: EndReconnect, jitter: time.Duration(m.GetJitterMs()) * time.Millisecond, err: err}
 		case clientpb.Cmd_CMD_LOGOUT_RESP:
 			if a.loggingOut.Load() {
 				return end{kind: endLogoutResp}

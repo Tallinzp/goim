@@ -422,21 +422,26 @@ func TestEachEndingIsClassified(t *testing.T) {
 		lo    time.Duration
 		hi    time.Duration
 		after time.Duration // time the ending takes
+		end   EndKind
 	}{
-		{"closed before the handshake reply", func(c *fakeConn) { c.hello() }, WaitPreHandshake, ms(500), ms(1500), 0},
-		{"closed after the handshake, before any reply", func(c *fakeConn) { c.login() }, WaitRetryable, s, 3 * s, 0},
-		{"no reply within LoginTimeout", func(c *fakeConn) { c.login(); c.drain() }, WaitRetryable, s, 3 * s, 10 * s},
+		{"closed before the handshake reply", func(c *fakeConn) { c.hello() }, WaitPreHandshake, ms(500), ms(1500), 0, EndPreHandshake},
+		{"closed after the handshake, before any reply", func(c *fakeConn) { c.login() }, WaitRetryable, s, 3 * s, 0, EndNoReply},
+		{"no reply within LoginTimeout", func(c *fakeConn) { c.login(); c.drain() }, WaitRetryable, s, 3 * s, 10 * s, EndNoReply},
 		{"EXPIRED", func(c *fakeConn) {
 			c.login()
 			c.send(clientpb.Cmd_CMD_ERROR, 1, &clientpb.Error{Code: clientpb.ErrorCode_ERROR_CODE_EXPIRED})
-		}, WaitRetryable, s, 3 * s, 0},
+		}, WaitRetryable, s, 3 * s, 0, EndRejected},
 		{"KEY_UNKNOWN", func(c *fakeConn) {
 			c.login()
 			c.send(clientpb.Cmd_CMD_ERROR, 1, &clientpb.Error{Code: clientpb.ErrorCode_ERROR_CODE_KEY_UNKNOWN})
-		}, WaitRetryable, s, 3 * s, 0},
-		{"Busy without retry_after", func(c *fakeConn) { c.login(); c.send(clientpb.Cmd_CMD_BUSY, 1, &clientpb.Busy{}) }, WaitRetryable, s, 3 * s, 0},
-		{"handshake reply that fails", func(c *fakeConn) { c.hello(); c.nc.Write(make([]byte, 54)) }, WaitFailure, ms(2500), 5 * s, 0},
-		{"no handshake reply within ConnectTimeout", func(c *fakeConn) { c.hello(); c.drain() }, WaitFailure, ms(2500), 5 * s, 10 * s},
+		}, WaitRetryable, s, 3 * s, 0, EndRejected},
+		{"Busy without retry_after", func(c *fakeConn) { c.login(); c.send(clientpb.Cmd_CMD_BUSY, 1, &clientpb.Busy{}) }, WaitRetryable, s, 3 * s, 0, EndBusy},
+		{"Busy with a body that can't be decoded", func(c *fakeConn) {
+			c.login()
+			c.sess.WriteFrame(c.nc, uint16(clientpb.Cmd_CMD_BUSY), 1, []byte{0xff})
+		}, WaitRetryable, s, 3 * s, 0, EndBusy},
+		{"handshake reply that fails", func(c *fakeConn) { c.hello(); c.nc.Write(make([]byte, 54)) }, WaitFailure, ms(2500), 5 * s, 0, EndFailed},
+		{"no handshake reply within ConnectTimeout", func(c *fakeConn) { c.hello(); c.drain() }, WaitFailure, ms(2500), 5 * s, 10 * s, EndFailed},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
@@ -449,9 +454,87 @@ func TestEachEndingIsClassified(t *testing.T) {
 				if w.Kind != tc.kind || w.D < tc.lo || w.D > tc.hi {
 					t.Fatalf("wait %+v, want %v in [%v, %v]", w, tc.kind, tc.lo, tc.hi)
 				}
+				if evs[1].End != tc.end {
+					t.Fatalf("End %v, want %v", evs[1].End, tc.end)
+				}
 			})
 		})
 	}
+}
+
+// Events say what ended the connection (P5I-1): a Busy and a close before
+// any reply wait the same, and loadgen counts them apart. RetryAfter is the
+// server's value before the cap.
+func TestEventsSayWhatEndedTheConnection(t *testing.T) {
+	kick := func(r clientpb.KickReason) func(*fakeConn) {
+		return func(c *fakeConn) { c.online(nil); c.send(clientpb.Cmd_CMD_KICK, 0, &clientpb.Kick{Reason: r}) }
+	}
+	for _, tc := range []struct {
+		name       string
+		serve      func(*fakeConn)
+		kind       EventKind
+		end        EndKind
+		retryAfter time.Duration
+	}{
+		{"connection lost", func(c *fakeConn) { c.online(nil) }, EventWaiting, EndLost, 0},
+		{"Pong timeout", func(c *fakeConn) { c.online(&clientpb.LoginResp{HeartbeatS: 30}); c.drain() }, EventWaiting, EndPongTimeout, 0},
+		{"Reconnect", func(c *fakeConn) {
+			c.online(nil)
+			c.send(clientpb.Cmd_CMD_RECONNECT, 0, &clientpb.Reconnect{JitterMs: 1000})
+			c.drain()
+		}, EventWaiting, EndReconnect, 0},
+		{"Kick", kick(clientpb.KickReason_KICK_REASON_KICKED_BY_OTHER_DEVICE), EventIdle, EndKicked, 0},
+		{"Kick REVOKED", kick(clientpb.KickReason_KICK_REASON_REVOKED), EventLoginRequired, EndKicked, 0},
+		{"Error REVOKED", func(c *fakeConn) {
+			c.login()
+			c.send(clientpb.Cmd_CMD_ERROR, 1, &clientpb.Error{Code: clientpb.ErrorCode_ERROR_CODE_REVOKED})
+		}, EventLoginRequired, EndRejected, 0},
+		{"Busy over the cap", func(c *fakeConn) {
+			c.login()
+			c.send(clientpb.Cmd_CMD_BUSY, 1, &clientpb.Busy{RetryAfterMs: uint32((10 * time.Minute).Milliseconds())})
+		}, EventWaiting, EndBusy, 10 * time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newFake(t, func(n int, c *fakeConn) {
+					if n == 1 {
+						tc.serve(c)
+						return
+					}
+					c.drain()
+				})
+				c, r := testClient(t, f, &MemStore{}, nil)
+				c.Connect()
+				time.Sleep(time.Minute)
+				var got *Event
+				for _, e := range r.take() {
+					if e.Kind == tc.kind {
+						got = &e
+						break
+					}
+				}
+				if got == nil || got.End != tc.end || got.RetryAfter != tc.retryAfter {
+					t.Fatalf("event %+v, want %v with End %v, RetryAfter %v", got, tc.kind, tc.end, tc.retryAfter)
+				}
+			})
+		})
+	}
+}
+
+// A failure before any dial (a failed Save) ends nothing it dialled, but
+// is still EndFailed.
+func TestFailedSaveIsAnEndFailed(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := &MemStore{}
+		f := newFake(t, func(_ int, c *fakeConn) { c.drain() })
+		c, r := testClient(t, f, store, nil)
+		store.Err = errors.New("disk full")
+		c.Connect()
+		evs := expect(t, r.take(), EventAnomaly, EventWaiting)
+		if evs[1].End != EndFailed {
+			t.Fatalf("End %v, want %v", evs[1].End, EndFailed)
+		}
+	})
 }
 
 // The counters run across real attempts: 10 quick pre-handshake retries,

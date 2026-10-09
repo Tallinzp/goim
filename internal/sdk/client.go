@@ -86,9 +86,13 @@ type Event struct {
 	Attempt Attempt             // EventConnecting
 	Resp    *clientpb.LoginResp // EventOnline
 	Wait    Wait                // EventWaiting
-	Kick    clientpb.KickReason // the Kick that caused it, if any
-	Code    clientpb.ErrorCode  // the Login error that caused it, if any
-	Err     error               // the failure that caused it, if any
+	// End is what ended the attempt or connection that caused it, if any:
+	// on EventWaiting, EventIdle and EventLoginRequired (P5I-1).
+	End        EndKind
+	RetryAfter time.Duration       // EndBusy: the server's retry_after before the cap; 0: none sent
+	Kick       clientpb.KickReason // the Kick that caused it, if any
+	Code       clientpb.ErrorCode  // the Login error that caused it, if any
+	Err        error               // the failure that caused it, if any
 }
 
 // Client holds at most one connection for one device_id (spec: device_id)
@@ -340,8 +344,8 @@ func (c *Client) start(reason clientpb.ReconnectReason) {
 // fail is a failure before any attempt: an anomaly, then a failure backoff.
 func (c *Client) fail(err error) {
 	c.emit(Event{Kind: EventAnomaly, Err: err})
-	w, _ := c.pol.after(end{kind: endFailed, err: err})
-	c.schedule(w, Event{Err: err})
+	w, _ := c.pol.after(end{kind: EndFailed, err: err})
+	c.schedule(w, Event{End: EndFailed, Err: err})
 }
 
 func (c *Client) handle(m attemptMsg) {
@@ -373,11 +377,11 @@ func (c *Client) handle(m attemptMsg) {
 	}
 	triggered := c.cur.triggered && !c.online
 	c.cur, c.online = nil, false
-	ev := Event{Kick: e.kick, Code: e.code, Err: e.err}
-	if e.kind == endRejected {
+	ev := Event{End: e.kind, RetryAfter: e.retryAfter, Kick: e.kick, Code: e.code, Err: e.err}
+	if e.kind == EndRejected {
 		c.refresh = e.code == clientpb.ErrorCode_ERROR_CODE_TOKEN_INVALID
 	}
-	if e.kind == endRejected && e.code == clientpb.ErrorCode_ERROR_CODE_STALE {
+	if e.kind == EndRejected && e.code == clientpb.ErrorCode_ERROR_CODE_STALE {
 		// Set the counter to max(local, stored); the next attempt adds 1.
 		c.st.ConnSeq = max(c.st.ConnSeq, e.storedSeq)
 		if err := c.cfg.Store.Save(c.st); err != nil {
@@ -388,7 +392,7 @@ func (c *Client) handle(m attemptMsg) {
 		c.emit(Event{Kind: EventAnomaly, Kick: e.kick, Code: e.code, Err: err})
 	}
 	revoked := e.kick == clientpb.KickReason_KICK_REASON_REVOKED ||
-		(e.kind == endRejected && e.code == clientpb.ErrorCode_ERROR_CODE_REVOKED)
+		(e.kind == EndRejected && e.code == clientpb.ErrorCode_ERROR_CODE_REVOKED)
 	if w, ok := c.pol.after(e); ok {
 		if lw, cut := c.pol.local(w); triggered && cut {
 			w = lw
