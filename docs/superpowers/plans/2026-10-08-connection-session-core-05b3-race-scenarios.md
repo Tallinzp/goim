@@ -1789,3 +1789,11 @@ Minors M1–M5, fixed afterwards at the user's request in `bcb46ce`:
 - **M5** `forceSweep` waits until a renewal has hit the fault (renewals are serial) before deleting the lease. `TestForceSweepWaitsOutARenewalInFlight` (a renewal held in an 800ms delay) failed 5/5 before, passes 5/5 after.
 
 Full suite after the fixes: `make test-race-suite` green (58 tests, ~278s), `go vet ./...` and `make test` green.
+
+**Tier 2 run 10 (2026-10-09, `make test-tier2 SCENARIO=race`, commit 962b05d, 24 cores / 26GB, Linux 7.0, Go 1.27.1, Redis 7.4.11 from `make redis-server`): all four checks pass.**
+- **tests** and **all_ran:** 58 listed, 58 passed, in 273s. That is the same as the 2-core dev machine, since the scenarios are bound by the profile's timings, not by CPU.
+- **mutation:** with fence (a) removed, `TestRace5CloseWhileLoginInFlight` fails as intended ("the fenced Logout deleted it").
+- **redis:** the suite ran on 7.4.11.
+- **Timings logged:** `TestEndedEpochIsSweptAtOnce` swept 0.40s after EpochEnded, and the stale-lease observation was corrected 0.93s after gw-1 renewed.
+- The host tree had one changed file ("dirty: 1"), which the report does not name.
+- Still not covered: Redis Cluster, and a real network between the processes.
