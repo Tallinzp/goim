@@ -21,7 +21,7 @@
 - Spec, race integration tests: "`deploy/compose`: Redis, Logic, **4 gateways** and a scripted client; Tier 1b, test timing profile". Choice #47 replaces compose with local processes; #62 makes Redis local processes too: a `redis-server` primary and replica per scenario, on the dev machine and at Tier 2 (`make test-tier2 SCENARIO=race`).
 - Tier 1b runs "before every commit / merge" on the dev machine (2 cores / 2GB). Docker is never installed there (user decision 2026-10-07); `redis-server` built from source is (the user's decision at the Plan 5b review, 2026-10-08), for the race suite and for `make test-redis-local`.
 - Tier 2 automation contract: one entry point per scenario, a host guard (`nproc`, memory), teardown always runs, machine-readable JSON with pass/fail and a matching exit code.
-- Roadmap choices #1–#57 apply; this plan's choices are #58–#64 below.
+- Roadmap choices #1–#57 apply; Plan 5b's choices are #58–#64, in 5b1's *Implementation choices*.
 
 ## Review Focus
 
@@ -1763,4 +1763,4 @@ Every race integration test in the spec runs on the dev machine before each comm
 
 Plan 6 builds `cmd/loadgen` and the Tier 2/3 load scenarios. It can reuse the harness's process and port handling and the fault API (a slowed Logic), and it decides the client per load test as P5I-2 records.
 
-The open risks are listed in *Execution Notes*.
+The open risks are listed in 5b1's *Execution Notes*.

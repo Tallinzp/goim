@@ -78,7 +78,7 @@ The spec leaves these open. Each one is restated in the task that implements it.
 
 ## Execution Notes
 
-- **Branch:** the branches keep stacking (the user's decision, 2026-10-08). Plan 5b branches from Plan 5a: `git checkout -b feat/plan5b-race feat/plan5a-sdk`. Commit this plan and the roadmap edit before Task 1, so the branch diff holds only Plan 5b's code.
+- **Branch:** the branches keep stacking (the user's decision, 2026-10-08). Plan 5b branches from Plan 5a: `git checkout -b feat/plan5b-race feat/plan5a-sdk`. The plan and the roadmap edit were committed before Task 1 (ed43cfb; split into 5b1/5b2/5b3 in 47ac512), so the branch diff holds only Plan 5b's code.
 - **Prototype:** every code block in this plan was compiled and run before the plan was written. The whole plan was built in a scratch clone of `22b1b95`, then the rendered plan was replayed into a second clone, task by task, one commit per task, by a script that applies only what this document says. `go vet ./...` passed after each task (it compiles every test file, so no task uses what a later one defines), and the replay's final tree matched the prototype byte for byte. Full runs on the dev machine:
   - Run 1 failed once on a port collision (finding 4).
   - Run 2 passed.
