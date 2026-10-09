@@ -65,7 +65,8 @@ t2_json_str() {
   s=${s//$'\n'/\\n}
   s=${s//$'\r'/\\r}
   s=${s//$'\t'/\\t}
-  s=$(printf '%s' "$s" | tr -d '\000-\010\013\014\016-\037')
+  # Control bytes and invalid UTF-8 (log tails of a crashing process) are dropped.
+  s=$(printf '%s' "$s" | tr -d '\000-\010\013\014\016-\037' | iconv -c -f utf-8 -t utf-8 2>/dev/null)
   printf '"%s"' "$s"
 }
 
@@ -395,15 +396,26 @@ t2_host_setup_missing() {
   cmp -s "$dir/goim-netdrop" "$netdrop" || echo "$netdrop is missing or differs from scripts/tier2/goim-netdrop"
 }
 
+# t2_netdrop_leftover RULES: refuses (returns 1) when goim-netdrop rules are
+# left, e.g. by a SIGKILLed run: they would silently drop the new stack's ports.
+t2_netdrop_leftover() {
+  if [ -n "$1" ]; then
+    printf 'refused: goim-netdrop rules left by an earlier run:\n%s\nremove them: sudo -n /usr/local/sbin/goim-netdrop flush\n' "$1"
+    return 1
+  fi
+}
+
 # t2_require_host_setup: load scenarios call it after t2_init; refuses
-# (exit 2) until host-setup.sh has run with this checkout's files.
+# (exit 2) until host-setup.sh has run with this checkout's files, and while
+# an earlier run's DROP rules are left.
 t2_require_host_setup() {
-  local missing
+  local missing rules why
   missing=$(t2_host_setup_missing scripts/tier2 /proc/sys /sys/module /usr/local/sbin/goim-netdrop)
-  if [ -z "$missing" ] && ! sudo -n /usr/local/sbin/goim-netdrop list >/dev/null 2>&1; then
+  if [ -z "$missing" ] && ! rules=$(sudo -n /usr/local/sbin/goim-netdrop list 2>/dev/null); then
     missing="sudo -n /usr/local/sbin/goim-netdrop fails (no sudoers line?)"
   fi
   if [ -n "$missing" ]; then
     t2_refuse "$(printf 'refused: the host is not set up for load tests:\n%s\nrun once: sudo scripts/tier2/host-setup.sh' "$missing")"
   fi
+  why=$(t2_netdrop_leftover "$rules") || t2_refuse "$why"
 }

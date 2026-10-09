@@ -37,7 +37,7 @@ rule() { echo "-i lo -p tcp --$1 $port -m comment --comment $TAG -j DROP"; }
 case $cmd in
   add|del)
     [ $# -eq 2 ] || usage
-    case $port in ''|*[!0-9]*) usage ;; esac
+    case $port in ''|0*|*[!0-9]*) usage ;; esac # iptables reads 0NNN as octal
     { [ "$port" -ge 1024 ] && [ "$port" -le 65535 ]; } || usage
     if [ $print = 1 ]; then
       for dir in dport sport; do

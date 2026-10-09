@@ -62,7 +62,9 @@ stack_wait() {
   return 1
 }
 
-stack_port_free() { ! (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+# stack_port_free PORT: true only if a connect is refused at once; a connect
+# that hangs (a DROP rule) counts as busy instead of blocking for minutes.
+stack_port_free() { timeout 2 bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$0"' "$1" 2>/dev/null; [ $? -eq 1 ]; }
 
 stack_up() {
   : "${STACK_DIR:?set STACK_DIR}"

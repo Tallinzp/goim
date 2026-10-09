@@ -41,6 +41,8 @@ fi
 
 # JSON strings.
 expect "json: escapes" "$(t2_json_str $'a"b\\c\nd\te\001')" '"a\"b\\c\nd\te"'
+expect "json: invalid UTF-8 is dropped" "$(t2_json_str $'a\xffb\xc3')" '"ab"'
+expect "json: UTF-8 is kept" "$(t2_json_str 'é—x')" '"é—x"'
 
 # fake_run BODY: a scenario run without t2_init; prints its exit code.
 fake_run() {
@@ -150,15 +152,22 @@ contains "setup check: one low tcp_mem field" "$m" "sysctl net.ipv4.tcp_mem is 1
 contains "setup check: module" "$m" "module ip_vs is not loaded"
 contains "setup check: outdated helper" "$m" "differs from scripts/tier2/goim-netdrop"
 expect "setup check: nothing else" "$(echo "$m" | wc -l)" 4
+t2_netdrop_leftover "" >/dev/null; expect "leftover: no rules pass" "$?" 0
+why=$(t2_netdrop_leftover "-A INPUT -i lo -p tcp -m tcp --dport 17100 -m comment --comment goim-netdrop -j DROP"); expect "leftover: a rule is refused" "$?" 1
+contains "leftover: says how to remove it" "$why" "sudo -n /usr/local/sbin/goim-netdrop flush"
 
 # goim-netdrop prints its rules and refuses anything else.
 expect "netdrop: add" "$(scripts/tier2/goim-netdrop --print add 21100)" \
 "iptables -w -I INPUT -i lo -p tcp --dport 21100 -m comment --comment goim-netdrop -j DROP
 iptables -w -I INPUT -i lo -p tcp --sport 21100 -m comment --comment goim-netdrop -j DROP"
 contains "netdrop: del" "$(scripts/tier2/goim-netdrop --print del 21100)" "iptables -w -D INPUT -i lo -p tcp --dport 21100"
-for bad_args in "add 80" "add 70000" "add 21100x" "add" "add 1 2" "drop 21100" "--print flush"; do
+for bad_args in "add 80" "add 01167" "add 70000" "add 21100x" "add" "add 1 2" "drop 21100" "--print flush"; do
   # shellcheck disable=SC2086
   scripts/tier2/goim-netdrop $bad_args >/dev/null 2>&1; expect "netdrop: refuses '$bad_args'" "$?" 2
 done
+
+# make test-tier2 shows the script's own exit code (make itself exits 2 on any failure).
+out=$(GOIM_TEST_TIER= make -s test-tier2 SCENARIO=race 2>&1)
+contains "make: shows the scenario's exit code" "$out" "test-tier2: race exited 2"
 
 [ "$fails" -eq 0 ] && echo "lib_test: all passed" || { echo "lib_test: $fails failed"; exit 1; }
