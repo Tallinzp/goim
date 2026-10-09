@@ -257,7 +257,6 @@ func TestCloseInsideACoreCallIsReportedAfterIt(t *testing.T) {
 func TestSlowConsumerIsClosedAtTheOutboundCap(t *testing.T) {
 	s := newServer(t, func(_ *gateway.Config, tc *Config) { tc.MaxOutbound = wire.HeaderLen + wire.MaxLength })
 	c := s.online("u1")
-	c.nc.(*net.TCPConn).SetReadBuffer(4096)
 	deadline := time.Now().Add(8 * time.Second)
 	for id := uint32(10); s.closes(closeSlowConsumer) == 0; {
 		if time.Now().After(deadline) {
