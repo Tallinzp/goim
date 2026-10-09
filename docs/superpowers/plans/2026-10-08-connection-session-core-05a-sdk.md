@@ -162,7 +162,14 @@ The spec leaves these open. Each one is restated in the task that implements it.
   9. `New`'s store events come from the run loop. Why: `OnEvent`'s one-goroutine guarantee had an exception.
 
   The prototype was rebuilt from this plan's code blocks (they reproduced the reviewed tree and its green suite), the changes were made and tested there, and the blocks were written back from it; extracting them again gives the prototype byte for byte. The full suite passed under `-race`, and the SDK and `clientconn` packages three more times.
-- **Execution mode:** to be chosen before Task 1. Plans 1–4 ran Native.
+- **Execution mode:** Native (inline), like Plans 1–4.
+- **Implemented 2026-10-08** on `feat/plan5a-sdk`: plan commit 0905cb5, task commits 49759b4..1087c51, one per task, code blocks applied byte for byte, no deviations. Each task's test failed first (build failure), except Task 6, which adds tests only and passed at once as planned. Full suite green under `-race`.
+- **Final review (fresh Opus, 2026-10-08):** no Critical.
+  - Fixed: two goroutines calling `Close` at once panicked with "close of closed channel" (re-graded Minor→Important, an app crash); `quit` is closed under a `sync.Once`, `TestConcurrentCloseDoesNotPanic` (42f4c2a).
+  - **Open for the user (amend a decided choice or keep it):**
+    - I1 (Important), against #51: a network change that arrives while an attempt is in flight is dropped. If that attempt then fails, the failure backoff it schedules (up to 5m at high step counts) is not cut, so a phone whose network came back can stay offline up to 5m (~10% of recoveries at high backoff: ~20s in flight against a 150–300s wait). Proposed: remember a local trigger seen while an attempt is in flight and not online; if that attempt ends as a failure, schedule the local window instead of the failure backoff.
+    - M2, against #50 ("the step count restarts only at a successful login"): backoff steps and both counters survive `Logout` and `SwitchAccount`, so a newly switched account's first transient failure can wait up to 5m. Proposed: reset the policy in `logout()`.
+  - Deferred minors: M1 the backoff shift overflows for a `Backoff.Base` ≥ ~8.6s at step 31 (one 0s wait; the 5s default is safe); M4 `Send` has no write deadline, so a blocked `Send` would stall the Pong check once sub-project 2 sends large frames on the same `Conn` (Pings alone can't block).
 - **Tests and timing.** `internal/clientconn` takes ~1.3s, over real TCP on 127.0.0.1. The SDK unit tests take ~1.5s under `-race`, on fake time. The end-to-end file takes ~10s on real time: each test starts Logic on miniredis and one or two gnet gateways, and two tests watch 2s for a reconnect that must not happen.
 - **Not verified at Tier 1a, and where each is closed:**
   1. **Real mobile networks.** Radio wake-up, NAT rebinding, OS network-change events and background limits are the native SDKs' to test. This SDK only defines the rules.
