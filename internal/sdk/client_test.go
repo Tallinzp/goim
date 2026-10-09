@@ -944,3 +944,52 @@ func TestConcurrentCloseDoesNotPanic(t *testing.T) {
 		wg.Wait()
 	}
 }
+
+// Choice #51 (amended, final review I1): a network change while an attempt
+// is in flight is remembered. If that attempt fails, the failure backoff it
+// would schedule is cut to the local window, once.
+func TestNetworkChangeDuringAFailingAttemptCutsItsBackoff(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newFake(t, func(n int, c *fakeConn) {
+			if n <= 2 {
+				c.hello()
+				c.drain() // blackholed: no handshake reply
+				return
+			}
+			c.online(nil)
+			c.pong()
+		})
+		c, r := testClient(t, f, &MemStore{}, nil)
+		c.Connect()
+		time.Sleep(5 * time.Second)
+		c.NetworkChanged() // the attempt is still waiting for its handshake reply
+		time.Sleep(5 * time.Second)
+		evs := expect(t, r.take(), EventConnecting, EventWaiting)
+		within(t, "after the trigger", evs[1].Wait, WaitLocal, 0, s, reasonLocal)
+		time.Sleep(evs[1].Wait.D + 10*time.Second) // the second attempt is blackholed too
+		evs = expect(t, r.take(), EventConnecting, EventWaiting)
+		if evs[1].Wait.Kind != WaitFailure {
+			t.Fatalf("second wait %+v, want a failure backoff: the trigger is used once", evs[1].Wait)
+		}
+	})
+}
+
+// The remembered trigger never cuts a server's answer (spec: Precedence).
+func TestNetworkChangeDuringAnAttemptDoesNotCutRetryAfter(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newFake(t, func(n int, c *fakeConn) {
+			c.login()
+			time.Sleep(3 * time.Second)
+			c.send(clientpb.Cmd_CMD_BUSY, 1, &clientpb.Busy{RetryAfterMs: 2000})
+		})
+		c, r := testClient(t, f, &MemStore{}, nil)
+		c.Connect()
+		time.Sleep(time.Second)
+		c.NetworkChanged()
+		time.Sleep(3 * time.Second)
+		evs := expect(t, r.take(), EventConnecting, EventWaiting)
+		if w := evs[1].Wait; w.Kind != WaitRetryable || w.D != 2*time.Second {
+			t.Fatalf("wait %+v, want retry_after 2s", w)
+		}
+	})
+}

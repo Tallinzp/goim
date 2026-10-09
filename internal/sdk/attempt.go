@@ -23,6 +23,7 @@ type attempt struct {
 	refresh    bool             // Token's refresh argument
 	cc         *clientconn.Conn // set before the attempt reports it is online
 	loggingOut atomic.Bool      // the client sent Logout: LogoutResp ends the connection
+	triggered  bool             // run loop: a local trigger came before the Login was answered
 }
 
 // attemptMsg is what an attempt's goroutine reports: online (resp set),

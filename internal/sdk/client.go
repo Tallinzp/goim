@@ -293,6 +293,10 @@ func (c *Client) local(foreground bool) {
 			c.stopWait()
 			c.schedule(w, Event{})
 		}
+	case c.cur != nil && !c.online:
+		// Remembered: if this attempt fails, its failure backoff is cut
+		// (choice #51, amended).
+		c.cur.triggered = true
 	case c.cur == nil && foreground && c.idleKick == clientpb.KickReason_KICK_REASON_REPLACED:
 		c.idleKick = 0
 		c.schedule(c.pol.localWait(), Event{})
@@ -367,6 +371,7 @@ func (c *Client) handle(m attemptMsg) {
 	if c.online {
 		c.lostAt = time.Now() // the client detected the loss now (offline_ms)
 	}
+	triggered := c.cur.triggered && !c.online
 	c.cur, c.online = nil, false
 	ev := Event{Kick: e.kick, Code: e.code, Err: e.err}
 	if e.kind == endRejected {
@@ -385,6 +390,9 @@ func (c *Client) handle(m attemptMsg) {
 	revoked := e.kick == clientpb.KickReason_KICK_REASON_REVOKED ||
 		(e.kind == endRejected && e.code == clientpb.ErrorCode_ERROR_CODE_REVOKED)
 	if w, ok := c.pol.after(e); ok {
+		if lw, cut := c.pol.local(w); triggered && cut {
+			w = lw
+		}
 		c.schedule(w, ev)
 		return
 	}
