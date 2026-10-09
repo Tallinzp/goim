@@ -77,6 +77,7 @@ type Conn struct {
 
 	inChunk      bool // in a Reconcile chunk not yet resolved (fence c)
 	logoutQueued bool
+	reconnected  bool // Reconnect sent (drain): once per connection
 }
 
 // ID returns the conn_id.

@@ -54,3 +54,27 @@ func TestNoLeaseRenewalAfterEpochEnded(t *testing.T) {
 		t.Fatalf("%d GatewayLease calls after EpochEnded", m-n)
 	}
 }
+
+// A Login that completes as the drain starts gets one Reconnect, not one
+// from online() and another from the drain's pass over ONLINE connections
+// (found by Plan 5b's TestDrainingGatewayStillReceivesKicks).
+func TestDrainSendsOneReconnectToALoginCompletingAsItStarts(t *testing.T) {
+	h := newCore(t, func(c *Config) { c.Drain.Window, c.Drain.Flush = time.Second, 0 })
+	k := h.authed(0)
+	it := h.login(k, "u1")
+	it.state.Store(itemSent)
+	h.g.draining.Store(true) // the drain's first step; its pass over the loops comes after
+	h.reply(it, loginReply{outcome: loginOK, label: "ok", uid: "u1", tokIatMs: 1})
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	h.g.Drain(ctx)
+	n := 0
+	for _, f := range k.sent() {
+		if f.cmd == clientpb.Cmd_CMD_RECONNECT {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("%d Reconnect frames, want 1", n)
+	}
+}

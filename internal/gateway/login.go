@@ -139,6 +139,10 @@ func (w Window) pb() *clientpb.Window {
 // reconnect sends Reconnect{jitter_ms} (spec: Graceful drain); the client
 // closes and reconnects elsewhere.
 func (g *Gateway) reconnect(c *Conn) {
+	if c.reconnected {
+		return // a Login completing as the drain starts is seen by both online() and the drain's pass
+	}
+	c.reconnected = true
 	g.send(c, clientpb.Cmd_CMD_RECONNECT, 0, &clientpb.Reconnect{JitterMs: uint32(g.cfg.Drain.Jitter.Milliseconds())})
 }
 
