@@ -63,7 +63,7 @@ The spec leaves these open. Each one is restated in the task that implements it.
 63. **Clock skew** (R4M-5, P4I-5). `-clock-offset` shifts the gateway's clock by a fixed amount at start; it also drives the timing wheel, so a step at run time would fire timers early.
     - +2s fires the skew alert.
     - −5s makes the gateway's Logins `EXPIRED`, and the client logs in elsewhere.
-    - The late-write ghost uses **+5s, not the spec's +2s** (amended at the review from the +3s first proposed). Fence (b) fires 6–8s after recv: the wheel rounds a deadline up to a whole second, and the 1s ticker that advances it has its own phase (finding 12). +5s puts the Lua deadline at 10s of real time, and the Login held 9s lands a second clear of both the latest fence and the deadline. With +2s the deadline is 7s, so a write after the fence fits only in some runs; with +3s and a 7.5s hold it failed once in three full runs. The repair path checked is the same at any offset.
+    - The late-write ghost uses **+5s, not the spec's +2s** (amended at the review from the +3s first proposed). Fence (b) fired 6–8s after recv: the wheel rounds a deadline up to a whole second, and the 1s ticker that advanced it had its own phase (finding 12; the ticker now wakes on the second, so 6–7s). +5s puts the Lua deadline at 10s of real time, and the Login held 9s lands a second clear of both the latest fence and the deadline. With +2s the deadline is 7s, so a write after the fence fits only in some runs; with +3s and a 7.5s hold it failed once in three full runs. The repair path checked is the same at any offset.
 64. **Tier 2 entry point.** `make test-tier2 SCENARIO=race` runs `scripts/tier2/race.sh` with four checks:
     - every scenario passes;
     - every listed scenario ran (no skips);
@@ -125,7 +125,7 @@ The spec leaves these open. Each one is restated in the task that implements it.
   9. *Rule 1 is checked twice.* Removing rule 1 from Logic's Go code alone is not caught: the compare-and-set Lua re-checks it (choice #4) and returns `REVOKED`. The `rule1` mutant removes both.
   10. *A gateway bug: two Reconnects.* The drain scenario failed about once in ten runs with a second `Reconnect` before the Kick. A Login completing as the drain starts was reconnected by `online()` and again by the drain's pass. Task 9 fixes it; the scenario expects exactly one.
   11. *Two scenario races found by the fault check and by repetition.* The stale-lease scenario's "starve gw-1" rule sometimes never fired: the overwrite could happen before gw-1's next renewal, so the starvation was not exercised. It now waits until the block has fired once before removing the lease key. The drain scenario read Logic's Kick metric before the RPC had returned (the client sees the Kick first); it now polls.
-  12. *The wheel fires up to 2s late, not 1s* (found at the review, on `redis-server`). Full run 8 failed `TestClockAheadAlertsAndItsLateWriteIsCleanedUp` once: the connection was still tracked when the ghost appeared. Polling the gateway's `tracked` gauge over 15 runs showed fence (b) untracking at 6.92–7.00s after recv in 13 runs and at 7.92–7.99s in 2, together with Busy (both are 6s wheel timers). The cause: `wheel.schedule` rounds a deadline up to a whole second of the clock, and `advance` runs from a 1s `time.Ticker` with an unrelated phase, so a timer fires 0–2s late (`wheel.go` says up to one tick). Firing late is safe for every fence and timeout, and the SDK's 10s Login timeout is above the 8s worst case for Busy, so the gateway is not changed. The scenario moved from +3s / 7.5s to +5s / 9s (choice #63); its window had 0.5s of margin, and a late tick took all of it. With the wider window it passed 10 of 10 runs alone and every full run after. *For the user:* the `wheel.go` comment, and Plan 3's "fires at most one tick late", should say 0–2s; a fix would align the ticker to the second, which this plan does not do.
+  12. *The wheel fires up to 2s late, not 1s* (found at the review, on `redis-server`). Full run 8 failed `TestClockAheadAlertsAndItsLateWriteIsCleanedUp` once: the connection was still tracked when the ghost appeared. Polling the gateway's `tracked` gauge over 15 runs showed fence (b) untracking at 6.92–7.00s after recv in 13 runs and at 7.92–7.99s in 2, together with Busy (both are 6s wheel timers). The cause: `wheel.schedule` rounds a deadline up to a whole second of the clock, and `advance` runs from a 1s `time.Ticker` with an unrelated phase, so a timer fires 0–2s late (`wheel.go` says up to one tick). Firing late is safe for every fence and timeout, and the SDK's 10s Login timeout is above the 8s worst case for Busy. The scenario moved from +3s / 7.5s to +5s / 9s (choice #63); its window had 0.5s of margin, and a late tick took all of it. With the wider window it passed 10 of 10 runs alone and every full run after. *Fixed after the review, before Task 1* (the user's request): `runTicker` now wakes just after each whole second of the gateway's clock (`untilNextTick`), so a timer fires at most one tick late, as Plan 3 meant; `TestRunningWheelFiresAtMostOneTickLate` failed 3 of 4 runs without it. The +5s / 9s window stays: it now has 2s of margin after the fence instead of 1s. The full suite passed on the prototype with the fix (56 tests).
 - **Spec test map** (*Verification → Race integration tests*): every bullet of the spec's list, in its order.
   - Races 1, 2, 3, 5, 10: `TestRace1DelayedDisconnect`, `TestRace2DelayedLoginSameDeviceIsStale`, `TestRace2LoginPastTheDeadlineIsExpired`, `TestRace3DelayedLoginOtherDeviceIsSuperseded`, `TestRace5CloseWhileLoginInFlight`, `TestRace10SharedDeviceIDReplacesOnce`. Race 4: `TestRace4ZombieGatewayKickForTheOldEpochIsIgnored`.
   - Race 6 in both orders, and with a Logic crash: `TestRace6WrittenWithoutReplyLoginBeforeLogout`, `TestRace6WrittenWithoutReplyLogoutBeforeLogin`, `TestRace6LogicCrashLogoutWaitsForTheFence`.
@@ -5557,10 +5557,10 @@ import (
 // more than the 1s skew allowance can also see a Login written after its
 // fence (b) released the Logout: the Lua's deadline runs on the gateway's
 // recv_ms, the fence on its wheel. That ghost is deleted by the next pass's
-// delete phase. The ghost uses +5s: the fence fires 6–8s after recv (the
-// wheel rounds the deadline up to a whole second, and its 1s ticker has its
-// own phase), and +5s puts the Lua deadline at 10s of real time, so a write
-// at 9s lands a second clear of both.
+// delete phase. The ghost uses +5s: the fence fires 6–7s after recv (the
+// wheel rounds the deadline up to a whole second), and +5s puts the Lua
+// deadline at 10s of real time, so a write at 9s lands well after the fence
+// and a second before the deadline.
 func TestClockAheadAlertsAndItsLateWriteIsCleanedUp(t *testing.T) {
 	s := New(t, Options{})
 	s.GW[0].kill()
@@ -5572,7 +5572,7 @@ func TestClockAheadAlertsAndItsLateWriteIsCleanedUp(t *testing.T) {
 			s.logicMetric(`goim_logic_clock_skew_alert{gw="gw-1"}`) == 1
 	})
 	const uid = "sk1"
-	// The Login reaches Redis 9s after recv: after the fence (at most 8s)
+	// The Login reaches Redis 9s after recv: after the fence (at most 7s)
 	// and inside the Lua deadline, 10s of real time with recv_ms 5s ahead.
 	s.LogicFault(fault.Rule{Op: logic.FaultLogin, Key: uid, Delay: dur(9 * time.Second), Count: 1})
 	if f := s.Dial(1).Login(s.Req(uid, "d1", 1)); f.Cmd != clientpb.Cmd_CMD_BUSY {
