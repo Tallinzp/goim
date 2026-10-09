@@ -138,6 +138,8 @@ func parseFlags(args []string) (gateway.Config, gateway.ServerConfig, tcp.Config
 	fs.DurationVar(&cfg.HandshakeTimeout, "handshake-timeout", cfg.HandshakeTimeout, "accept → handshake done (3s–30s)")
 	fs.DurationVar(&cfg.AuthTimeout, "auth-timeout", cfg.AuthTimeout, "handshake done → LoginReq (3s–30s)")
 	fs.DurationVar(&cfg.Heartbeat, "heartbeat", cfg.Heartbeat, "heartbeat interval sent in LoginResp")
+	fs.DurationVar(&cfg.HeartbeatMin, "heartbeat-min", cfg.HeartbeatMin, "lowest allowed -heartbeat; the same as the SDK's range")
+	fs.DurationVar(&cfg.HeartbeatMax, "heartbeat-max", cfg.HeartbeatMax, "highest allowed -heartbeat; the same as the SDK's range")
 	fs.DurationVar(&cfg.LoginDeadline, "login-deadline", cfg.LoginDeadline, "login_deadline, as Logic's (not scaled by the test profile)")
 	fs.DurationVar(&cfg.LoginTimeout, "login-timeout", cfg.LoginTimeout, "per-entry Login timeout from recv_ms")
 	fs.DurationVar(&cfg.LeaseInterval, "lease-interval", cfg.LeaseInterval, "GatewayLease period")

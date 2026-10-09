@@ -34,6 +34,8 @@ type Config struct {
 	HandshakeTimeout time.Duration // accept → handshake done (5s, 3–30s)
 	AuthTimeout      time.Duration // handshake done → LoginReq (5s, 3–30s)
 	Heartbeat        time.Duration // sent in LoginResp; dead after 2× + 10s (150s)
+	HeartbeatMin     time.Duration // Heartbeat range, as the SDK's (30s); the test profile lowers it
+	HeartbeatMax     time.Duration // (300s, below a 350s LB idle timeout)
 
 	LoginDeadline time.Duration // login_deadline, the same value as Logic's (5s)
 	LoginTimeout  time.Duration // per entry from recv_ms, ≥ LoginDeadline + 1s (6s)
@@ -108,6 +110,8 @@ func DefaultConfig() Config {
 		HandshakeTimeout: 5 * time.Second,
 		AuthTimeout:      5 * time.Second,
 		Heartbeat:        150 * time.Second,
+		HeartbeatMin:     30 * time.Second,
+		HeartbeatMax:     300 * time.Second,
 		LoginDeadline:    5 * time.Second,
 		LoginTimeout:     6 * time.Second,
 		LoginBatch:       200,
@@ -186,6 +190,11 @@ func (c Config) Validate() error {
 	}
 	if c.Heartbeat < time.Second || c.Heartbeat%time.Second != 0 {
 		bad("Heartbeat %v must be a whole number of seconds (LoginResp carries seconds)", c.Heartbeat)
+	}
+	if c.HeartbeatMin < time.Second || c.HeartbeatMin > c.HeartbeatMax {
+		bad("HeartbeatMin %v and HeartbeatMax %v need 1s ≤ min ≤ max", c.HeartbeatMin, c.HeartbeatMax)
+	} else if c.Heartbeat < c.HeartbeatMin || c.Heartbeat > c.HeartbeatMax {
+		bad("Heartbeat %v outside [%v, %v]: the SDK would clamp it and disagree on the dead time", c.Heartbeat, c.HeartbeatMin, c.HeartbeatMax)
 	}
 	if c.LoginDeadline <= 0 {
 		bad("LoginDeadline %v must be positive", c.LoginDeadline)
