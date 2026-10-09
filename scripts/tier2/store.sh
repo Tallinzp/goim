@@ -84,6 +84,7 @@ teardown() {
 }
 trap teardown EXIT
 
+t0=$SECONDS # durations in result.json: whole seconds, bash's SECONDS
 make redis-down >/dev/null 2>&1   # idempotent: start from a clean Redis
 
 # The host ports must be free; name whatever holds them.
@@ -104,16 +105,21 @@ if ! make redis-up >"$out/redis-up.log" 2>&1; then
   exit 1
 fi
 
+setup_s=$((SECONDS - t0))
+
 # 1 + 2: full suite on real Redis.
+t=$SECONDS
 go test -race -count=1 -v ./... >"$out/tests.log" 2>&1
 tests_rc=$?
 skips=$(grep -c 'TODO: Tier 2 integration' "$out/tests.log")
 failed=$(grep -E '^[[:space:]]*--- FAIL' "$out/tests.log" | sed 's/^[[:space:]]*--- FAIL: //; s/ (.*//' | paste -sd, -)
+tests_s=$((SECONDS - t))
 
 # 3: mutation check in a throwaway worktree, so the checkout is never modified.
 # The mutant sends WAIT through node (the pooled *redis.Client) instead of the
 # Conn that wrote the marker. It counts as caught only if it compiles and the
 # test fails its own assertion; a build error or any other failure is an error.
+t=$SECONDS
 mutdir=$(mktemp -d)
 git worktree add --detach "$mutdir" HEAD >/dev/null 2>&1
 sed -i.orig 's/conn\.Wait(ctx, 1, s\.cfg\.WaitTimeout)/node.Wait(ctx, 1, s.cfg.WaitTimeout)/' "$mutdir/internal/store/revoke.go"
@@ -129,6 +135,7 @@ elif grep -q -- '--- FAIL: TestRevokeFailsWhenReplicaDoesNotAck' "$out/mutation.
 else
   mutation="error: the test failed for another reason, see mutation.log"
 fi
+mutation_s=$((SECONDS - t))
 
 # 4: eviction policy (Execution Notes risk 12).
 policy=$(docker compose -f deploy/compose/redis-test.yml exec -T redis-primary \
@@ -148,10 +155,11 @@ cat >"$out/result.json" <<JSON
   "host": {"cores": $cores, "mem_gb": $mem_gb},
   "redis": "$(docker compose -f deploy/compose/redis-test.yml exec -T redis-primary redis-server --version | tr -d '\r')",
   "pass": $ok,
+  "duration_s": {"total": $((SECONDS - t0)), "setup": $setup_s},
   "checks": {
-    "tests": {"pass": $([ "$tests_rc" -eq 0 ] && echo true || echo false), "failed": "$failed"},
+    "tests": {"pass": $([ "$tests_rc" -eq 0 ] && echo true || echo false), "failed": "$failed", "duration_s": $tests_s},
     "no_skips": {"pass": $([ "$skips" -eq 0 ] && echo true || echo false), "tier2_skips": $skips},
-    "mutation": {"pass": $([ "$mutation" = "pass" ] && echo true || echo false), "detail": "$mutation"},
+    "mutation": {"pass": $([ "$mutation" = "pass" ] && echo true || echo false), "detail": "$mutation", "duration_s": $mutation_s},
     "eviction": {"pass": $([ "$policy" = "noeviction" ] && echo true || echo false), "maxmemory_policy": "$policy"}
   },
   "not_covered": ["Redis Cluster: MasterForKey, MOVED after failover, multi-node NOSCRIPT, CRC16 key slots",

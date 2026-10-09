@@ -83,21 +83,27 @@ teardown() {
 }
 trap teardown EXIT
 
+t0=$SECONDS # durations in result.json: whole seconds, bash's SECONDS
 if ! make redis-server >"$out/redis-build.log" 2>&1; then
   echo "make redis-server failed, see $out/redis-build.log" >&2
   exit 1
 fi
 
+setup_s=$((SECONDS - t0))
+
 # 1 + 2: the suite. Each scenario starts its own Redis primary and replica.
+t=$SECONDS
 listed=$(GOIM_RACE_SUITE= go test -list '.*' ./internal/racetest/ | grep -c '^Test') # no suite: lists without building the binaries
 go test -count=1 -v -timeout 45m ./internal/racetest/ >"$out/tests.log" 2>&1
 tests_rc=$?
 passed=$(grep -cE '^--- PASS' "$out/tests.log")
 failed=$(grep -E '^[[:space:]]*--- FAIL' "$out/tests.log" | sed 's/^[[:space:]]*--- FAIL: //; s/ (.*//' | paste -sd, -)
+tests_s=$((SECONDS - t))
 
 # 3: mutation check in a throwaway worktree. The mutant sends a closed
 # connection's Logout as soon as it closes while its Login is in flight
 # (fence (a) removed): the Logout lands before the write and a ghost stays.
+t=$SECONDS
 mutdir=$(mktemp -d)
 if ! git worktree add --detach "$mutdir" HEAD >"$out/mutation.log" 2>&1; then
   rmdir "$mutdir" 2>/dev/null
@@ -115,6 +121,7 @@ elif grep -q -- '--- FAIL: TestRace5CloseWhileLoginInFlight' "$out/mutation.log"
 else
   mutation="error: the test failed for another reason, see mutation.log"
 fi
+mutation_s=$((SECONDS - t))
 
 # 4: the Redis the suite reported it ran (TestMain prints it).
 ran_on=$(grep -m1 '^racetest: .*: Redis ' "$out/tests.log" | sed 's/.*: Redis //')
@@ -132,10 +139,11 @@ cat >"$out/result.json" <<JSON
   "commit": "$(git rev-parse HEAD)",
   "host": {"cores": $cores, "mem_gb": $mem_gb},
   "pass": $ok,
+  "duration_s": {"total": $((SECONDS - t0)), "setup": $setup_s},
   "checks": {
-    "tests": {"pass": $([ "$tests_rc" -eq 0 ] && echo true || echo false), "failed": "$failed"},
+    "tests": {"pass": $([ "$tests_rc" -eq 0 ] && echo true || echo false), "failed": "$failed", "duration_s": $tests_s},
     "all_ran": {"pass": $([ "$passed" -eq "$listed" ] && echo true || echo false), "listed": $listed, "passed": $passed},
-    "mutation": {"pass": $([ "$mutation" = "pass" ] && echo true || echo false), "detail": "$mutation"},
+    "mutation": {"pass": $([ "$mutation" = "pass" ] && echo true || echo false), "detail": "$mutation", "duration_s": $mutation_s},
     "redis": {"pass": $([ "$ran_on" = "$redis_version" ] && echo true || echo false), "want": "$redis_version", "ran_on": "$ran_on"}
   },
   "not_covered": ["Redis Cluster (one primary + one replica here)", "a real network between the processes (all on 127.0.0.1)"]
