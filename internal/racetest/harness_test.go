@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Tallinzp/goim/internal/fault"
+	"github.com/Tallinzp/goim/internal/gateway"
 	"github.com/Tallinzp/goim/internal/logic"
 )
 
@@ -24,6 +25,8 @@ func TestHarnessFailsWhatAssertionsMiss(t *testing.T) {
 		{mode: "unexpected-exit", want: "exited on its own"},
 		{mode: "unfired-fault", want: "never fired"},
 		{mode: "race-report", want: "the race detector reported a data race"},
+		{mode: "crash-then-kill", want: "exited on its own"},
+		{mode: "unfired-fault-after-restart", want: "never fired"},
 	} {
 		cmd := exec.Command(os.Args[0], "-test.run=^TestHelperScenario$", "-test.count=1", "-test.v")
 		cmd.Env = append(os.Environ(), "GOIM_RACETEST_HELPER="+c.mode, "GOIM_RACE_BIN="+binDir, "GOIM_RACE_LOGS=",
@@ -55,6 +58,16 @@ func TestHelperScenario(t *testing.T) {
 		f, _ := os.OpenFile(s.Logic.log, os.O_APPEND|os.O_WRONLY, 0)
 		f.WriteString("==================\nWARNING: DATA RACE\nWrite at 0x00c000123456 by goroutine 7:\n")
 		f.Close()
+	case "crash-then-kill": // a gateway dies, then the scenario "crashes" it as planned
+		s.GW[0].signal(syscall.SIGKILL)
+		<-s.GW[0].done
+		s.GW[0].kill()
+	case "unfired-fault-after-restart": // a typo in a rule set on a gateway started after the first rule
+		s.LogicFault(fault.Rule{Op: logic.FaultLogin, Key: "somebody", Delay: fault.Duration(time.Millisecond)})
+		s.Online(0, "somebody", "d1", 1)
+		s.GW[0].kill()
+		s.RestartGateway(0)
+		s.Fault(0, fault.Rule{Op: gateway.FaultKick, Key: "nobody", Fail: true})
 	}
 }
 
@@ -122,13 +135,25 @@ func TestProcessesDieWithTheSuite(t *testing.T) {
 			t.Skip("no sleep binary")
 		}
 		binDir = filepath.Dir(sleep)
-		p := startProc(t, t.TempDir(), "sleep", "sleep", "60")
+		p := startProc(t, os.Getenv("GOIM_RACETEST_SPAWN"), "sleep", "sleep", "60")
 		os.Stdout.WriteString("pid " + strconv.Itoa(p.cmd.Process.Pid) + "\n")
 		os.Exit(0)
 	}
+	leftovers := func() []string {
+		a, _ := filepath.Glob(filepath.Join(os.TempDir(), "goim-race-bin-*"))
+		b, _ := filepath.Glob(filepath.Join(os.TempDir(), "TestProcessesDieWithTheSuite*"))
+		return append(a, b...)
+	}
+	spawnDir := t.TempDir()
+	before := leftovers()
 	cmd := exec.Command(os.Args[0], "-test.run=^TestProcessesDieWithTheSuite$", "-test.count=1")
-	cmd.Env = append(os.Environ(), "GOIM_RACETEST_SPAWN=1")
+	// The child exits without cleanups: it gets a directory this test removes,
+	// and no suite switch, so its TestMain builds no binaries it would leak.
+	cmd.Env = append(os.Environ(), "GOIM_RACETEST_SPAWN="+spawnDir, envSuite+"=")
 	out, err := cmd.Output()
+	if after := leftovers(); len(after) > len(before) {
+		t.Errorf("the child left files behind in %s: %d before, %d after", os.TempDir(), len(before), len(after))
+	}
 	if err != nil {
 		t.Fatalf("child: %v\n%s", err, out)
 	}

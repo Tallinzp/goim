@@ -30,6 +30,7 @@ redis-server:
 # that skip as "TODO: Tier 2 integration", against a local redis-server
 # primary and replica (no Docker). The tests make test-redis runs on the Tier 2 host.
 test-redis-local:
+	scripts/redis-local.sh $(REDIS_SERVER) go test -race -count=1 ./...
 
 # Regenerate api/internalpb and api/clientpb from api/internal.proto and
 # api/client.proto. Needs protoc 33.1 and the two pinned plugins (Plan 2,

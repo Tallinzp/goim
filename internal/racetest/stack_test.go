@@ -366,11 +366,11 @@ func (s *Stack) ClearFault(i int, op string) { s.clearFault(s.GW[i].Admin, op) }
 func (s *Stack) setFault(p *proc, admin string, r fault.Rule) {
 	s.t.Helper()
 	faultPut(s.t, admin, r)
-	if s.rules == nil {
-		// Registered after the processes, so it runs before they are killed.
-		s.t.Cleanup(s.checkFaultsFired)
-	}
-	s.rules = append(s.rules, &setRule{p: p, admin: admin, op: r.Op})
+	sr := &setRule{p: p, admin: admin, op: r.Op}
+	s.rules = append(s.rules, sr)
+	// Registered after its process started, so it runs before that process
+	// is killed, a process restarted after the scenario's first rule included.
+	s.t.Cleanup(func() { s.checkFired(sr) })
 }
 
 func (s *Stack) clearFault(admin, op string) {
@@ -383,25 +383,23 @@ func (s *Stack) clearFault(admin, op string) {
 	faultClear(s.t, admin, op)
 }
 
-// checkFaultsFired fails the scenario for every rule that never matched,
-// unless its process was killed (its counts died with it).
-func (s *Stack) checkFaultsFired() {
-	for _, r := range s.rules {
-		n := r.fired
-		if !r.cleared {
-			if r.p.exited() {
-				continue
-			}
-			var v struct{ Fired int }
-			if err := getJSON("http://"+r.admin+"/fault/rule/"+r.op, &v); err != nil {
-				s.t.Errorf("fault %q on %s: %v", r.op, r.p.name, err)
-				continue
-			}
-			n = v.Fired
+// checkFired fails the scenario if rule r never matched, unless the
+// scenario killed its process (its counts died with it).
+func (s *Stack) checkFired(r *setRule) {
+	n := r.fired
+	if !r.cleared {
+		if r.p.exited() {
+			return
 		}
-		if n == 0 {
-			s.t.Errorf("fault %q on %s never fired: the scenario did not exercise what it claims", r.op, r.p.name)
+		var v struct{ Fired int }
+		if err := getJSON("http://"+r.admin+"/fault/rule/"+r.op, &v); err != nil {
+			s.t.Errorf("fault %q on %s: %v", r.op, r.p.name, err)
+			return
 		}
+		n = v.Fired
+	}
+	if n == 0 {
+		s.t.Errorf("fault %q on %s never fired: the scenario did not exercise what it claims", r.op, r.p.name)
 	}
 }
 

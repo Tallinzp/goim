@@ -22,6 +22,7 @@ type proc struct {
 	log     string
 	done    chan struct{} // closed when the process has exited
 	stopped atomic.Bool   // the scenario killed or terminated it
+	crashed atomic.Bool   // it had exited on its own when the scenario stopped it
 }
 
 // startProc starts bin (in binDir unless the path is absolute) with args. t's cleanup fails the scenario if
@@ -52,7 +53,7 @@ func startProc(t *testing.T, dir, name, bin string, args ...string) *proc {
 		close(p.done)
 	}()
 	t.Cleanup(func() {
-		if p.exited() && !p.stopped.Load() {
+		if p.exited() && !p.stopped.Load() || p.crashed.Load() {
 			t.Errorf("%s exited on its own (%v):\n%s", name, p.cmd.ProcessState, strings.Join(p.tail(30), "\n"))
 		}
 		p.kill()
@@ -64,7 +65,7 @@ func (p *proc) signal(s syscall.Signal) { _ = p.cmd.Process.Signal(s) }
 
 // kill sends SIGKILL (a crash) and waits for the exit.
 func (p *proc) kill() {
-	p.stopped.Store(true)
+	p.stop()
 	p.signal(syscall.SIGKILL) // also ends a stopped process
 	<-p.done
 }
@@ -76,7 +77,7 @@ func (p *proc) resume() { p.signal(syscall.SIGCONT) }
 
 // term sends SIGTERM and waits up to d for the exit.
 func (p *proc) term(d time.Duration) bool {
-	p.stopped.Store(true)
+	p.stop()
 	p.signal(syscall.SIGTERM)
 	select {
 	case <-p.done:
@@ -84,6 +85,16 @@ func (p *proc) term(d time.Duration) bool {
 	case <-time.After(d):
 		return false
 	}
+}
+
+// stop marks the process stopped by the scenario. One that had already
+// exited on its own is still reported: a crash in the window under test
+// must not hide behind the scenario's own kill.
+func (p *proc) stop() {
+	if p.exited() && !p.stopped.Load() {
+		p.crashed.Store(true)
+	}
+	p.stopped.Store(true)
 }
 
 func (p *proc) exited() bool {
