@@ -298,21 +298,49 @@ func TestReconcileEndIsRetriedWithTheSamePayload(t *testing.T) {
 	waitFor(t, "deleted counted", func() bool { return testutil.ToFloat64(l.g.m.EndDeleted) == 2 })
 }
 
+// The periodic pass is held at a chunk in Logic, so it is still in progress
+// when the trigger comes, and the chunk is released only once the pass has
+// taken the trigger. (The first periodic pass starts at a random point of
+// its cycle; one that started while the test was still logging clients in
+// could cover a few entries and finish before an unsynchronized trigger.)
 func TestTriggerCancelsAPeriodicPass(t *testing.T) {
 	l := newLive(t, func(c *Config) {
 		c.Reconcile.Cycle, c.Reconcile.Jitter = 2*time.Second, 0
 		c.Reconcile.Chunk, c.Reconcile.MinRate = 2, 5 // 40 entries at 5/s: the periodic pass takes ~8s
 	})
 	l.onlineMany(t, 10)
-	waitFor(t, "periodic pass started", func() bool { return get(l.logic, func() int { return len(l.logic.chunks) }) > 0 })
-	l.g.recon.Trigger()
-	waitFor(t, "triggered pass done", func() bool { return passes(l) == 1 })
-	end := get(l.logic, func() *pb.ReconcileEndRequest { return l.logic.ends[0] })
-	if end.GetPace() != pb.Pace_PACE_TRIGGERED {
-		t.Fatalf("first ReconcileEnd has pace %v: a cancelled pass must send none", end.GetPace())
+	held, release := make(chan struct{}), make(chan struct{})
+	var holdOnce, releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	l.logic.mu.Lock()
+	l.logic.reconcile = func(c *pb.ReconcileChunk) (*pb.ReconcileReply, error) {
+		first := false
+		holdOnce.Do(func() { first = true })
+		if first { // the next chunk only; later ones, the triggered pass's, pass through
+			close(held)
+			<-release
+		}
+		return replyAll(c, pb.ReconcileCode_RECONCILE_CODE_WRITTEN), nil
 	}
-	if n := testutil.ToFloat64(l.g.m.Passes.WithLabelValues("PACE_PERIODIC", "cancelled")); n != 1 {
-		t.Fatalf("cancelled periodic passes %v, want 1", n)
+	l.logic.mu.Unlock()
+	select {
+	case <-held: // only periodic passes run so far
+	case <-time.After(5 * time.Second):
+		t.Fatal("no periodic pass sent a chunk within two cycles")
+	}
+	before := passes(l) // ReconcileEnds of periodic passes that finished earlier
+	l.g.recon.Trigger()
+	// The held chunk keeps the pass from ending, so the pass is what takes
+	// the trigger from its one-slot channel.
+	waitFor(t, "the periodic pass took the trigger", func() bool { return len(l.g.recon.trigger) == 0 })
+	releaseOnce.Do(func() { close(release) })
+	waitFor(t, "the periodic pass was cancelled", func() bool {
+		return testutil.ToFloat64(l.g.m.Passes.WithLabelValues("PACE_PERIODIC", "cancelled")) == 1
+	})
+	waitFor(t, "triggered pass done", func() bool { return passes(l) > before })
+	end := get(l.logic, func() *pb.ReconcileEndRequest { return l.logic.ends[before] })
+	if end.GetPace() != pb.Pace_PACE_TRIGGERED {
+		t.Fatalf("first ReconcileEnd after the trigger has pace %v: a cancelled pass must send none", end.GetPace())
 	}
 }
 
