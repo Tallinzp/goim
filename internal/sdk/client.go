@@ -205,8 +205,18 @@ func (c *Client) load() error {
 func (c *Client) DeviceID() string { return c.deviceID.Load().(string) }
 
 // Connect starts an attempt now if the client is idle: the first connect,
-// or the user asking to go online after a Kick or a Logout.
-func (c *Client) Connect() { c.do(func() { c.connect() }) }
+// or the user asking to go online after a Kick or a Logout. Otherwise it is
+// a local trigger, like NetworkChanged (P5I-3): a user's "retry" cuts only
+// the storm wait and a failure backoff, never a wait the server asked for.
+func (c *Client) Connect() {
+	c.do(func() {
+		if c.cur == nil && c.timer == nil {
+			c.connect()
+			return
+		}
+		c.local(false)
+	})
+}
 
 // NetworkChanged reports an OS network change: it cuts the storm wait
 // short (spec: Local trigger).

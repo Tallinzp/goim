@@ -977,6 +977,59 @@ func TestBlackholedGatewayBacksOffAndANetworkChangeCutsIt(t *testing.T) {
 	})
 }
 
+// Connect while a wait is pending is a local trigger (P5I-3): a user's
+// "retry" cuts the storm wait and a failure backoff to the local window,
+// and never a wait the server asked for (spec: Precedence).
+func TestConnectDuringAWaitIsALocalTrigger(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		first func(*fakeConn)
+		kind  WaitKind
+		cut   bool
+	}{
+		{"storm wait", func(c *fakeConn) { c.online(nil) }, WaitStorm, true},
+		{"failure backoff", func(c *fakeConn) { c.hello(); c.nc.Write(make([]byte, 54)) }, WaitFailure, true},
+		{"Busy retry_after", func(c *fakeConn) {
+			c.login()
+			c.send(clientpb.Cmd_CMD_BUSY, 1, &clientpb.Busy{RetryAfterMs: 7000})
+		}, WaitRetryable, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newFake(t, func(n int, c *fakeConn) {
+					if n == 1 {
+						tc.first(c)
+						return
+					}
+					c.online(nil)
+					c.pong()
+				})
+				c, r := testClient(t, f, &MemStore{}, nil)
+				c.Connect()
+				var w Wait
+				for _, e := range r.take() {
+					if e.Kind == EventWaiting {
+						w = e.Wait
+					}
+				}
+				if w.Kind != tc.kind {
+					t.Fatalf("wait %+v, want %v", w, tc.kind)
+				}
+				c.Connect()
+				evs := r.take()
+				if !tc.cut {
+					expect(t, evs)
+					return
+				}
+				evs = expect(t, evs, EventWaiting)
+				within(t, "Connect", evs[0].Wait, WaitLocal, 0, s, reasonLocal)
+				time.Sleep(evs[0].Wait.D)
+				expect(t, r.take(), EventConnecting, EventOnline)
+			})
+		})
+	}
+}
+
 // Review Focus 5: Logout while the Login is in flight closes at once (the
 // gateway's fence (a) sends the Logout after the Login reply) and never
 // reconnects.
