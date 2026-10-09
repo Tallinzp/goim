@@ -209,3 +209,167 @@ t2_init() {
   mkdir -p "$T2_OUT"
   t2_traps
 }
+
+# ---- Run recording (choices #70, #71): what else ran, swap, CPU clocks ----
+#
+# The Tier 2 host is also a desktop. A load scenario calls t2_mem_budget and
+# t2_nofile before its setup, then t2_record_start / t2_record_end around its
+# measured window. result.json gets a "background" member and a no_swap_in
+# check: a window with any page swapped in fails (#70).
+# "Ours" is this run's process group: make, the script and every process it
+# starts (none of them calls setpgid). Kernel threads are reported apart,
+# since they do our network work. CPU used by a process that started and
+# exited inside the window is not seen.
+
+# t2_mem_verdict WANT_GB AVAIL_GB: pure.
+t2_mem_verdict() {
+  if [ "$2" -lt "$1" ]; then
+    echo "refused: this scenario needs ${1}GB available, the host has ${2}GB; close the desktop apps (top users in background-before.txt)"
+    return 1
+  fi
+}
+
+# t2_mem_budget GB: refuses (exit 2) when MemAvailable is below GB.
+t2_mem_budget() {
+  local avail why
+  avail=$(awk '/^MemAvailable:/ {printf "%d", $2 / 1024 / 1024}' /proc/meminfo)
+  t2_field mem_budget "{\"want_gb\": $1, \"available_gb\": $avail}"
+  why=$(t2_mem_verdict "$1" "$avail") || { t2_top >"$T2_OUT/background-before.txt"; t2_refuse "$why"; }
+}
+
+# t2_nofile N: raises the soft nofile limit to N for this run and its
+# children (the hard limit is 1,048,576 on the host, #68), or refuses.
+t2_nofile() {
+  local hard
+  hard=$(ulimit -Hn)
+  if [ "$hard" != unlimited ] && [ "$hard" -lt "$1" ]; then
+    t2_refuse "refused: nofile hard limit $hard < $1"
+  fi
+  ulimit -Sn "$1"
+}
+
+# t2_top: the largest memory and CPU users.
+t2_top() {
+  echo "== by memory"
+  ps -eo pid,pgid,rss,pcpu,etimes,comm --sort=-rss | head -n 11
+  echo "== by CPU (lifetime average)"
+  ps -eo pid,pgid,rss,pcpu,etimes,comm --sort=-pcpu | head -n 11
+}
+
+# t2_cpulist_expand LIST: "4-6,9" -> "4 5 6 9".
+t2_cpulist_expand() {
+  local part out=() i
+  IFS=, read -ra parts <<<"$1"
+  for part in "${parts[@]}"; do
+    if [[ $part == *-* ]]; then
+      for ((i = ${part%-*}; i <= ${part#*-}; i++)); do out+=("$i"); done
+    else
+      out+=("$part")
+    fi
+  done
+  echo "${out[*]}"
+}
+
+# t2_proc_stats: one line per process, "pid pgrp ppid starttime ticks comm"
+# (ticks = utime + stime), parsed after the last ')' so a comm with spaces
+# or parentheses cannot shift the fields.
+t2_proc_stats() {
+  cat /proc/[0-9]*/stat 2>/dev/null | awk '{
+    n = length($0); while (n > 0 && substr($0, n, 1) != ")") n--
+    o = index($0, "(")
+    comm = substr($0, o + 1, n - o - 1); gsub(/[^A-Za-z0-9._:\/-]/, "_", comm)
+    split(substr($0, n + 2), f, " ")
+    print $1, f[3], f[2], f[20], f[12] + f[13], comm
+  }'
+}
+
+# t2_pgid PID: PID's process group.
+t2_pgid() { t2_proc_stats | awk -v p="$1" '$1 == p { print $2 }'; }
+
+# t2_cpu_delta BEFORE AFTER OURS HZ: from two t2_proc_stats files, prints
+# "outside_user_s kernel_threads_s top" where top is a JSON array of the
+# ten biggest outside users. Kernel threads: pid 2 and its children.
+t2_cpu_delta() {
+  awk -v ours="$3" -v hz="$4" '
+    NR == FNR { before[$1 " " $4] = $5; next }
+    $2 == ours { next }
+    {
+      d = $5 - before[$1 " " $4]
+      if (d <= 0) next
+      if ($1 == 2 || $3 == 2) { kern += d; next }
+      user += d; by[$6] += d
+    }
+    END {
+      top = ""
+      for (k = 0; k < 10; k++) {
+        best = ""; bv = 0
+        for (c in by) if (by[c] > bv) { bv = by[c]; best = c }
+        if (best == "") break
+        top = top (top == "" ? "" : ", ") sprintf("{\"comm\": \"%s\", \"cpu_s\": %.1f}", best, bv / hz)
+        delete by[best]
+      }
+      printf "%.1f %.1f [%s]\n", user / hz, kern / hz, top
+    }' "$1" "$2"
+}
+
+# t2_busy_ticks: host-wide busy CPU ticks (all CPUs; idle and iowait excluded).
+t2_busy_ticks() { awk '/^cpu / { print $2 + $3 + $4 + $7 + $8 + $9; exit }' /proc/stat; }
+# t2_swap_pages: "pswpin pswpout" since boot.
+t2_swap_pages() { awk '/^pswpin / { i = $2 } /^pswpout / { o = $2 } END { print i + 0, o + 0 }' /proc/vmstat; }
+
+# t2_clock_sampler FILE: appends "unix_s cpu khz" for every CPU every 5s.
+t2_clock_sampler() {
+  local f
+  f=(/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq)
+  [ -r "${f[0]}" ] || return 0
+  while :; do
+    awk -v t="$(date +%s)" '{ split(FILENAME, a, "/"); print t, substr(a[6], 4), $1 }' "${f[@]}" >>"$1"
+    sleep 5
+  done
+}
+
+# t2_clock_summary FILE: {"gateway": {"min_mhz", "mean_mhz"}, ...} over the
+# CPU sets of #71, or null when the host reports no clocks.
+t2_clock_summary() {
+  [ -s "$1" ] || { echo null; return; }
+  local name list out=()
+  for name in gateway logic loadgen; do
+    case $name in
+      gateway) list=$T2_CPUS_GATEWAY ;; logic) list=$T2_CPUS_LOGIC ;; loadgen) list=$T2_CPUS_LOADGEN ;;
+    esac
+    out+=("\"$name\": $(awk -v cpus=" $(t2_cpulist_expand "$list") " '
+      index(cpus, " " $2 " ") { n++; s += $3; if (min == "" || $3 < min) min = $3 }
+      END { if (n) printf "{\"min_mhz\": %d, \"mean_mhz\": %d}", min / 1000, s / n / 1000; else printf "null" }' "$1")")
+  done
+  echo "{$(t2_join "${out[@]}")}"
+}
+
+# t2_record_start: start of the measured window.
+t2_record_start() {
+  T2_PGID=$(t2_pgid $$)
+  t2_top >"$T2_OUT/background-before.txt"
+  t2_proc_stats >"$T2_OUT/.procs-before"
+  T2_BUSY0=$(t2_busy_ticks)
+  T2_SWAP0=$(t2_swap_pages)
+  T2_REC_T0=$SECONDS
+  t2_clock_sampler "$T2_OUT/clocks.tsv" &
+  T2_SAMPLER=$!
+  t2_on_exit 'kill $T2_SAMPLER'
+}
+
+# t2_record_end: end of the window: the background member and no_swap_in.
+t2_record_end() {
+  local hz busy swap1 delta in out
+  kill "$T2_SAMPLER" 2>/dev/null
+  wait "$T2_SAMPLER" 2>/dev/null
+  hz=$(getconf CLK_TCK)
+  t2_proc_stats >"$T2_OUT/.procs-after"
+  t2_top >"$T2_OUT/background-after.txt"
+  busy=$(( $(t2_busy_ticks) - T2_BUSY0 ))
+  swap1=$(t2_swap_pages)
+  in=$(( ${swap1% *} - ${T2_SWAP0% *} ))
+  out=$(( ${swap1#* } - ${T2_SWAP0#* } ))
+  read -r user kern top <<<"$(t2_cpu_delta "$T2_OUT/.procs-before" "$T2_OUT/.procs-after" "$T2_PGID" "$hz")"
+  t2_field background "{\"window_s\": $((SECONDS - T2_REC_T0)), \"host_busy_cpu_s\": $(awk -v b="$busy" -v h="$hz" 'BEGIN { printf "%.1f", b / h }'), \"outside_user_cpu_s\": $user, \"kernel_threads_cpu_s\": $kern, \"top_outside\": $top, \"swap_in_pages\": $in, \"swap_out_pages\": $out, \"cpu_clocks\": $(t2_clock_summary "$T2_OUT/clocks.tsv")}"
+  t2_check no_swap_in "$(t2_bool [ "$in" -eq 0 ])" "\"swap_in_pages\": $in"
+}
