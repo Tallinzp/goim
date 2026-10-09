@@ -7,11 +7,23 @@ export GOIM_REDIS_REPLICA_PORT ?= 16380
 COMPOSE_REDIS := docker compose -f deploy/compose/redis-test.yml
 TIER2_GUARD := test "$$GOIM_TEST_TIER" = 2 || { echo "Tier 2 host only: set GOIM_TEST_TIER=2"; exit 1; }
 
-.PHONY: test proto redis-up redis-down test-redis test-tier2
+.PHONY: test redis-server test-redis-local proto redis-up redis-down test-redis test-tier2
 
 # Tier 1a (dev machine): unit and Lua tests on in-process miniredis, race detector on.
 test:
 	go test -race -count=1 ./...
+
+# The race suite's Redis: redis-server on PATH, else the pinned 7.4.11 that
+# make redis-server builds into .cache/redis (cc and make, no Docker).
+REDIS_SERVER ?= $(or $(shell command -v redis-server 2>/dev/null),$(CURDIR)/.cache/redis/bin/redis-server)
+redis-server:
+	scripts/redis-build.sh .cache/redis
+
+# Tier 1a on real Redis, on the dev machine: every test, including the ones
+# that skip as "TODO: Tier 2 integration", against a local redis-server
+# primary and replica (no Docker). The tests make test-redis runs on the Tier 2 host.
+test-redis-local:
+	scripts/redis-local.sh $(REDIS_SERVER) go test -race -count=1 ./...
 
 # Regenerate api/internalpb and api/clientpb from api/internal.proto and
 # api/client.proto. Needs protoc 33.1 and the two pinned plugins (Plan 2,

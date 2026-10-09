@@ -4,3 +4,4 @@ pkg/
 *.out
 tier2-results/
 *.DS_Store
+.cache/

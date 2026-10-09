@@ -1,11 +1,12 @@
 // Package testredis gives tests a Redis.
 //
 // Tier 1a (dev machine, the default): every New starts a fresh in-process
-// miniredis. Tier 2 (dedicated host): set GOIM_TEST_REDIS (and
-// GOIM_TEST_REDIS_REPLICA) to a real Redis primary with one replica, e.g. the
-// one `make redis-up` starts from deploy/compose/redis-test.yml. Tests that
-// need real Redis behaviour (replication, WAIT, DEBUG) call RequireReal and
-// are skipped at Tier 1a; Plan 1's Execution Notes list what that leaves unverified.
+// miniredis. With GOIM_TEST_REDIS (and GOIM_TEST_REDIS_REPLICA) set, tests run
+// against a real Redis primary with one replica: on the dev machine `make
+// test-redis-local` starts two redis-server processes (no Docker); on the Tier
+// 2 host `make redis-up` starts the compose one. Tests that need real Redis
+// behaviour (replication, WAIT, DEBUG) call RequireReal and are skipped
+// without it; Plan 1's Execution Notes list what that leaves unverified.
 package testredis
 
 import (
@@ -28,7 +29,7 @@ func RequireReal(t testing.TB) {
 	t.Helper()
 	if !Real() {
 		t.Skip("TODO: Tier 2 integration — needs a real Redis primary and replica " +
-			"(GOIM_TEST_REDIS, GOIM_TEST_REDIS_REPLICA); see Plan 1 Execution Notes")
+			"(GOIM_TEST_REDIS, GOIM_TEST_REDIS_REPLICA; make test-redis-local); see Plan 1 Execution Notes")
 	}
 }
 
@@ -61,7 +62,7 @@ func dial(t testing.TB, addr string) *redis.Client {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := c.Ping(ctx).Err(); err != nil {
-		t.Fatalf("test Redis not reachable at %s (on the Tier 2 host: `make redis-up`): %v", addr, err)
+		t.Fatalf("test Redis not reachable at %s (make test-redis-local, or `make redis-up` on the Tier 2 host): %v", addr, err)
 	}
 	t.Cleanup(func() { _ = c.Close() })
 	return c
