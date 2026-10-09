@@ -14,6 +14,7 @@ import (
 	"syscall"
 
 	"github.com/Tallinzp/goim/internal/auth"
+	"github.com/Tallinzp/goim/internal/fault"
 	"github.com/Tallinzp/goim/internal/logic"
 	"github.com/Tallinzp/goim/internal/store"
 	"github.com/prometheus/client_golang/prometheus"
@@ -34,17 +35,26 @@ type options struct {
 	redisCluster bool
 	jwksURL      string
 	jwksFallback string
+	jwks         auth.ManagerConfig // its intervals; URL and fallback come from the two flags above
+	kickAddrFile string
+	faults       bool
 }
 
 // parseFlags returns the validated configuration. Logic refuses to start on
 // a configuration that breaks a required ratio (spec: Test execution model).
 func parseFlags(args []string) (logic.Config, logic.ServerConfig, options, error) {
-	cfg, sc, o := logic.DefaultConfig(), logic.DefaultServerConfig(), options{}
+	cfg, sc := logic.DefaultConfig(), logic.DefaultServerConfig()
+	o := options{jwks: auth.DefaultManagerConfig("", "")}
 	fs := flag.NewFlagSet("logic", flag.ContinueOnError)
 	fs.StringVar(&o.redisAddrs, "redis", "127.0.0.1:6379", "Redis address(es), comma-separated")
 	fs.BoolVar(&o.redisCluster, "redis-cluster", true, "Redis Cluster (false: one node, for tests)")
 	fs.StringVar(&o.jwksURL, "jwks-url", "", "account service JWKS URL")
 	fs.StringVar(&o.jwksFallback, "jwks-fallback", "/etc/goim/jwks-fallback/jwks.json", "jwks-fallback ConfigMap file")
+	fs.DurationVar(&o.jwks.Refresh, "jwks-refresh", o.jwks.Refresh, "periodic JWKS refresh")
+	fs.DurationVar(&o.jwks.RetryEmpty, "jwks-retry-empty", o.jwks.RetryEmpty, "JWKS retry interval while no key set is held")
+	fs.DurationVar(&o.jwks.UnknownKid, "jwks-unknown-kid", o.jwks.UnknownKid, "at most one unknown-kid refresh per this long")
+	fs.StringVar(&o.kickAddrFile, "kick-addr-file", "", "JSON file mapping gateway id to Kick address, read at each dial (tests; overrides -kick-addr-format)")
+	fs.BoolVar(&o.faults, "faults", false, "serve the test-only fault API on the admin port (race suite only, never in production)")
 
 	fs.StringVar(&sc.GRPCAddr, "grpc-addr", sc.GRPCAddr, "Logic and Revocation gRPC listen address")
 	fs.StringVar(&sc.LeaseAddr, "lease-addr", sc.LeaseAddr, "Lease gRPC listen address (dedicated, R1-O2)")
@@ -63,11 +73,15 @@ func parseFlags(args []string) (logic.Config, logic.ServerConfig, options, error
 	fs.DurationVar(&cfg.LeaseCache, "lease-cache", cfg.LeaseCache, "lease observation cache")
 	fs.DurationVar(&cfg.SweepInterval, "sweep-interval", cfg.SweepInterval, "sweeper cycle")
 	fs.IntVar(&cfg.SweepRate, "sweep-rate", cfg.SweepRate, "sweeper uids/s")
+	fs.IntVar(&cfg.SweepBatch, "sweep-batch", cfg.SweepBatch, "sweeper uids per page and abort check")
 	fs.IntVar(&cfg.DeleteRate, "delete-rate", cfg.DeleteRate, "ReconcileEnd delete phase uids/s")
+	fs.IntVar(&cfg.DeleteBatch, "delete-batch", cfg.DeleteBatch, "delete phase uids per page")
 	fs.DurationVar(&cfg.RevokeMaxAhead, "revoke-max-ahead", cfg.RevokeMaxAhead, "largest before_ms lead over Redis TIME")
 	fs.IntVar(&cfg.Kick.Workers, "kick-workers", cfg.Kick.Workers, "Kick workers per target")
 	fs.IntVar(&cfg.Kick.Queue, "kick-queue", cfg.Kick.Queue, "Kick queue per target")
 	fs.DurationVar(&cfg.Kick.Deadline, "kick-deadline", cfg.Kick.Deadline, "Kick attempt deadline")
+	fs.DurationVar(&cfg.Kick.RetrySpacing, "kick-retry-spacing", cfg.Kick.RetrySpacing, "between Kick attempts")
+	fs.DurationVar(&cfg.Kick.IdleTimeout, "kick-idle-timeout", cfg.Kick.IdleTimeout, "a Kick target with no work for this long is dropped")
 	fs.StringVar(&cfg.Kick.AddrFormat, "kick-addr-format", cfg.Kick.AddrFormat, "gateway pod DNS, %s = pod name")
 	if err := fs.Parse(args); err != nil {
 		return cfg, sc, o, err
@@ -80,6 +94,10 @@ func parseFlags(args []string) (logic.Config, logic.ServerConfig, options, error
 	}
 	if o.jwksURL == "" && o.jwksFallback == "" {
 		return cfg, sc, o, errors.New("config: -jwks-url or -jwks-fallback is required")
+	}
+	o.jwks.URL, o.jwks.FallbackPath = o.jwksURL, o.jwksFallback
+	if o.jwks.Refresh <= 0 || o.jwks.RetryEmpty <= 0 || o.jwks.UnknownKid <= 0 {
+		return cfg, sc, o, errors.New("config: the JWKS intervals must be positive")
 	}
 	return cfg, sc, o, nil
 }
@@ -97,6 +115,16 @@ func run(args []string) error {
 		rdb = redis.NewClient(&redis.Options{Addr: addrs[0]})
 	}
 	defer rdb.Close()
+	var faults *fault.Set
+	if o.faults {
+		faults = fault.New()
+		rdb.AddHook(logic.FaultHook(faults))
+		slog.Warn("logic: -faults is set: the test-only fault API is on the admin port")
+	}
+	dial := logic.PodDNSDial(cfg.Kick.AddrFormat)
+	if o.kickAddrFile != "" {
+		dial = logic.FileDial(o.kickAddrFile)
+	}
 
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
@@ -104,9 +132,9 @@ func run(args []string) error {
 	defer stop()
 
 	m := logic.NewMetrics(reg)
-	keys := auth.NewManager(auth.DefaultManagerConfig(o.jwksURL, o.jwksFallback), m.AuthObserver())
+	keys := auth.NewManager(o.jwks, m.AuthObserver())
 	srv, err := logic.NewServer(cfg, sc, logic.Deps{Store: store.New(rdb, cfg.Store), Keys: keys,
-		Dial: logic.PodDNSDial(cfg.Kick.AddrFormat), Registry: reg, Metrics: m})
+		Dial: dial, Registry: reg, Metrics: m, Faults: faults})
 	if err != nil {
 		return err
 	}

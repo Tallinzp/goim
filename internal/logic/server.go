@@ -14,6 +14,7 @@ import (
 	"time"
 
 	pb "github.com/Tallinzp/goim/api/internalpb"
+	"github.com/Tallinzp/goim/internal/fault"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
@@ -69,6 +70,9 @@ type Deps struct {
 	Dial     DialFunc
 	Registry *prometheus.Registry // served on /metrics
 	Metrics  *Metrics             // registered on Registry (NewMetrics)
+	// Faults, if set, breaks Store calls on request and serves /fault/ on
+	// the admin port (the race suite, -faults). Nil in production.
+	Faults *fault.Set
 }
 
 // Server is one Logic pod: two gRPC servers, the admin HTTP server, the
@@ -100,14 +104,21 @@ func NewServer(cfg Config, sc ServerConfig, d Deps) (*Server, error) {
 		return nil, err
 	}
 	m := d.Metrics
+	if d.Faults != nil {
+		d.Store = faultStore{d.Store, d.Faults}
+	}
 	leases := NewLeaseCache(d.Store, cfg.LeaseCache, time.Now)
 	kicker := NewKicker(cfg.Kick, leases, m, d.Dial)
 	s := &Server{cfg: cfg, sc: sc, deps: d, m: m, kicker: kicker,
 		svc:   NewService(cfg, d.Store, d.Keys, leases, kicker, m, sc.Workers),
 		lease: NewLeaseService(d.Store, leases, m, sc.LeaseWorkers),
 		sweep: NewSweeper(cfg, d.Store, m, time.Now)}
+	unary := []grpc.UnaryServerInterceptor{s.unaryObserve}
+	if d.Faults != nil {
+		unary = append(unary, faultUnary(d.Faults))
+	}
 	opts := []grpc.ServerOption{
-		grpc.ChainUnaryInterceptor(s.unaryObserve),
+		grpc.ChainUnaryInterceptor(unary...),
 		grpc.ChainStreamInterceptor(s.streamObserve),
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{MinTime: 10 * time.Second, PermitWithoutStream: true}),
 	}
@@ -130,6 +141,9 @@ func NewServer(cfg Config, sc ServerConfig, d Deps) (*Server, error) {
 		}
 		w.WriteHeader(http.StatusOK)
 	})
+	if d.Faults != nil {
+		mux.Handle("/fault/", d.Faults.Handler(nil, nil))
+	}
 	s.admin = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	return s, nil
 }

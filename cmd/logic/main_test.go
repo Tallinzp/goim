@@ -34,3 +34,25 @@ func TestRefusesBrokenRatio(t *testing.T) {
 		t.Fatal("run started with a grace below the Login timeout")
 	}
 }
+
+// The race suite's flags (Plan 5b): Kick addresses from a file, faults on,
+// and the intervals the timing profile scales that were not flags before.
+func TestRaceSuiteFlags(t *testing.T) {
+	cfg, _, o, err := parseFlags([]string{"-jwks-url", "x", "-kick-addr-file", "/tmp/kick.json", "-faults",
+		"-kick-retry-spacing", "1s", "-kick-idle-timeout", "6s", "-sweep-batch", "50", "-delete-batch", "50",
+		"-jwks-refresh", "30s", "-jwks-retry-empty", "500ms", "-jwks-unknown-kid", "3s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !o.faults || o.kickAddrFile != "/tmp/kick.json" || cfg.Kick.RetrySpacing != time.Second ||
+		cfg.Kick.IdleTimeout != 6*time.Second || cfg.SweepBatch != 50 || cfg.DeleteBatch != 50 {
+		t.Fatalf("parsed %+v %+v", cfg, o)
+	}
+	if o.jwks.URL != "x" || o.jwks.Refresh != 30*time.Second || o.jwks.RetryEmpty != 500*time.Millisecond ||
+		o.jwks.UnknownKid != 3*time.Second || o.jwks.FetchTimeout != 5*time.Second {
+		t.Fatalf("JWKS config %+v", o.jwks)
+	}
+	if _, _, _, err := parseFlags([]string{"-jwks-url", "x", "-jwks-unknown-kid", "0s"}); err == nil {
+		t.Fatal("a zero unknown-kid interval was accepted")
+	}
+}
