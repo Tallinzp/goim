@@ -923,3 +923,24 @@ func TestLogoutDuringAnAttemptClosesItAtOnce(t *testing.T) {
 		}
 	})
 }
+
+// Close may be called from several goroutines at once (app teardown and an
+// account-switch handler); none of them may panic.
+func TestConcurrentCloseDoesNotPanic(t *testing.T) {
+	for range 500 {
+		cfg := DefaultConfig()
+		cfg.Addrs, cfg.Store, cfg.ServerKey = []string{"gw-a:8000"}, &MemStore{}, make([]byte, 32)
+		cfg.Token = func(context.Context, bool) (string, error) { return "tok", nil }
+		c, err := New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for range 8 {
+			wg.Go(func() { <-start; c.Close() })
+		}
+		close(start)
+		wg.Wait()
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -100,6 +101,7 @@ type Client struct {
 	cmds     chan func()
 	msgs     chan attemptMsg
 	quit     chan struct{}
+	quitOnce sync.Once // Close may run on several goroutines
 	done     chan struct{}
 
 	// Owned by the run loop.
@@ -227,11 +229,7 @@ func (c *Client) SwitchAccount(token func(ctx context.Context, refresh bool) (st
 // Close is the app closing: it cancels everything, closes any connection
 // without a Logout, and stops the client.
 func (c *Client) Close() {
-	select {
-	case <-c.quit:
-	default:
-		close(c.quit)
-	}
+	c.quitOnce.Do(func() { close(c.quit) })
 	<-c.done
 }
 
