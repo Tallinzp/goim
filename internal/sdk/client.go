@@ -433,6 +433,7 @@ func (c *Client) logout() {
 	c.idleKick = 0
 	c.lostAt = time.Time{}
 	c.refresh = false
+	c.pol.loggedIn() // the next account starts with fresh counters (choice #50, amended)
 	if c.cur != nil && c.online {
 		a := c.cur
 		a.loggingOut.Store(true)

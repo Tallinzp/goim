@@ -993,3 +993,52 @@ func TestNetworkChangeDuringAnAttemptDoesNotCutRetryAfter(t *testing.T) {
 		}
 	})
 }
+
+// Choice #50 (amended, final review M2): Logout and SwitchAccount reset both
+// counters and the backoff, so the next account starts fresh.
+func TestLogoutAndSwitchAccountResetTheCountersAndTheBackoff(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		reset func(*Client)
+	}{
+		{"logout", func(c *Client) { c.Logout(); c.Connect() }},
+		{"switch account", func(c *Client) {
+			c.SwitchAccount(func(context.Context, bool) (string, error) { return "tok-b", nil })
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newFake(t, func(_ int, c *fakeConn) { c.hello() }) // every attempt: a pre-handshake close
+				c, r := testClient(t, f, &MemStore{}, nil)
+				c.Connect()
+				// 10 quick retries, then 2 backoffs: steps = 2.
+				for n := 0; n < 12; {
+					for _, e := range r.take() {
+						if e.Kind == EventWaiting {
+							n++
+							if n < 12 {
+								time.Sleep(e.Wait.D)
+							}
+						}
+					}
+				}
+				tc.reset(c) // cancels the pending backoff
+				var waits []Wait
+				for len(waits) < 11 {
+					for _, e := range r.take() {
+						if e.Kind == EventWaiting {
+							waits = append(waits, e.Wait)
+							time.Sleep(e.Wait.D)
+						}
+					}
+				}
+				if waits[0].Kind != WaitPreHandshake {
+					t.Fatalf("first wait after %s is %v, want a quick retry", tc.name, waits[0].Kind)
+				}
+				if w := waits[10]; w.Kind != WaitBackoff || w.D < 2500*time.Millisecond || w.D > 5*time.Second {
+					t.Fatalf("11th wait %v %v, want backoff step 1 (2.5–5s)", w.Kind, w.D)
+				}
+			})
+		})
+	}
+}
