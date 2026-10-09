@@ -25,6 +25,7 @@ test-race-suite:
 # Needs python3, curl and redis-server (make redis-server).
 test-scripts:
 	scripts/tier2/lib_test.sh
+	STACK_REDIS_SERVER=$(REDIS_SERVER) scripts/stack_test.sh
 
 # The race suite's Redis: redis-server on PATH, else the pinned 7.4.11 that
 # make redis-server builds into .cache/redis (cc and make, no Docker).
