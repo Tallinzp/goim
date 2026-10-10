@@ -43,7 +43,7 @@ One firm rule: **gateways never touch Redis; only Logic does.** The gateway is t
 - **Revocation.** Revocation markers ("tokens issued before T are invalid") are written and confirmed on a replica before any Kick is sent, so a lost Kick can't bring a revoked session back.
 - **Client SDK.** Deterministic reconnect rules: a random 0–20 s spread after a drop, then exponential backoff. A dead gateway's users come back as a bounded storm, not a stampede.
 
-The full reasoning, including the rejected alternatives, is in the [design guide](docs/guides/connection-session-core-guide.md) ([中文](docs/guides/connection-session-core-guide.zh-CN.md)) and the [design spec](docs/superpowers/specs/2026-10-03-connection-session-core-design-rev6.md).
+The full reasoning, including the rejected alternatives, is in the [design guide](docs/guides/connection-session-core-guide.md) and the [design spec](docs/superpowers/specs/2026-10-03-connection-session-core-design-rev6.md).
 
 ## Repository layout
 
