@@ -1,0 +1,336 @@
+package loadgen
+
+import (
+	"context"
+	"crypto/ed25519"
+	"encoding/json"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os/exec"
+	"strconv"
+	"sync"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/Tallinzp/goim/internal/auth"
+	"github.com/Tallinzp/goim/internal/gateway"
+	"github.com/Tallinzp/goim/internal/gateway/tcp"
+	"github.com/Tallinzp/goim/internal/logic"
+	"github.com/Tallinzp/goim/internal/sdk"
+	"github.com/Tallinzp/goim/internal/store"
+	"github.com/Tallinzp/goim/internal/testredis"
+	"github.com/Tallinzp/goim/internal/wire"
+	"github.com/prometheus/client_golang/prometheus"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+)
+
+// The end-to-end tests run loadgen over real TCP and Noise against real
+// gateways and Logic on miniredis, in process (as internal/sdk's do).
+
+type staticKeys struct{ k auth.PrivateKey }
+
+func (s staticKeys) Verify(tok string) (auth.Claims, error) {
+	return auth.Verify(tok, auth.KeySet{s.k.Kid: s.k.Key.Public().(ed25519.PublicKey)}, time.Now().UnixMilli(), 30_000)
+}
+func (staticKeys) Ready() bool         { return true }
+func (staticKeys) Run(context.Context) {}
+
+// startStack starts Logic and n gateways; stop[i] stops gateway i's
+// transport (its clients see their connections close) and core.
+func startStack(t *testing.T, n int) (env Env, stop []func()) {
+	t.Helper()
+	jwt, err := auth.GenerateKey("k1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	noise, err := wire.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	kicks := map[string]string{}
+	lcfg := logic.DefaultConfig()
+	lcfg.SweepInterval = time.Hour
+	lsc := logic.DefaultServerConfig()
+	lsc.GRPCAddr, lsc.LeaseAddr, lsc.AdminAddr = "127.0.0.1:0", "127.0.0.1:0", "127.0.0.1:0"
+	reg := prometheus.NewRegistry()
+	srv, err := logic.NewServer(lcfg, lsc, logic.Deps{Store: store.New(testredis.New(t), lcfg.Store), Keys: staticKeys{jwt},
+		Dial: func(gw string) (*grpc.ClientConn, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			return grpc.NewClient(kicks[gw], grpc.WithTransportCredentials(insecure.NewCredentials()))
+		}, Registry: reg, Metrics: logic.NewMetrics(reg)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := srv.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cancel(); srv.Stop() })
+	grpcAddr, leaseAddr, _ := srv.Addrs()
+	env = Env{NoiseKeyID: 1, NoisePublic: noise.Public, JWTKey: jwt}
+	for range n {
+		cfg := gateway.DefaultConfig()
+		cfg.GatewayID, cfg.Epoch, cfg.NumLoops = testredis.Gateway(), gateway.NewEpoch(), 2
+		cfg.MaxConns, cfg.PendingCap, cfg.LoginQueueCap, cfg.LogoutQueue = 1000, 1000, 1000, 1000
+		cfg.Limits.Notrack = true
+		tcfg := tcp.DefaultConfig(cfg.NumLoops)
+		tcfg.Addr = "tcp://127.0.0.1:0"
+		greg := prometheus.NewRegistry()
+		var tr *tcp.Transport
+		g, err := gateway.New(cfg, gateway.Deps{Metrics: gateway.NewMetrics(greg), Registry: greg,
+			ReadyChecks: []func() error{func() error { return tr.Ready() }}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tr, err = tcp.New(g, wire.KeySet{1: noise}, tcfg, greg); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Start(context.Background(), gateway.ServerConfig{LogicTarget: grpcAddr,
+			LeaseTarget: leaseAddr, KickAddr: "127.0.0.1:0", AdminAddr: "127.0.0.1:0"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := tr.Start(); err != nil {
+			g.Stop()
+			t.Fatal(err)
+		}
+		var once sync.Once
+		s := func() {
+			once.Do(func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				tr.Stop(ctx)
+				g.Stop()
+			})
+		}
+		t.Cleanup(s)
+		kick, _ := g.Addrs()
+		mu.Lock()
+		kicks[cfg.GatewayID] = kick
+		mu.Unlock()
+		env.GatewayAddrs = append(env.GatewayAddrs, tr.Addr())
+		env.GatewayIDs = append(env.GatewayIDs, cfg.GatewayID)
+		stop = append(stop, s)
+	}
+	return env, stop
+}
+
+// run starts r in the background; the returned func stops it and waits.
+func run(r *Runner) func() {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { r.Run(ctx); close(done) }()
+	return func() { cancel(); <-done }
+}
+
+func waitFor(t *testing.T, what string, d time.Duration, cond func() bool) {
+	t.Helper()
+	for end := time.Now().Add(d); time.Now().Before(end); time.Sleep(20 * time.Millisecond) {
+		if cond() {
+			return
+		}
+	}
+	t.Fatalf("timed out after %v waiting for %s", d, what)
+}
+
+// Light clients log in evenly over the gateways, every Ping is answered,
+// and stopping the run closes every connection. Under -race the gateways'
+// handshake limit closes some first attempts before the handshake reply;
+// those are retried.
+func TestLightClientsHoldAndPing(t *testing.T) {
+	env, _ := startStack(t, 2)
+	r, err := New(Config{Mode: "light", Clients: 40, Rate: 400, UIDPrefix: "light", PingEvery: 200 * time.Millisecond,
+		Timeout: 5 * time.Second}, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := run(r)
+	waitFor(t, "40 online", 10*time.Second, func() bool { s := r.Stats(); return s.RampDone && s.Online == 40 })
+	s := r.Stats()
+	if d := s.OnlineByGateway[env.GatewayIDs[0]] - s.OnlineByGateway[env.GatewayIDs[1]]; d < -2 || d > 2 {
+		t.Fatalf("not balanced: %v", s.OnlineByGateway)
+	}
+	waitFor(t, "two Pongs per client", 5*time.Second, func() bool { return r.Stats().Pongs >= 80 })
+	stop()
+	s = r.Stats()
+	delete(s.Failed, "pre-handshake")
+	if s.PongMissing != 0 || s.Online != 0 || s.Lost["stopped"] != 40 || len(s.Failed) != 0 || s.LoginLatency.N != 40 {
+		t.Fatalf("stats after stop: %+v", s)
+	}
+}
+
+// SDK clients on a gateway that dies log in again elsewhere; the SLO from
+// the mark covers every one of them.
+func TestSDKStormAfterAGatewayStops(t *testing.T) {
+	env, stopGW := startStack(t, 2)
+	r, err := New(Config{Mode: "sdk", Clients: 30, Rate: 300, UIDPrefix: "sdk"}, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.cfg.windows = sdk.DefaultWindows()
+	r.cfg.windows.Storm = sdk.Window{Lo: 0, Hi: time.Second}
+	stop := run(r)
+	defer stop()
+	waitFor(t, "30 online", 10*time.Second, func() bool { s := r.Stats(); return s.RampDone && s.Online == 30 })
+	n, err := r.Mark(1, "death", true)
+	if err != nil || n != 15 {
+		t.Fatalf("mark: %d %v", n, err)
+	}
+	stopGW[1]()
+	waitFor(t, "all back", 10*time.Second, func() bool { s, _ := r.Recorder().SLO("death", time.Second); return s.Back == 15 })
+	s, _ := r.Recorder().SLO("death", 5*time.Second)
+	if s.Population != 15 || s.Lost != 15 || !s.PassFromMark || !s.PassFromDetection {
+		t.Fatalf("slo %+v", s)
+	}
+	if st := r.Stats(); st.OnlineByGateway[env.GatewayIDs[0]] != 30 || st.Lost["lost"] != 15 {
+		t.Fatalf("stats %+v", st)
+	}
+}
+
+// closeFirst forwards to addr, but closes its first n connections once
+// their handshake arrives, before any reply, as a gateway's handshake limit
+// does.
+func closeFirst(t *testing.T, addr string, n int) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go func() {
+		for k := 0; ; k++ {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			if k < n {
+				c.Read(make([]byte, 1)) // after the handshake arrives, as the limiter closes
+				c.Close()
+				continue
+			}
+			up, err := net.Dial("tcp", addr)
+			if err != nil {
+				c.Close()
+				continue
+			}
+			go func() { io.Copy(up, c); up.Close() }()
+			go func() { io.Copy(c, up); c.Close() }()
+		}
+	}()
+	return l.Addr().String()
+}
+
+// A light client retries a close before the handshake reply after
+// 0.5–1.5s, and logs in.
+func TestLightRetriesAPreHandshakeClose(t *testing.T) {
+	env, _ := startStack(t, 1)
+	env.GatewayAddrs[0] = closeFirst(t, env.GatewayAddrs[0], 2)
+	r, _ := New(Config{Mode: "light", Clients: 1, Rate: 10, UIDPrefix: "retry", PingEvery: time.Second, Timeout: 5 * time.Second}, env)
+	stop := run(r)
+	defer stop()
+	begin := time.Now()
+	waitFor(t, "online", 10*time.Second, func() bool { return r.Stats().Online == 1 })
+	if s := r.Stats(); s.Failed["pre-handshake"] != 2 || len(s.Failed) != 1 {
+		t.Fatalf("failed %v, want two pre-handshake closes", s.Failed)
+	}
+	if took := time.Since(begin); took < time.Second {
+		t.Fatalf("logged in after %v: retries must wait 0.5–1.5s each", took)
+	}
+}
+
+func post(t *testing.T, u string) (int, map[string]any) {
+	t.Helper()
+	resp, err := http.Post(u, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var m map[string]any
+	json.NewDecoder(resp.Body).Decode(&m)
+	return resp.StatusCode, m
+}
+
+// The control API: stats, marks, the SLO, and /kill really sends SIGKILL.
+func TestControlAPI(t *testing.T) {
+	env, _ := startStack(t, 2)
+	r, _ := New(Config{Mode: "light", Clients: 4, Rate: 100, UIDPrefix: "ctl", PingEvery: time.Second, Timeout: 5 * time.Second}, env)
+	stop := run(r)
+	defer stop()
+	srv := httptest.NewServer(r.Handler())
+	defer srv.Close()
+	waitFor(t, "4 online", 10*time.Second, func() bool { return r.Stats().Online == 4 })
+
+	resp, err := http.Get(srv.URL + "/stats")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st Stats
+	json.NewDecoder(resp.Body).Decode(&st)
+	resp.Body.Close()
+	if st.Online != 4 || st.Mode != "light" || st.Sources != 1 {
+		t.Fatalf("/stats %+v", st)
+	}
+	if code, _ := post(t, srv.URL+"/mark?gateway=nope&mark=x"); code != http.StatusBadRequest {
+		t.Fatalf("/mark unknown gateway: %d", code)
+	}
+	if code, m := post(t, srv.URL+"/mark?gateway=all&mark=all"); code != http.StatusOK || m["population"] != 4.0 {
+		t.Fatalf("/mark all: %d %v", code, m)
+	}
+	if code, _ := post(t, srv.URL+"/mark?gateway=all&mark=all"); code != http.StatusConflict {
+		t.Fatalf("/mark duplicate: %d", code)
+	}
+	resp, _ = http.Get(srv.URL + "/slo?mark=all&within=30s")
+	var s SLO
+	json.NewDecoder(resp.Body).Decode(&s)
+	resp.Body.Close()
+	if s.Population != 4 || s.Gateway != "all" || s.WithinMs != 30_000 {
+		t.Fatalf("/slo %+v", s)
+	}
+	if resp, _ := http.Get(srv.URL + "/slo?mark=nope&within=30s"); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("/slo unknown mark: %d", resp.StatusCode)
+	}
+
+	// /kill: a stand-in process gets SIGKILL; gw-1 leaves the balancer.
+	victim := exec.Command("sleep", "30")
+	if err := victim.Start(); err != nil {
+		t.Fatal(err)
+	}
+	q := url.Values{"gateway": {env.GatewayIDs[1]}, "pid": {itoa(victim.Process.Pid)}, "mark": {"death"}}
+	code, m := post(t, srv.URL+"/kill?"+q.Encode())
+	if code != http.StatusOK || m["population"] != 2.0 {
+		t.Fatalf("/kill: %d %v", code, m)
+	}
+	if err := victim.Wait(); err == nil || victim.ProcessState.String() != "signal: killed" {
+		t.Fatalf("victim: %v", err)
+	}
+	if !r.bal.Down(1) {
+		t.Fatal("killed gateway still in the balancer")
+	}
+	// A taken mark name: no signal, gw-0 stays in the balancer.
+	other := exec.Command("sleep", "30")
+	if err := other.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer other.Process.Kill()
+	q = url.Values{"gateway": {env.GatewayIDs[0]}, "pid": {itoa(other.Process.Pid)}, "mark": {"death"}}
+	if code, _ := post(t, srv.URL+"/kill?"+q.Encode()); code != http.StatusConflict {
+		t.Fatalf("/kill with a taken mark: %d", code)
+	}
+	if r.bal.Down(0) || other.Process.Signal(syscall.Signal(0)) != nil {
+		t.Fatal("/kill with a taken mark took gw-0 out or signalled")
+	}
+	if code, _ := post(t, srv.URL+"/kill?gateway="+env.GatewayIDs[0]+"&mark=x"); code != http.StatusBadRequest {
+		t.Fatalf("/kill without pid: %d", code)
+	}
+	if resp, _ := http.Get(srv.URL + "/debug/pprof/goroutine?debug=1"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("pprof: %d", resp.StatusCode)
+	}
+}
+
+func itoa(n int) string { return strconv.Itoa(n) }
