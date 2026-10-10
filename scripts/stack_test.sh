@@ -90,6 +90,10 @@ for f in logic gw-0 gw-1; do
   gzip -t "$STACK_DIR/artifacts/idle/$f.heap.pb.gz" 2>/dev/null && ok "snapshot: $f heap profile" || bad "snapshot: $f heap profile"
 done
 stack_profile cpu 1
+# A failed profile fails stack_profile, even when it is not the last one
+# (Logic's comes first; 6a2a final review).
+(curl() { case "$*" in *":$((STACK_PORT_BASE + 4))/"*) return 22 ;; esac; command curl "$@"; }
+ stack_profile failed 1) && bad "profile: a failed profile is not reported" || ok "profile: a failed profile fails"
 for f in logic gw-0 gw-1; do
   gzip -t "$STACK_DIR/artifacts/cpu/$f.cpu.pb.gz" 2>/dev/null && ok "profile: $f CPU profile" || bad "profile: $f CPU profile"
 done
@@ -166,6 +170,16 @@ if stack_up; then
   expect "dead: not a problem after the stop" "$(stack_health 2>&1)" ""
   echo "panic: runtime error: before the kill" >>"$STACK_DIR/logs/gw-1.log"
   grep -q "^gw-1: panic: runtime error: before the kill" <<<"$(stack_health)" && ok "dead: a panic in its log is still reported" || bad "dead: panic not reported: [$(stack_health 2>&1)]"
+  # Only the SIGKILL is expected: a gateway that exited by itself just
+  # before the kill is still reported (6a2a final review).
+  echo "gw-0 expected:1" >>"$STACK_DIR/exit-status"
+  grep -q "^gw-0: expected a kill, exited with status 1$" <<<"$(stack_health)" && ok "dead: another status is reported" || bad "dead: other status: [$(stack_health 2>&1)]"
+  sed -i '$d' "$STACK_DIR/exit-status"
+  # stack_profile with nothing up returns at once (a bare wait would wait for
+  # every child), and a profile that fails fails it.
+  start=$SECONDS
+  (sleep 5 & stack_profile none 1) && ok "profile: nothing up returns" || bad "profile: nothing up failed"
+  [ $((SECONDS - start)) -lt 3 ] && ok "profile: nothing up does not wait" || bad "profile: nothing up waited $((SECONDS - start))s"
 else
   bad "up: expect-dead stack"
 fi

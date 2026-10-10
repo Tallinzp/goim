@@ -230,15 +230,19 @@ stack_snapshot() {
 
 # stack_profile NAME SECONDS: a CPU profile of Logic and every running
 # gateway over the same SECONDS, into artifacts/NAME/<process>.cpu.pb.gz.
-# Blocks for SECONDS; a scenario takes it inside its measured window.
+# Blocks for SECONDS; a scenario takes it inside its measured window. Fails
+# if any profile failed.
 stack_profile() {
-  local dir=$STACK_DIR/artifacts/$1 name admin pids=()
+  local dir=$STACK_DIR/artifacts/$1 name admin pid rc=0 pids=()
   mkdir -p "$dir"
   while read -r name admin; do
     curl -sf -m $(($2 + 30)) "http://$admin/debug/pprof/profile?seconds=$2" >"$dir/$name.cpu.pb.gz" &
     pids+=($!)
   done < <(stack_admins)
-  wait "${pids[@]}"
+  # One wait per pid: a bare wait (no process up) would wait for every
+  # child, Redis included, and one wait for several returns the last status.
+  for pid in "${pids[@]}"; do wait "$pid" || rc=1; done
+  return $rc
 }
 
 # stack_pinned NAME CPUS: the process's affinity is exactly CPUS.
@@ -327,15 +331,17 @@ stack_down() {
 # process not running while the stack is up; once stack_down has run, a stop
 # that was not clean (status 0; devtoken has no SIGTERM handler, so 143 too)
 # or needed SIGKILL; and any log line starting with "panic:" or "fatal error:".
-# A process killed on purpose (stack_expect_dead) is not a problem, but its
-# log is still scanned.
+# A process killed on purpose (stack_expect_dead, status 137) is not a
+# problem, but its log is still scanned; one that ended otherwise before
+# the kill is.
 stack_health() {
   local name status line names=()
   # Stopped processes by their recorded status, running ones by kill -0.
   if [ -f "$STACK_DIR/exit-status" ]; then
     while read -r name status; do
       case "$name:$status" in
-        *:0 | devtoken:143 | *:expected:*) ;;
+        *:0 | devtoken:143 | *:expected:137) ;;
+        *:expected:*) echo "$name: expected a kill, exited with status ${status#expected:}" ;;
         *:killed) echo "$name: did not stop after SIGTERM, killed" ;;
         *) if [ "$status" -gt 128 ] 2>/dev/null; then
              echo "$name: stopped by SIG$(kill -l "$((status - 128))" 2>/dev/null || echo "$((status - 128))") (status $status)"
