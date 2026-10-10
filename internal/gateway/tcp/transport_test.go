@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -304,4 +305,33 @@ func TestRejectAtAcceptIsAPreHandshakeCloseForTheClient(t *testing.T) {
 			t.Fatalf("attempt %d: err %v, want ErrClosedBeforeReply", i, err)
 		}
 	}
+}
+
+// TestListenBesideTimeWait: a gateway restarted on its port while the old
+// process's closed connections sit in TIME_WAIT (a SIGKILL closes them with
+// a FIN, as does a drain) must still bind: a container restarted in the same
+// pod, or a stack started again within 60s, would otherwise fail with
+// "address already in use".
+func TestListenBesideTimeWait(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc, err := l.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc.Close() // the server side closes first, so its port goes to TIME_WAIT
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := c.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("client read = %v, want EOF", err)
+	}
+	c.Close()
+	l.Close()
+	startServer(t, func(_ *gateway.Config, tc *Config) { tc.Addr = "tcp://" + addr }, "127.0.0.1:1", "127.0.0.1:1")
 }

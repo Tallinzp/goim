@@ -122,6 +122,7 @@ func (t *Transport) Start() error {
 			gnet.WithNumEventLoop(t.loops),
 			gnet.WithLoadBalancing(gnet.RoundRobin), // spec: Pre-allocation, chosen explicitly
 			gnet.WithReusePort(false),               // one acceptor, so RoundRobin applies
+			gnet.WithReuseAddr(true),                // rebind beside the last run's TIME_WAIT, as net.Listen does
 			gnet.WithTCPNoDelay(gnet.TCPNoDelay),
 			gnet.WithLogger(gnetLogger{t.log}))
 	}()
