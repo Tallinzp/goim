@@ -92,17 +92,34 @@ T2_FIELDS=()
 T2_DURATIONS=()
 T2_NOT_COVERED=()
 T2_EXIT_HOOKS=()
+# Names already used in result.json, as "check:NAME", "field:KEY" and
+# "duration:NAME"; the members t2_result_json writes itself are taken.
+declare -A T2_USED=([duration:total]=1)
+for k in schema scenario tier commit dirty host pass stopped refused duration_s checks not_covered; do
+  T2_USED[field:$k]=1
+done
+
+# t2_claim KIND NAME: stops the run (exit 1) when NAME was already used: a
+# duplicate key would make result.json ambiguous (P6a1I-3).
+t2_claim() {
+  if [ -n "${T2_USED[$1:$2]:-}" ]; then
+    echo "lib.sh: $1 name '$2' already used in result.json (a bug in the scenario)" >&2
+    exit 1
+  fi
+  T2_USED[$1:$2]=1
+}
 
 # t2_check NAME PASS [MEMBERS]: records a check; PASS is true or false,
 # MEMBERS more JSON object members, e.g. "\"failed\": \"x\", \"n\": 3".
 t2_check() {
   case "$2" in true|false) ;; *) echo "t2_check $1: pass must be true or false, got '$2'" >&2; exit 1 ;; esac
+  t2_claim check "$1"
   T2_CHECKS+=("$(t2_json_str "$1"): {\"pass\": $2${3:+, $3}}")
 }
 # t2_field KEY JSON: a top-level member of result.json.
-t2_field() { T2_FIELDS+=("$(t2_json_str "$1"): $2"); }
+t2_field() { t2_claim field "$1"; T2_FIELDS+=("$(t2_json_str "$1"): $2"); }
 # t2_duration NAME SECONDS: a member of duration_s.
-t2_duration() { T2_DURATIONS+=("$(t2_json_str "$1"): $2"); }
+t2_duration() { t2_claim duration "$1"; T2_DURATIONS+=("$(t2_json_str "$1"): $2"); }
 # t2_not_covered TEXT...: what this scenario does not verify.
 t2_not_covered() { local s; for s in "$@"; do T2_NOT_COVERED+=("$(t2_json_str "$s")"); done; }
 # t2_on_exit CMD: runs CMD (eval'd) at exit, newest first, before the report.
@@ -358,35 +375,51 @@ t2_clock_summary() {
   echo "{$(t2_join "${out[@]}")}"
 }
 
-# t2_record_start: start of the measured window.
+# t2_record_start [NAME]: start of a measured window. Without NAME the run
+# records one window: background, no_swap_in, background-before.txt,
+# clocks.tsv; with NAME: background_NAME, no_swap_in_NAME,
+# background-before-NAME.txt, clocks-NAME.tsv (P6a1I-3). Windows do not
+# overlap: starting one while another is open stops the run (exit 1).
 t2_record_start() {
+  if [ -n "${T2_REC_OPEN:-}" ]; then
+    echo "lib.sh: t2_record_start ${1:-}: window '${T2_REC_NAME:-(unnamed)}' is already open (a bug in the scenario)" >&2
+    exit 1
+  fi
+  T2_REC_OPEN=1 T2_REC_NAME=${1:-}
+  local f=${1:+-$1}
   T2_PGID=$(t2_pgid $$)
-  t2_top >"$T2_OUT/background-before.txt"
+  t2_top >"$T2_OUT/background-before$f.txt"
   t2_proc_stats >"$T2_OUT/.procs-before"
   T2_BUSY0=$(t2_busy_ticks)
   T2_SWAP0=$(t2_swap_pages)
   T2_REC_T0=$SECONDS
-  t2_clock_sampler "$T2_OUT/clocks.tsv" &
+  t2_clock_sampler "$T2_OUT/clocks$f.tsv" &
   T2_SAMPLER=$!
   t2_on_exit '[ -n "$T2_SAMPLER" ] && kill "$T2_SAMPLER"'
 }
 
-# t2_record_end: end of the window: the background member and no_swap_in.
+# t2_record_end [NAME]: end of the window: the background member and
+# no_swap_in, named as t2_record_start says.
 t2_record_end() {
-  local hz busy swap1 delta in out
+  local hz busy swap1 delta in out m=${1:+_$1} f=${1:+-$1}
+  if [ -z "${T2_REC_OPEN:-}" ] || [ "$T2_REC_NAME" != "${1:-}" ]; then
+    echo "lib.sh: t2_record_end ${1:-}: no such window open (a bug in the scenario)" >&2
+    exit 1
+  fi
+  T2_REC_OPEN=""
   kill "$T2_SAMPLER" 2>/dev/null
   wait "$T2_SAMPLER" 2>/dev/null
   T2_SAMPLER="" # reaped: its pid may be reused before the exit hook runs
   hz=$(getconf CLK_TCK)
   t2_proc_stats >"$T2_OUT/.procs-after"
-  t2_top >"$T2_OUT/background-after.txt"
+  t2_top >"$T2_OUT/background-after$f.txt"
   busy=$(( $(t2_busy_ticks) - T2_BUSY0 ))
   swap1=$(t2_swap_pages)
   in=$(( ${swap1% *} - ${T2_SWAP0% *} ))
   out=$(( ${swap1#* } - ${T2_SWAP0#* } ))
   read -r user kern top <<<"$(t2_cpu_delta "$T2_OUT/.procs-before" "$T2_OUT/.procs-after" "$T2_PGID" "$hz")"
-  t2_field background "{\"window_s\": $((SECONDS - T2_REC_T0)), \"host_busy_cpu_s\": $(awk -v b="$busy" -v h="$hz" 'BEGIN { printf "%.1f", b / h }'), \"outside_user_cpu_s\": $user, \"kernel_threads_cpu_s\": $kern, \"top_outside\": $top, \"swap_in_pages\": $in, \"swap_out_pages\": $out, \"cpu_clocks\": $(t2_clock_summary "$T2_OUT/clocks.tsv")}"
-  t2_check no_swap_in "$(t2_bool [ "$in" -eq 0 ])" "\"swap_in_pages\": $in"
+  t2_field "background$m" "{\"window_s\": $((SECONDS - T2_REC_T0)), \"host_busy_cpu_s\": $(awk -v b="$busy" -v h="$hz" 'BEGIN { printf "%.1f", b / h }'), \"outside_user_cpu_s\": $user, \"kernel_threads_cpu_s\": $kern, \"top_outside\": $top, \"swap_in_pages\": $in, \"swap_out_pages\": $out, \"cpu_clocks\": $(t2_clock_summary "$T2_OUT/clocks$f.tsv")}"
+  t2_check "no_swap_in$m" "$(t2_bool [ "$in" -eq 0 ])" "\"swap_in_pages\": $in"
 }
 
 # ---- Host setup (choice #68) ----

@@ -144,6 +144,34 @@ expect "record: the other group counts, ours does not" "$r" "True True True True
 [ -s "$tmp/run/out/background-before.txt" ] && ok "record: background-before.txt" || bad "record: background-before.txt missing"
 expect "record: no sampler pid is left for the exit hook to kill" "$(cat "$tmp/run/sampler")" "[]"
 
+# Named windows (P6a1I-3): each gets its own members, checks and files.
+rc=$(fake_run 't2_record_start warm; sleep 0.2; t2_record_end warm; t2_record_start load; sleep 0.2; t2_record_end load; t2_finish')
+expect "windows: two named windows pass" "$rc" 0
+expect "windows: result.json is JSON" "$(valid_json "$tmp/run/out/result.json")" ""
+r=$(python3 -c '
+import json,sys
+d = json.load(open(sys.argv[1]))
+print(sorted(k for k in d if k.startswith("background")), sorted(d["checks"]))' "$tmp/run/out/result.json" 2>&1)
+expect "windows: members and checks per name" "$r" "['background_load', 'background_warm'] ['no_swap_in_load', 'no_swap_in_warm']"
+[ -s "$tmp/run/out/background-before-warm.txt" ] && [ -s "$tmp/run/out/background-before-load.txt" ] && ok "windows: background-before-NAME.txt" || bad "windows: background-before-NAME.txt missing: $(ls "$tmp/run/out")"
+rc=$(fake_run 't2_record_start a; t2_record_start b; echo reached')
+expect "windows: overlapping windows stop the run" "$rc" 1
+contains "windows: says why" "$(cat "$tmp/run/stdout")" "already open"
+grep -q reached "$tmp/run/stdout" && bad "windows: the run went on after an overlap" || ok "windows: the run stops at the overlap"
+rc=$(fake_run 't2_record_end x'); expect "windows: ending a window that is not open stops the run" "$rc" 1
+contains "windows: says no window is open" "$(cat "$tmp/run/stdout")" "no such window open"
+rc=$(fake_run 't2_record_start a; t2_record_end b'); expect "windows: ending another window stops the run" "$rc" 1
+
+# A name used twice is a programming error: the run stops (exit 1).
+for dup in "t2_check a true; t2_check a false" "t2_field x 1; t2_field x 2" "t2_duration t 1; t2_duration t 2" \
+  "t2_field pass true" "t2_duration total 3" "t2_record_start; t2_record_end; t2_record_start; t2_record_end"; do
+  rc=$(fake_run "$dup; echo reached")
+  expect "dup: '$dup' stops the run" "$rc" 1
+  grep -q reached "$tmp/run/stdout" && bad "dup: '$dup' went on" || ok "dup: '$dup' stops at once"
+  contains "dup: '$dup' says why" "$(cat "$tmp/run/stdout")" "already used"
+  expect "dup: '$dup' result.json is JSON" "$(valid_json "$tmp/run/out/result.json")" ""
+done
+
 # Host setup.
 mkdir -p "$tmp/hs"
 (cd "$tmp/hs" && "$OLDPWD/scripts/tier2/host-setup.sh" --root "$tmp/hs/root" --user alice) >"$tmp/hs/out" 2>&1
