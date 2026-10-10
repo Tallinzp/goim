@@ -55,11 +55,19 @@ func NewBalancer(addrs []string, sources int) (*Balancer, error) {
 		next: make([]int, len(addrs))}, nil
 }
 
-// SetDown takes gateway gw out of rotation for new dials.
+// SetDown takes gateway gw out of rotation for new dials. It is permanent:
+// a scenario that restarts a gateway adds a SetUp (P6a2aI-1).
 func (b *Balancer) SetDown(gw int) {
 	b.mu.Lock()
 	b.down[gw] = true
 	b.mu.Unlock()
+}
+
+// Down reports whether gateway gw is out of rotation.
+func (b *Balancer) Down(gw int) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.down[gw]
 }
 
 // Open is the number of open connections per gateway.

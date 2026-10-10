@@ -58,7 +58,7 @@ func parseFlags(args []string) (logic.Config, logic.ServerConfig, options, error
 
 	fs.StringVar(&sc.GRPCAddr, "grpc-addr", sc.GRPCAddr, "Logic and Revocation gRPC listen address")
 	fs.StringVar(&sc.LeaseAddr, "lease-addr", sc.LeaseAddr, "Lease gRPC listen address (dedicated, R1-O2)")
-	fs.StringVar(&sc.AdminAddr, "admin-addr", sc.AdminAddr, "/metrics, /healthz, /readyz listen address")
+	fs.StringVar(&sc.AdminAddr, "admin-addr", sc.AdminAddr, "/metrics, /healthz, /readyz, /debug/pprof/ listen address")
 	fs.IntVar(&sc.Workers, "workers", sc.Workers, "concurrent Login/Logout/Reconcile calls")
 	fs.IntVar(&sc.LeaseWorkers, "lease-workers", sc.LeaseWorkers, "concurrent lease calls")
 	fs.DurationVar(&sc.MaxConnectionAge, "max-conn-age", sc.MaxConnectionAge, "gRPC MaxConnectionAge")

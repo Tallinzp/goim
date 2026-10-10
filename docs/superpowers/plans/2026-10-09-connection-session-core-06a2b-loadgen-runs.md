@@ -36,7 +36,7 @@
 - Create: `internal/loadgen/runner.go`, `internal/loadgen/light.go`, `internal/loadgen/sdkclient.go`, `internal/loadgen/control.go`, `internal/loadgen/light_test.go`, `internal/loadgen/e2e_test.go`
 
 **Interfaces:**
-- Consumes (Plan 6a2a): `Env`, `NewBalancer`, `(*Balancer).Dial/SetDown`, `b.down`; `NewRecorder`, `(*Recorder).Online/Lost/Failed/Pong/PongMissing/Mark/SLO/Marks/Counts`, `Counts`, `SLO`; `pprofhttp.Register`. Also `clientconn.New/Conn.Handshake/Send/Recv/Close`, `clientconn.ErrClosedBeforeReply`, `sdk.New`, `sdk.Config`, `sdk.MemStore`, `sdk.NewDeviceID`, `sdk.Event`/`EventKind`/`EndKind`, `sdk.Windows`, `auth.Sign`.
+- Consumes (Plan 6a2a): `Env`, `NewBalancer`, `(*Balancer).Dial/SetDown/Down` (`Down` added at the 6a2a interface review, P6a2aI-1); `NewRecorder`, `(*Recorder).Online/Lost/Failed/Pong/PongMissing/Mark/SLO/Marks/Counts`, `Counts`, `SLO`; `pprofhttp.Register`. Also `clientconn.New/Conn.Handshake/Send/Recv/Close`, `clientconn.ErrClosedBeforeReply`, `sdk.New`, `sdk.Config`, `sdk.MemStore`, `sdk.NewDeviceID`, `sdk.Event`/`EventKind`/`EndKind`, `sdk.Windows`, `auth.Sign`.
 - Produces (Task 5 uses all of it):
   - `const AppID = "im"`; `type Config struct { Mode string; Clients int; Rate float64; UIDPrefix string; Sources int; PingEvery, Timeout time.Duration; windows sdk.Windows }`.
   - `func New(cfg Config, env Env) (*Runner, error)`; `(*Runner).Run(ctx context.Context)` (blocks until ctx ends and every client is stopped); `Recorder() *Recorder`; `Kill(gw, pid int, name string) (int, error)`; `Mark(gw int, name string, down bool) (int, error)`; `Stats() Stats`; `Result(within time.Duration) Result`; `Handler() http.Handler`.
@@ -398,7 +398,7 @@ func TestControlAPI(t *testing.T) {
 	if err := victim.Wait(); err == nil || victim.ProcessState.String() != "signal: killed" {
 		t.Fatalf("victim: %v", err)
 	}
-	if !r.bal.down[1] {
+	if !r.bal.Down(1) {
 		t.Fatal("killed gateway still in the balancer")
 	}
 	// A taken mark name: no signal, gw-0 stays in the balancer.
@@ -411,7 +411,7 @@ func TestControlAPI(t *testing.T) {
 	if code, _ := post(t, srv.URL+"/kill?"+q.Encode()); code != http.StatusConflict {
 		t.Fatalf("/kill with a taken mark: %d", code)
 	}
-	if r.bal.down[0] || other.Process.Signal(syscall.Signal(0)) != nil {
+	if r.bal.Down(0) || other.Process.Signal(syscall.Signal(0)) != nil {
 		t.Fatal("/kill with a taken mark took gw-0 out or signalled")
 	}
 	if code, _ := post(t, srv.URL+"/kill?gateway="+env.GatewayIDs[0]+"&mark=x"); code != http.StatusBadRequest {

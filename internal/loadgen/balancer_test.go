@@ -70,6 +70,9 @@ func TestBalancerLeastConnectionsAndSources(t *testing.T) {
 func TestBalancerSkipsDownGateways(t *testing.T) {
 	b, _ := NewBalancer(listeners(t, 2), 1)
 	b.SetDown(0)
+	if !b.Down(0) || b.Down(1) {
+		t.Fatalf("down: gw-0 %v gw-1 %v, want true false", b.Down(0), b.Down(1))
+	}
 	for range 3 {
 		if _, gw, err := b.Dial(context.Background()); err != nil || gw != 1 {
 			t.Fatalf("dial: gw %d %v, want gw 1", gw, err)

@@ -8,8 +8,10 @@ import (
 )
 
 // Recorder keeps per-client times and the run's counters (choice #83). Every
-// method takes one mutex: events arrive at most at the login rate (20k/s),
-// far below what a mutex serves.
+// method takes one mutex. Logins arrive at most at the login rate (20k/s)
+// and Pongs at clients ÷ PingEvery (60k/s at 600k every 10s), both well
+// below what a mutex serves; callers pass the times in, so a wait for the
+// lock never shows in a sample (P6a2aI-4).
 type Recorder struct {
 	mu      sync.Mutex
 	ids     []string
@@ -117,7 +119,9 @@ func (r *Recorder) PongMissing() {
 
 // Mark records instant now as name, with the clients logged in on gateway
 // gw (-1: on any gateway) as its population, and returns its size. A client
-// belongs to its latest mark only. Names are unique.
+// belongs to its latest mark only. Names are unique. gw -1 is only for an
+// event that ends every client's connection: a member that never loses it
+// is never back and fails the SLO (P6a2aI-2).
 func (r *Recorder) Mark(name string, gw int, now time.Time) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
