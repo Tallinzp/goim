@@ -7,7 +7,7 @@ export GOIM_REDIS_REPLICA_PORT ?= 16380
 COMPOSE_REDIS := docker compose -f deploy/compose/redis-test.yml
 TIER2_GUARD := test "$$GOIM_TEST_TIER" = 2 || { echo "Tier 2 host only: set GOIM_TEST_TIER=2"; exit 1; }
 
-.PHONY: test test-race-suite test-scripts redis-server test-redis-local proto redis-up redis-down test-redis test-tier2
+.PHONY: test test-race-suite test-scripts test-load-probe redis-server test-redis-local proto redis-up redis-down test-redis test-tier2
 
 # Tier 1a (dev machine): unit and Lua tests on in-process miniredis, race detector on.
 test:
@@ -20,12 +20,21 @@ test:
 test-race-suite:
 	GOIM_RACE_SUITE=1 GOIM_REDIS_SERVER=$(REDIS_SERVER) go test -count=1 -timeout 30m ./internal/racetest/
 
-# The Tier 2 and load-run scripts (Plan 6a1), on any machine: lib.sh's guard,
-# result.json, recording and host-setup checks, and a real stack.sh stack.
+# The Tier 2 and load-run scripts (Plans 6a1, 6a2), on any machine: lib.sh's
+# guard, result.json, recording and host-setup checks, loadgen.sh's JSON
+# readers, and a real stack.sh stack.
 # Needs python3, curl and redis-server (make redis-server).
 test-scripts:
 	scripts/tier2/lib_test.sh
+	scripts/loadgen_test.sh
 	STACK_REDIS_SERVER=$(REDIS_SERVER) scripts/stack_test.sh
+
+# The Tier 1a load probe (Plan 6a2, spec: ≤ 5k connections), on the dev
+# machine: a 2-gateway stack.sh stack and cmd/loadgen, light then sdk with a
+# gateway killed by loadgen. Not in make test (about 2 minutes). Needs
+# redis-server (make redis-server), curl and python3.
+test-load-probe:
+	STACK_REDIS_SERVER=$(REDIS_SERVER) scripts/load-probe.sh
 
 # The race suite's Redis: redis-server on PATH, else the pinned 7.4.11 that
 # make redis-server builds into .cache/redis (cc and make, no Docker).

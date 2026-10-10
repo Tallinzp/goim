@@ -5,7 +5,7 @@
 # core type (choice #71); the Tier 1a load probe (Plan 6a2) runs it unpinned.
 # Source it, set STACK_DIR, then:
 #
-#   stack_build                 # binaries into $STACK_DIR/bin
+#   stack_build                 # binaries into $STACK_DIR/bin (loadgen too, for scripts/loadgen.sh)
 #   stack_up                    # keys, processes, waits until all are Ready
 #   stack_snapshot NAME         # /metrics, heap and goroutine profiles of each process + redis INFO
 #                               #   -> $STACK_DIR/artifacts/NAME/
@@ -44,7 +44,7 @@ STACK_ORDER=()
 
 stack_build() {
   mkdir -p "$STACK_DIR/bin"
-  go build -o "$STACK_DIR/bin/" ./cmd/gateway ./cmd/logic ./cmd/devtoken
+  go build -o "$STACK_DIR/bin/" ./cmd/gateway ./cmd/logic ./cmd/devtoken ./cmd/loadgen
 }
 
 # stack_start NAME CPUS CMD...: starts CMD in the background in its own
