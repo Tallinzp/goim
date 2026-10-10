@@ -31,6 +31,10 @@
 #   CAPACITY_RATE      clients started per second (default 5000)
 #   CAPACITY_WINDOW    measured window in seconds (default: whole heartbeats,
 #                      at least 120s: 150s at 150s, 120s at 60s)
+#   CAPACITY_RECONCILE_CYCLE the gateway's -reconcile-cycle (default 24h: the
+#                      production 10m cycle starts its first pass at a random
+#                      point, which would land in some windows and not others;
+#                      reconcile_entries records any that did)
 #
 # Checks, for each phase P:
 #   P_stack            redis, devtoken, Logic and gw-0 become Ready
@@ -59,6 +63,7 @@ t2_nofile 1048576
 PHASES=${CAPACITY_PHASES:-a_default:600000:150:default a_tuned:600000:150:tuned c200_150:200000:150:tuned c200_60:200000:60:tuned}
 TUNED=(GOGC=${CAPACITY_GOGC:-off} GOMEMLIMIT=${CAPACITY_GOMEMLIMIT:-4GiB})
 CAP=${CAPACITY_CAP:-650000} RATE=${CAPACITY_RATE:-5000}
+RECONCILE=${CAPACITY_RECONCILE_CYCLE:-24h}
 export STACK_GATEWAYS=1 STACK_PIN=1
 STACK_PORT_BASE=${STACK_PORT_BASE:-17000}
 STACK_REDIS_SERVER=$PWD/.cache/redis/bin/redis-server
@@ -104,7 +109,7 @@ for phase in $PHASES; do
   export STACK_DIR=$T2_OUT/$name
   mkdir -p "$STACK_DIR"
   ln -sfn ../bin "$STACK_DIR/bin"
-  STACK_GATEWAY_ARGS=(-max-conns "$CAP" -heartbeat "${hb}s")
+  STACK_GATEWAY_ARGS=(-max-conns "$CAP" -heartbeat "${hb}s" -reconcile-cycle "$RECONCILE" -reconcile-jitter 0)
   STACK_GATEWAY_ENV=()
   [ "$gc" = tuned ] && STACK_GATEWAY_ENV=("${TUNED[@]}")
   t0=$SECONDS
@@ -143,6 +148,7 @@ for phase in $PHASES; do
   pongs0=$(lg_get /stats 'd["pongs"]')
   gc0=$(stack_metric gw-0 go_gc_duration_seconds_count)
   pause0=$(stack_metric gw-0 go_gc_duration_seconds_sum)
+  rec0=$(stack_metric gw-0 goim_gateway_reconcile_entries_total)
   t2_record_start "$name"
   stack_usage_start loadgen="$LG_PID"
   stack_profile window 30 & p1=$!
@@ -151,6 +157,11 @@ for phase in $PHASES; do
   wait $p1; wait $p2
   win=$(stack_usage_json)
   t2_record_end "$name"
+  # Reconcile entries in the window (no sample until the first entry, so
+  # null at both ends is 0; null at one end only is unknown).
+  rec1=$(stack_metric gw-0 goim_gateway_reconcile_entries_total)
+  reconcile=$(python3 -c 'import sys; a, b = sys.argv[1:3]
+print(0 if a == b == "null" else "null" if "null" in (a, b) else int(float(b) - float(a)))' "$rec0" "$rec1")
   pongs1=$(lg_get /stats 'd["pongs"]')
   gw=$(python3 -c 'import json, sys
 def n(s):
@@ -203,7 +214,7 @@ print(round(w["gw-0"]["cpu_s"] / p * 1e6, 1) if p > 0 and w.get("gw-0") else "nu
   problems=$(stack_health)
   t2_check "${name}_processes" "$(t2_bool [ -z "$problems" ])" "\"problems\": $(t2_json_str "$problems")"
 
-  t2_field "$name" "{\"clients\": $clients, \"heartbeat_s\": $hb, \"window_s\": $window, \"gc\": $(t2_json_str "$gc"), \"gateway_env\": $(t2_json_str "${STACK_GATEWAY_ENV[*]}"), \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"ramp_s\": $ramp_s, \"ramp\": $ramp, \"window\": $win, \"gateway\": $gw, \"live_heap_mb\": $live_mb, \"live_bytes_per_conn\": $per_conn, \"pings_in_window\": $pings, \"gateway_us_per_pong\": $per, \"stop_s\": $stop_s, \"login_latency\": $(lg_json 'd["login_latency"]'), \"pong_rtt\": $(lg_json 'd["pong_rtt"]'), \"failed\": $(lg_json 'd["failed"]'), \"sources\": $(lg_json 'd["sources"]')}"
+  t2_field "$name" "{\"clients\": $clients, \"heartbeat_s\": $hb, \"window_s\": $window, \"gc\": $(t2_json_str "$gc"), \"gateway_env\": $(t2_json_str "${STACK_GATEWAY_ENV[*]}"), \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"ramp_s\": $ramp_s, \"ramp\": $ramp, \"window\": $win, \"gateway\": $gw, \"live_heap_mb\": $live_mb, \"live_bytes_per_conn\": $per_conn, \"pings_in_window\": $pings, \"gateway_us_per_pong\": $per, \"reconcile_entries\": $reconcile, \"stop_s\": $stop_s, \"login_latency\": $(lg_json 'd["login_latency"]'), \"pong_rtt\": $(lg_json 'd["pong_rtt"]'), \"failed\": $(lg_json 'd["failed"]'), \"sources\": $(lg_json 'd["sources"]')}"
   summary+=("$(t2_json_str "$name"): {\"clients\": $clients, \"heartbeat_s\": $hb, \"gc\": $(t2_json_str "$gc"), \"gateway_cores\": $(echo "$win" | lg_py - 'd["gw-0"]["cores"]'), \"gateway_rss_mb\": $(echo "$win" | lg_py - 'd["gw-0"]["rss_mb"]'), \"live_heap_mb\": $live_mb, \"live_bytes_per_conn\": $per_conn, \"gateway_us_per_pong\": $per, \"gc_mark_cpu_pct\": $(echo "$gw" | lg_py - 'd["gc_mark_cpu_pct"]'), \"ramp_gateway_cores\": $(echo "$ramp" | lg_py - 'd["gw-0"]["cores"]'), \"loadgen_rss_mb\": $(echo "$win" | lg_py - 'd["loadgen"]["rss_mb"]')}")
   t2_duration "$name" $((SECONDS - t0))
 done
