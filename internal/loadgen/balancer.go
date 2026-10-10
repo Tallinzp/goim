@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"sync"
-	"sync/atomic"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -17,16 +16,20 @@ var ErrNoGateway = errors.New("loadgen: every gateway is down")
 
 // Balancer stands in for the NLB (choice #81): each dial goes to the live
 // gateway with the fewest open connections (the least-connections algorithm
-// the spec asks of the cloud LB, R5S-O4), from the next source address in
-// turn. A gateway marked down (loadgen killed or silenced it) gets no new
+// the spec asks of the cloud LB, R5S-O4), from that gateway's next source
+// address in turn. A gateway marked down (loadgen killed or silenced it) gets no new
 // dials, as an LB removes a failed target.
 type Balancer struct {
 	addrs []string
 	srcs  []net.IP
-	next  atomic.Uint64
 	mu    sync.Mutex
 	open  []int
 	down  []bool
+	// next is each gateway's source turn. One turn shared by all gateways
+	// falls into step with least connections, which visits the gateways in
+	// order: with 4 gateways and 10 sources each gateway would get only 5
+	// sources, and twice the connections per (source, destination) pair.
+	next []int
 }
 
 // Sources are loadgen's source addresses 127.0.0.2, 127.0.0.3, … (choice
@@ -48,7 +51,8 @@ func NewBalancer(addrs []string, sources int) (*Balancer, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Balancer{addrs: addrs, srcs: srcs, open: make([]int, len(addrs)), down: make([]bool, len(addrs))}, nil
+	return &Balancer{addrs: addrs, srcs: srcs, open: make([]int, len(addrs)), down: make([]bool, len(addrs)),
+		next: make([]int, len(addrs))}, nil
 }
 
 // SetDown takes gateway gw out of rotation for new dials.
@@ -65,7 +69,8 @@ func (b *Balancer) Open() []int {
 	return append([]int(nil), b.open...)
 }
 
-func (b *Balancer) pick() (int, error) {
+// pick takes a slot on the chosen gateway and that gateway's next source.
+func (b *Balancer) pick() (int, net.IP, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	best := -1
@@ -75,10 +80,12 @@ func (b *Balancer) pick() (int, error) {
 		}
 	}
 	if best < 0 {
-		return -1, ErrNoGateway
+		return -1, nil, ErrNoGateway
 	}
 	b.open[best]++
-	return best, nil
+	src := b.srcs[b.next[best]]
+	b.next[best] = (b.next[best] + 1) % len(b.srcs)
+	return best, src, nil
 }
 
 func (b *Balancer) release(gw int) {
@@ -90,11 +97,10 @@ func (b *Balancer) release(gw int) {
 // Dial connects to the chosen gateway and returns its index. The
 // connection counts as open on that gateway until it is closed.
 func (b *Balancer) Dial(ctx context.Context) (net.Conn, int, error) {
-	gw, err := b.pick()
+	gw, src, err := b.pick()
 	if err != nil {
 		return nil, -1, err
 	}
-	src := b.srcs[b.next.Add(1)%uint64(len(b.srcs))]
 	d := net.Dialer{LocalAddr: &net.TCPAddr{IP: src}, Control: bindNoPort}
 	nc, err := d.DialContext(ctx, "tcp", b.addrs[gw])
 	if err != nil {

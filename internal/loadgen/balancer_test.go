@@ -127,3 +127,27 @@ func TestSourcesRange(t *testing.T) {
 		t.Fatalf("last source %v", ips[252])
 	}
 }
+
+// Sources turn per gateway: least connections visits the gateways in order,
+// so one shared turn with as many sources as gateways would give each
+// gateway one source, and its 28,232 ports per (source, destination) pair
+// would run out at a fraction of the planned load (#69, final review).
+func TestBalancerEveryGatewayUsesEverySource(t *testing.T) {
+	b, _ := NewBalancer(listeners(t, 2), 2)
+	pairs := map[[2]string]int{}
+	for range 8 {
+		c, gw, err := b.Dial(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		pairs[[2]string{b.addrs[gw], c.LocalAddr().(*net.TCPAddr).IP.String()}]++
+	}
+	if len(pairs) != 4 {
+		t.Fatalf("(gateway, source) pairs %v, want all 4 twice each", pairs)
+	}
+	for p, n := range pairs {
+		if n != 2 {
+			t.Fatalf("pair %v used %d times, want 2: %v", p, n, pairs)
+		}
+	}
+}
