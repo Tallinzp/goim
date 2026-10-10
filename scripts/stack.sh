@@ -19,6 +19,8 @@
 #   STACK_PIN            1: taskset gateways to T2_CPUS_GATEWAY, Logic and Redis
 #                        to T2_CPUS_LOGIC (lib.sh sets both); 0: no pinning (default)
 #   STACK_REDIS_SERVER   default: redis-server on PATH, else .cache/redis/bin/redis-server
+#   STACK_GATEWAY_PROCS  each gateway's GOMAXPROCS (default: max(1, CPUs / STACK_GATEWAYS),
+#                        CPUs = T2_CPUS_GATEWAY when pinned, else all online; #79)
 #   STACK_GATEWAY_ARGS, STACK_LOGIC_ARGS   arrays of extra flags
 #   STACK_DOWN_WAIT      seconds stack_down waits for the gateways to drain (default 10)
 #
@@ -106,6 +108,18 @@ stack_up() {
   fi
   mkdir -p "$STACK_DIR/keys/noise" "$STACK_DIR/logs" "$STACK_DIR/artifacts" "$STACK_DIR/redis"
 
+  # Each gateway's GOMAXPROCS is its CPU share (#79); -loops and the
+  # handshake concurrency default from it, as in a pod with a CPU limit.
+  local cpus procs=${STACK_GATEWAY_PROCS:-}
+  if [ -z "$procs" ]; then
+    if [ "${STACK_PIN:-0}" = 1 ]; then
+      cpus=$(t2_cpulist_expand "$gw_cpus" | wc -w)
+    else
+      cpus=$(getconf _NPROCESSORS_ONLN)
+    fi
+    procs=$((cpus / n > 1 ? cpus / n : 1))
+  fi
+
   # Keys: the Noise static key (key_id 1) and the token signing key.
   local pub
   rm -f "$STACK_DIR/keys/noise/1" "$STACK_DIR/keys/jwt.jwk"
@@ -143,7 +157,7 @@ stack_up() {
   stack_wait logic "http://$admin/readyz" || return 1
   for ((i = 0; i < n; i++)); do
     local listen=127.0.0.1:$((base + 100 + 10 * i)) gadmin=127.0.0.1:$((base + 102 + 10 * i))
-    stack_start "gw-$i" "$gw_cpus" "$bin/gateway" -id "gw-$i" -listen "tcp://$listen" \
+    stack_start "gw-$i" "$gw_cpus" env GOMAXPROCS="$procs" "$bin/gateway" -id "gw-$i" -listen "tcp://$listen" \
       -noise-keys "$STACK_DIR/keys/noise" -logic "$grpc" -lease "$lease" \
       -kick-addr "127.0.0.1:$((base + 101 + 10 * i))" -admin-addr "$gadmin" "${STACK_GATEWAY_ARGS[@]}"
     addrs+="${addrs:+,}$listen"
@@ -160,6 +174,7 @@ JWT_KEY=$STACK_DIR/keys/jwt.jwk
 REDIS_ADDR=$redis_addr
 LOGIC_ADMIN=$admin
 ADMIN_ADDRS=$admins
+GATEWAY_PROCS=$procs
 ENV
 }
 

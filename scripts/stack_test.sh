@@ -17,9 +17,13 @@ expect() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1: got [$2], want [$3]";
 STACK_GATEWAYS=2
 STACK_PORT_BASE=${STACK_PORT_BASE:-17500}
 STACK_PIN=1
-T2_CPUS_GATEWAY=$(($(getconf _NPROCESSORS_ONLN) - 1)) # the last CPU
+ncpu=$(getconf _NPROCESSORS_ONLN)
+# Gateways get every CPU, so their CPU share (#79: CPUs / gateways) differs
+# from the GOMAXPROCS Go would take from the affinity mask.
+T2_CPUS_GATEWAY=0-$((ncpu - 1))
 T2_CPUS_LOGIC=0
-STACK_GATEWAY_ARGS=(-max-conns 1000 -pending-cap 1000 -logout-queue 1000 -loops 1)
+STACK_GATEWAY_ARGS=(-max-conns 1000 -pending-cap 1000 -logout-queue 1000)
+procs=$((ncpu / 2 > 1 ? ncpu / 2 : 1))
 
 stack_build || { echo "build failed"; exit 1; }
 if stack_up; then ok "up: every process Ready"; else bad "up"; exit 1; fi
@@ -28,6 +32,10 @@ if stack_up; then ok "up: every process Ready"; else bad "up"; exit 1; fi
 expect "env: two gateway addresses" "$GATEWAY_ADDRS" "127.0.0.1:$((STACK_PORT_BASE + 100)),127.0.0.1:$((STACK_PORT_BASE + 110))"
 expect "env: Noise public key is 32 bytes" "$(printf '%s' "$NOISE_PUBLIC" | base64 -d 2>/dev/null | wc -c)" 32
 [ -s "$JWT_KEY" ] && ok "env: token key" || bad "env: token key missing"
+expect "env: gateway procs is the CPU share" "${GATEWAY_PROCS:-}" "$procs"
+for name in gw-0 gw-1; do
+  grep -q " loops=$procs " "$STACK_DIR/logs/$name.log" && ok "procs: $name runs $procs loops" || bad "procs: $name: $(grep -o ' loops=[0-9]* ' "$STACK_DIR/logs/$name.log")"
+done
 for name in gw-0 gw-1; do
   stack_pinned "$name" "$T2_CPUS_GATEWAY" && ok "pin: $name on CPU $T2_CPUS_GATEWAY" || bad "pin: $name"
 done
@@ -59,5 +67,14 @@ expect "down: no process left" "$left" 0
 stack_port_free "$STACK_PORT_BASE" && stack_port_free $((STACK_PORT_BASE + 100)) && ok "down: ports free" || bad "down: ports still in use"
 # Gateways stop before Logic (#78), so a drain never loses its lease renewals.
 grep -q "lease renewal failed" "$STACK_DIR/logs/gw-0.log" && bad "down: gw-0 lost lease renewals while draining: $(grep -m 1 "lease renewal failed" "$STACK_DIR/logs/gw-0.log")" || ok "down: no lease renewal failed in gw-0 log"
+
+# STACK_GATEWAY_PROCS overrides the share (one gateway alone would get every CPU).
+STACK_GATEWAYS=1 STACK_GATEWAY_PROCS=1
+if stack_up; then
+  grep -q " loops=1 " "$STACK_DIR/logs/gw-0.log" && ok "procs: STACK_GATEWAY_PROCS=1 runs 1 loop" || bad "procs: override: $(grep -o ' loops=[0-9]* ' "$STACK_DIR/logs/gw-0.log")"
+else
+  bad "up: second stack"
+fi
+stack_down
 
 [ "$fails" -eq 0 ] && echo "stack_test: all passed" || { echo "stack_test: $fails failed"; exit 1; }
