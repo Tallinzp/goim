@@ -16,8 +16,9 @@
 #
 # Logs go to $STACK_DIR/logs/loadgen-NAME.log, the result (final stats and
 # every mark's SLO) to $STACK_DIR/artifacts/loadgen-NAME.json. The control
-# API listens on STACK_PORT_BASE + 5. With STACK_PIN=1 loadgen is pinned to
-# T2_CPUS_LOADGEN (choice #71). Like stack.sh's processes, loadgen runs in
+# API listens on STACK_PORT_BASE + 5, one of stack_ports, so a leftover
+# loadgen there is refused before the stack starts. With STACK_PIN=1
+# loadgen is pinned to T2_CPUS_LOADGEN (choice #71). Like stack.sh's processes, loadgen runs in
 # its own process group, added to T2_OURS_PGIDS.
 
 LG_PID=""

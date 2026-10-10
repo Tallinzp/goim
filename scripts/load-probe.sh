@@ -47,7 +47,7 @@ lg_stop
 check "light: loadgen exited 0" "$([ "$LG_STATUS" = 0 ] && echo true)" "status $LG_STATUS"
 check "light: every Ping answered" "$(lg_json 'd["pong_missing"] == 0 and d["pongs"] >= 3000 * 2')" \
   "pongs $(lg_json 'd["pongs"]'), missing $(lg_json 'd["pong_missing"]')"
-check "light: none lost while held" "$(lg_json 'set(d["lost"]) <= {"stopped"}')" "$(lg_json 'd["lost"]')"
+check "light: none lost while held" "$(lg_json 'd["lost"] == {}')" "$(lg_json 'd["lost"]')"
 echo "     light: login p99 $(lg_json 'd["login_latency"]["p99_ms"]')ms, Pong p99 $(lg_json 'd["pong_rtt"]["p99_ms"]')ms, failed $(lg_json 'd["failed"]')"
 
 # 2: sdk, and a gateway killed by loadgen.

@@ -18,7 +18,9 @@ import (
 const AppID = "im"
 
 // connsPerSource is the default number of connections per (source,
-// gateway) pair, well inside the 28,232-port ephemeral range (#69).
+// gateway) pair, well inside the 28,232-port ephemeral range (#69), sized
+// for one gateway less than the stack has: after /kill its clients log in
+// again on the others.
 const connsPerSource = 20_000
 
 // Config configures a run.
@@ -27,7 +29,7 @@ type Config struct {
 	Clients   int           // client i logs in as uid <UIDPrefix>-<i>
 	Rate      float64       // clients started per second
 	UIDPrefix string        // distinct per loadgen run, so runs never replace each other's sessions
-	Sources   int           // source addresses; 0: one per 20,000 connections per gateway
+	Sources   int           // source addresses; 0: one per 20,000 connections per gateway, with one gateway gone
 	PingEvery time.Duration // light: the Ping interval (cmd/loadgen: 150s, the gateway's default heartbeat)
 	Timeout   time.Duration // light: dial + handshake + Login (cmd/loadgen: 10s)
 	windows   sdk.Windows   // tests only: the SDK's built-in reconnect windows
@@ -72,7 +74,8 @@ func New(cfg Config, env Env) (*Runner, error) {
 		return nil, errors.New("loadgen: light mode needs PingEvery and Timeout")
 	}
 	if cfg.Sources == 0 {
-		perGW := (cfg.Clients + len(env.GatewayAddrs) - 1) / len(env.GatewayAddrs)
+		gws := max(1, len(env.GatewayAddrs)-1)
+		perGW := (cfg.Clients + gws - 1) / gws
 		cfg.Sources = (perGW + connsPerSource - 1) / connsPerSource
 	}
 	bal, err := NewBalancer(env.GatewayAddrs, cfg.Sources)
@@ -164,22 +167,32 @@ func (r *Runner) start(ctx context.Context, wg *sync.WaitGroup, i int) {
 	r.mu.Unlock()
 }
 
+// ErrKillAfterMark is a SIGKILL that failed after its mark was taken: the
+// process ended between Kill's check and the signal. The mark stands.
+var ErrKillAfterMark = errors.New("loadgen: SIGKILL failed after the mark")
+
 // Kill is POST /kill: the clients logged in on gateway gw become mark
 // name's population, gw leaves the balancer, and pid gets SIGKILL. The mark
 // is taken just before the signal is sent: T_death, the moment loadgen
-// issues SIGKILL (R4M-17). A mark name already taken changes nothing: no
-// gateway leaves the balancer and no signal is sent. A dial that picks gw
-// between the mark and SetDown is not logged in at the mark, so it is not
-// in the population.
+// issues SIGKILL (R4M-17). A pid that is gone or a mark name already taken
+// changes nothing: no mark, no gateway leaves the balancer and no signal is
+// sent. A dial that picks gw between the mark and SetDown is not logged in
+// at the mark, so it is not in the population.
 func (r *Runner) Kill(gw, pid int, name string) (int, error) {
 	if pid <= 0 {
 		return 0, fmt.Errorf("loadgen: pid %d", pid)
+	}
+	if err := syscall.Kill(pid, 0); err != nil {
+		return 0, fmt.Errorf("loadgen: pid %d: %w", pid, err)
 	}
 	n, err := r.Mark(gw, name, true)
 	if err != nil {
 		return 0, err
 	}
-	return n, syscall.Kill(pid, syscall.SIGKILL)
+	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
+		return n, fmt.Errorf("%w: pid %d: %v", ErrKillAfterMark, pid, err)
+	}
+	return n, nil
 }
 
 // Mark is POST /mark: a named instant on gateway gw (-1: every gateway),

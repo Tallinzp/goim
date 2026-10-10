@@ -25,6 +25,9 @@ T2_CPUS_LOGIC=0
 STACK_GATEWAY_ARGS=(-max-conns 1000 -pending-cap 1000 -logout-queue 1000)
 procs=$((ncpu / 2 > 1 ? ncpu / 2 : 1))
 
+# The ports checked before stack_up include loadgen's control port.
+stack_ports | grep -qx $((STACK_PORT_BASE + 5)) && ok "ports: loadgen's control port" || bad "ports: loadgen's control port missing"
+
 # stack_term records what wait reports, "killed" only for a process our
 # SIGKILL ended (M1): a kill -KILL that lands on an exited, unreaped process
 # (stubbed here) must not turn a clean exit 0 into "killed".

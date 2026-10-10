@@ -325,6 +325,18 @@ func TestControlAPI(t *testing.T) {
 	if r.bal.Down(0) || other.Process.Signal(syscall.Signal(0)) != nil {
 		t.Fatal("/kill with a taken mark took gw-0 out or signalled")
 	}
+	// A pid that is gone: no mark, gw-0 stays in the balancer.
+	gone := exec.Command("true")
+	if err := gone.Run(); err != nil {
+		t.Fatal(err)
+	}
+	q = url.Values{"gateway": {env.GatewayIDs[0]}, "pid": {itoa(gone.Process.Pid)}, "mark": {"stale"}}
+	if code, _ := post(t, srv.URL+"/kill?"+q.Encode()); code != http.StatusConflict {
+		t.Fatalf("/kill with a stale pid: %d", code)
+	}
+	if _, err := r.Recorder().SLO("stale", time.Second); r.bal.Down(0) || err == nil {
+		t.Fatal("/kill with a stale pid took gw-0 out or took the mark")
+	}
 	if code, _ := post(t, srv.URL+"/kill?gateway="+env.GatewayIDs[0]+"&mark=x"); code != http.StatusBadRequest {
 		t.Fatalf("/kill without pid: %d", code)
 	}

@@ -114,7 +114,8 @@ lg_stop
 t2_field light "{\"exit\": $LG_STATUS, \"rss_mb\": $rss, \"login_latency\": $(lg_json 'd["login_latency"]'), \"pong_rtt\": $(lg_json 'd["pong_rtt"]'), \"failed\": $(lg_json 'd["failed"]'), \"sources\": $(lg_json 'd["sources"]')}"
 res=$STACK_DIR/artifacts/loadgen-light.json
 t2_check light_pongs "$(lg_true "$res" 'd["pong_missing"] == 0 and d["pongs"] >= '"$LIGHT"' * 5')" "\"pongs\": $(lg_json 'd["pongs"]'), \"missing\": $(lg_json 'd["pong_missing"]')"
-t2_check light_held "$(lg_true "$res" 'set(d["lost"]) <= {"stopped"}')" "\"lost\": $(lg_json 'd["lost"]')"
+# The result is taken before any client stops (#84): even "stopped" is a loss.
+t2_check light_held "$(lg_true "$res" 'd["lost"] == {}')" "\"lost\": $(lg_json 'd["lost"]')"
 
 # 7-8: SDK clients, and a gateway killed by loadgen (b1 in small).
 t=$SECONDS

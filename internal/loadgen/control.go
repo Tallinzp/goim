@@ -2,6 +2,7 @@ package loadgen
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -29,6 +30,7 @@ func (r *Runner) Result(within time.Duration) Result {
 //
 //	GET  /stats                               Stats
 //	POST /kill?gateway=gw-1&pid=N&mark=death  SIGKILL and mark T_death  {"mark", "population"}
+//	                                          409: pid gone or mark taken, nothing changed; 500: ErrKillAfterMark
 //	POST /mark?gateway=gw-1|all&mark=drop     a mark; &down=1 also takes the gateway out of the balancer
 //	GET  /slo?mark=death&within=30s           SLO
 //	/debug/pprof/                             loadgen's own profiles
@@ -43,7 +45,10 @@ func (r *Runner) Handler() http.Handler {
 			return
 		}
 		n, err := r.Kill(gw, pid, q.FormValue("mark"))
-		if err != nil {
+		if errors.Is(err, ErrKillAfterMark) {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		} else if err != nil {
 			http.Error(w, err.Error(), http.StatusConflict)
 			return
 		}
