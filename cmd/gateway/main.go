@@ -143,7 +143,7 @@ func parseFlags(args []string) (gateway.Config, gateway.ServerConfig, tcp.Config
 	fs.IntVar(&cfg.MaxConns, "max-conns", cfg.MaxConns, "connection cap: open sockets in any state")
 	fs.IntVar(&cfg.PendingCap, "pending-cap", cfg.PendingCap, "HANDSHAKE + AUTH_PENDING sockets")
 	fs.IntVar(&cfg.LoginQueueCap, "login-queue-cap", cfg.LoginQueueCap, "Logins waiting for or inside a Login RPC")
-	fs.IntVar(&cfg.LogoutQueue, "logout-queue", cfg.LogoutQueue, "Logouts queued or waiting for a retry")
+	fs.IntVar(&cfg.LogoutQueue, "logout-queue", cfg.LogoutQueue, "Logouts queued or waiting for a retry (default: -max-conns)")
 	fs.DurationVar(&cfg.HandshakeTimeout, "handshake-timeout", cfg.HandshakeTimeout, "accept → handshake done (3s–30s)")
 	fs.DurationVar(&cfg.AuthTimeout, "auth-timeout", cfg.AuthTimeout, "handshake done → LoginReq (3s–30s)")
 	fs.DurationVar(&cfg.Heartbeat, "heartbeat", cfg.Heartbeat, "heartbeat interval sent in LoginResp")
@@ -178,6 +178,13 @@ func parseFlags(args []string) (gateway.Config, gateway.ServerConfig, tcp.Config
 	fs.IntVar(&tc.HandshakeBurst, "handshake-burst", tc.HandshakeBurst, "handshake token bucket burst")
 	if err := fs.Parse(args); err != nil {
 		return cfg, sc, tc, o, err
+	}
+	// The Logout queue defaults to the cap (#89): when every connection
+	// closes at once, each queues one Logout, and a full queue drops it.
+	logoutQueueSet := false
+	fs.Visit(func(f *flag.Flag) { logoutQueueSet = logoutQueueSet || f.Name == "logout-queue" })
+	if !logoutQueueSet {
+		cfg.LogoutQueue = cfg.MaxConns
 	}
 	tc.HandshakeConcurrency = tcp.DefaultConfig(cfg.NumLoops).HandshakeConcurrency
 	if *concurrency != 0 {

@@ -48,6 +48,30 @@ func TestDefaultFlagsAreValid(t *testing.T) {
 	}
 }
 
+// The Logout queue follows the connection cap unless set (#89): a gateway
+// whose connections all close at once (a loadgen stop, a whole-population
+// reconnect) queues one Logout per connection, and a queue below the cap
+// drops the excess, leaving sessions for the sweeper.
+func TestLogoutQueueFollowsTheCap(t *testing.T) {
+	for _, c := range []struct {
+		args []string
+		want int
+	}{
+		{nil, 250_000},
+		{[]string{"-max-conns", "650000"}, 650_000},
+		{[]string{"-max-conns", "650000", "-logout-queue", "1000"}, 1000},
+		{[]string{"-logout-queue", "1000", "-max-conns", "650000"}, 1000},
+	} {
+		cfg, _, _, _, err := parseFlags(append([]string{"-id", "gw-0"}, c.args...))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.LogoutQueue != c.want {
+			t.Errorf("%v: logout queue %d, want %d", c.args, cfg.LogoutQueue, c.want)
+		}
+	}
+}
+
 // The race suite's flags (Plan 5b).
 func TestRaceSuiteFlags(t *testing.T) {
 	cfg, _, _, o, err := parseFlags([]string{"-id", "gw-0", "-faults", "-clock-offset", "-5s",
