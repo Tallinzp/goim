@@ -155,7 +155,9 @@ t2_finish() {
   for c in "${T2_CHECKS[@]}"; do
     case "$c" in *'{"pass": false'*) pass=false ;; esac
   done
-  t2_result_json "$pass" >"$T2_OUT/result.json"
+  # Written aside and renamed: a signal mid-write leaves no result.json, so
+  # t2_exit writes the "stopped" one instead of keeping a half file.
+  t2_result_json "$pass" >"$T2_OUT/result.json.tmp" && mv "$T2_OUT/result.json.tmp" "$T2_OUT/result.json"
   cat "$T2_OUT/result.json"
   $pass && exit 0 || exit 1
 }
@@ -192,6 +194,7 @@ t2_exit() {
     eval "${T2_EXIT_HOOKS[i]}" >/dev/null 2>&1
   done
   # A run that ends before t2_finish still leaves a result.json (P6a1I-1).
+  rm -f "$T2_OUT/result.json.tmp"
   if [ ! -f "$T2_OUT/result.json" ]; then
     if [ -n "${T2_REFUSED:-}" ]; then
       t2_result_json false "\"refused\": $(t2_json_str "$T2_REFUSED")"
@@ -200,13 +203,16 @@ t2_exit() {
     fi >"$T2_OUT/result.json"
   fi
   t2_write_report
-  echo "report: $T2_REPORT"
+  # To the stdout saved by t2_traps: a signal can run this trap while a
+  # function's stdout is redirected to a file (t2_finish's result.json).
+  echo "report: $T2_REPORT" >&"$T2_STDOUT"
   exit "$rc"
 }
 
 # t2_traps: the exit hooks and the report run on any exit, including
 # Ctrl-C and SIGTERM, so no process or DROP rule outlives the run.
 t2_traps() {
+  exec {T2_STDOUT}>&1
   trap t2_exit EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM

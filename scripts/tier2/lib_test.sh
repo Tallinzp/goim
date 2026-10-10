@@ -104,6 +104,15 @@ expect "stopped: result.json names the refusal" "$(stopped)" "False None refused
 rc=$(fake_run 'kill -TERM $BASHPID; sleep 5')
 expect "stopped: SIGTERM exits 143" "$rc" 143
 expect "stopped: SIGTERM is recorded" "$(stopped)" "False {'exit': 143} None []"
+# A signal while t2_finish writes result.json (git status is slow on a big
+# checkout) must not leave a half or "pass": true file behind.
+mkdir -p "$tmp/slowgit"
+printf '#!/bin/sh\n[ "$1" = status ] && sleep 2\nexec %s "$@"\n' "$(command -v git)" >"$tmp/slowgit/git"
+chmod +x "$tmp/slowgit/git"
+rc=$(fake_run 'PATH="$tmp/slowgit:$PATH"; t2_check a true; me=$BASHPID; (sleep 1; kill -TERM $me) & t2_finish')
+expect "stopped: SIGTERM during t2_finish exits 143" "$rc" 143
+expect "stopped: SIGTERM during t2_finish leaves valid JSON" "$(valid_json "$tmp/run/out/result.json")" ""
+expect "stopped: SIGTERM during t2_finish is recorded" "$(stopped)" "False {'exit': 143} None ['a']"
 rc=$(fake_run 't2_check a true; t2_finish')
 expect "stopped: a finished run is not marked stopped" "$(stopped)" "True None None ['a']"
 
