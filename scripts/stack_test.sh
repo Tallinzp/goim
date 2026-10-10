@@ -57,5 +57,7 @@ left=0
 for p in "${pids[@]}"; do kill -0 "$p" 2>/dev/null && left=$((left + 1)); done
 expect "down: no process left" "$left" 0
 stack_port_free "$STACK_PORT_BASE" && stack_port_free $((STACK_PORT_BASE + 100)) && ok "down: ports free" || bad "down: ports still in use"
+# Gateways stop before Logic (#78), so a drain never loses its lease renewals.
+grep -q "lease renewal failed" "$STACK_DIR/logs/gw-0.log" && bad "down: gw-0 lost lease renewals while draining: $(grep -m 1 "lease renewal failed" "$STACK_DIR/logs/gw-0.log")" || ok "down: no lease renewal failed in gw-0 log"
 
 [ "$fails" -eq 0 ] && echo "stack_test: all passed" || { echo "stack_test: $fails failed"; exit 1; }

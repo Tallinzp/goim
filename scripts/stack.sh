@@ -8,7 +8,7 @@
 #   stack_build                 # binaries into $STACK_DIR/bin
 #   stack_up                    # keys, processes, waits until all are Ready
 #   stack_snapshot NAME         # /metrics of each process + redis INFO -> $STACK_DIR/artifacts/NAME/
-#   stack_down                  # SIGTERM, then SIGKILL after 10s; call it from the exit trap
+#   stack_down                  # gateways, then Logic, devtoken, Redis (#78); call it from the exit trap
 #
 # Settings (environment, read by stack_up):
 #   STACK_DIR            work dir (required): bin/, keys/, logs/, artifacts/, stack.env
@@ -20,6 +20,7 @@
 #                        to T2_CPUS_LOGIC (lib.sh sets both); 0: no pinning (default)
 #   STACK_REDIS_SERVER   default: redis-server on PATH, else .cache/redis/bin/redis-server
 #   STACK_GATEWAY_ARGS, STACK_LOGIC_ARGS   arrays of extra flags
+#   STACK_DOWN_WAIT      seconds stack_down waits for the gateways to drain (default 10)
 #
 # stack.env (for loadgen, Plan 6a2) holds GATEWAY_ADDRS (comma-separated),
 # NOISE_KEY_ID, NOISE_PUBLIC, JWT_KEY (the devtoken private key file), and
@@ -182,23 +183,36 @@ stack_pinned() {
   [ "$(t2_cpulist_expand "${have##*: }")" = "$(t2_cpulist_expand "$2")" ]
 }
 
-# stack_down: SIGTERM to all (gateways drain), SIGKILL whatever is left after 10s.
-stack_down() {
-  local name pid i
-  for ((i = ${#STACK_ORDER[@]} - 1; i >= 0; i--)); do
-    kill -TERM "${STACK_PIDS[${STACK_ORDER[i]}]}" 2>/dev/null
-  done
-  for i in $(seq 100); do
-    pid=""
-    for name in "${STACK_ORDER[@]}"; do
-      kill -0 "${STACK_PIDS[$name]}" 2>/dev/null && pid=1
-    done
-    [ -z "$pid" ] && break
+# stack_term WAIT NAME...: SIGTERM to NAMEs at once, wait up to WAIT seconds
+# for them to exit, then SIGKILL whatever is left.
+stack_term() {
+  local wait=$1 name alive i
+  shift
+  for name in "$@"; do kill -TERM "${STACK_PIDS[$name]}" 2>/dev/null; done
+  for i in $(seq $((wait * 10))); do
+    alive=""
+    for name in "$@"; do kill -0 "${STACK_PIDS[$name]}" 2>/dev/null && alive=1; done
+    [ -z "$alive" ] && break
     sleep 0.1
   done
-  for name in "${STACK_ORDER[@]}"; do
+  for name in "$@"; do
     kill -KILL "${STACK_PIDS[$name]}" 2>/dev/null
     wait "${STACK_PIDS[$name]}" 2>/dev/null
+  done
+}
+
+# stack_down: stops in dependency order (#78): the gateways first, together,
+# up to STACK_DOWN_WAIT (10s) for their drain, so Logic still answers their
+# lease renewals; then Logic, devtoken and Redis, each up to 5s. Whatever
+# outlives its wait is SIGKILLed, so teardown stays bounded (25s).
+stack_down() {
+  local name gws=()
+  for name in "${STACK_ORDER[@]}"; do
+    [[ $name == gw-* ]] && gws+=("$name")
+  done
+  [ ${#gws[@]} -gt 0 ] && stack_term "${STACK_DOWN_WAIT:-10}" "${gws[@]}"
+  for name in logic devtoken redis; do
+    [ -n "${STACK_PIDS[$name]:-}" ] && stack_term 5 "$name"
   done
   STACK_ORDER=()
   STACK_PIDS=()
