@@ -7,6 +7,7 @@
 #   lg_get PATH EXPR            # EXPR (python, over the JSON as d) of GET PATH on the control API
 #   lg_post PATH                # POST PATH; prints the reply, fails on an HTTP error
 #   lg_wait_back MARK SECONDS   # until every client of MARK logged in again
+#   lg_profile NAME SECONDS     # loadgen's CPU profile over SECONDS -> $STACK_DIR/artifacts/NAME/loadgen.cpu.pb.gz
 #   lg_stop                     # SIGTERM, then wait (60s) for it to write its result; LG_STATUS = exit status
 #   lg_json EXPR                # EXPR over the result file of the last loadgen
 #   lg_true SOURCE EXPR         # "true" if EXPR is true over SOURCE (a file, or - for stdin), else "false"
@@ -84,6 +85,14 @@ lg_wait_back() {
     sleep 0.5
   done
   return 1
+}
+
+# lg_profile NAME SECONDS: loadgen's own CPU profile (its control API serves
+# pprof), beside stack_profile's, so a run shows whether loadgen was the
+# bottleneck (P6a2aI-4). Blocks for SECONDS.
+lg_profile() {
+  mkdir -p "$STACK_DIR/artifacts/$1"
+  curl -sf -m $(($2 + 30)) "http://$(lg_control)/debug/pprof/profile?seconds=$2" >"$STACK_DIR/artifacts/$1/loadgen.cpu.pb.gz"
 }
 
 # lg_stop sets LG_STATUS rather than printing it: in $(...) it would run in a

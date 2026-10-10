@@ -11,6 +11,10 @@
 #                               #   -> $STACK_DIR/artifacts/NAME/
 #   stack_profile NAME SECONDS  # CPU profiles of Logic and every gateway at once -> artifacts/NAME/
 #   stack_expect_dead NAME      # NAME was killed on purpose (loadgen /kill): reap and record it
+#   stack_metric NAME METRIC [MATCH]  # sum of METRIC's samples (with MATCH in the line) on NAME's /metrics
+#   stack_wait_idle SECONDS     # phase boundary: every gateway at 0 connections and 0 awaiting Logout
+#   stack_usage_start [N=PID..] # start a CPU window over the stack's processes (and N=PID extras)
+#   stack_usage_json            # {"window_s", NAME: {"cpu_s", "cores", "rss_mb"}...} since the start
 #   stack_down                  # gateways, then Logic, devtoken, Redis (#78); call it from the exit trap
 #   stack_health                # one line per problem: dead process, unclean stop, panic in a log
 #
@@ -26,6 +30,7 @@
 #   STACK_GATEWAY_PROCS  each gateway's GOMAXPROCS (default: max(1, CPUs / STACK_GATEWAYS),
 #                        CPUs = T2_CPUS_GATEWAY when pinned, else all online; #79)
 #   STACK_GATEWAY_ARGS, STACK_LOGIC_ARGS   arrays of extra flags
+#   STACK_GATEWAY_ENV    array of VAR=VALUE for every gateway, e.g. (GOGC=off GOMEMLIMIT=4GiB) (#88)
 #   STACK_DRAIN_WINDOW   gateway -drain-window (default 1s, so stack_down's drain ends and
 #                        exits 0 well inside STACK_DOWN_WAIT; a measured drain sets 60s)
 #   STACK_DOWN_WAIT      seconds stack_down waits for the gateways to drain (default 10)
@@ -179,7 +184,7 @@ stack_up() {
   stack_wait logic "http://$admin/readyz" || return 1
   for ((i = 0; i < n; i++)); do
     local listen=127.0.0.1:$((base + 100 + 10 * i)) gadmin=127.0.0.1:$((base + 102 + 10 * i))
-    stack_start "gw-$i" "$gw_cpus" env GOMAXPROCS="$procs" "$bin/gateway" -id "gw-$i" -listen "tcp://$listen" \
+    stack_start "gw-$i" "$gw_cpus" env GOMAXPROCS="$procs" "${STACK_GATEWAY_ENV[@]}" "$bin/gateway" -id "gw-$i" -listen "tcp://$listen" \
       -noise-keys "$STACK_DIR/keys/noise" -logic "$grpc" -lease "$lease" \
       -kick-addr "127.0.0.1:$((base + 101 + 10 * i))" -admin-addr "$gadmin" \
       -drain-window "${STACK_DRAIN_WINDOW:-1s}" "${STACK_GATEWAY_ARGS[@]}"
@@ -245,6 +250,83 @@ stack_profile() {
   # child, Redis included, and one wait for several returns the last status.
   for pid in "${pids[@]}"; do wait "$pid" || rc=1; done
   return $rc
+}
+
+# stack_metric NAME METRIC [MATCH]: the sum of METRIC's samples on NAME's
+# /metrics (lines "METRIC{...} V" or "METRIC V", and containing MATCH if
+# given, e.g. 'state="online"'), as an integer when whole; "null" if NAME
+# does not answer or has no such sample, so it can go straight into JSON.
+stack_metric() {
+  local admin body
+  admin=$(stack_admins | awk -v n="$1" '$1 == n { print $2 }')
+  [ -n "$admin" ] && body=$(curl -sf -m 10 "http://$admin/metrics") || { echo null; return; }
+  awk -v m="$2" -v want="${3:-}" '
+    ($1 == m || index($1, m "{") == 1) && index($0, want) { s += $NF; n++ }
+    END { if (!n) print "null"; else if (s == int(s)) printf "%d\n", s; else printf "%.6g\n", s }' <<<"$body"
+}
+
+# stack_wait_idle SECONDS: the phase boundary on a shared stack (P6a2bI-3):
+# waits until every running gateway has no open connection and no closed
+# one still awaiting its fenced Logout, so a stopped loadgen's closes and
+# Logouts do not spill into the next phase. Fails, naming what is left, after
+# SECONDS. A gateway that does not answer counts as busy.
+stack_wait_idle() {
+  local end=$((SECONDS + $1)) name admin busy c a
+  while :; do
+    busy=""
+    while read -r name admin; do
+      [[ $name == gw-* ]] || continue
+      c=$(stack_metric "$name" goim_gateway_connections)
+      a=$(stack_metric "$name" goim_gateway_awaiting_logout)
+      [ "$c" = 0 ] && [ "$a" = 0 ] || busy+=" $name: connections $c, awaiting_logout $a;"
+    done < <(stack_admins)
+    [ -z "$busy" ] && return 0
+    if [ $SECONDS -ge $end ]; then
+      echo "stack: not idle after $1s:${busy%;}" >&2
+      return 1
+    fi
+    sleep 0.5
+  done
+}
+
+# stack_ticks PID: utime + stime of PID in clock ticks (every thread), read
+# after the last ')' so a comm with spaces cannot shift the fields.
+stack_ticks() {
+  awk '{ n = length($0); while (n > 0 && substr($0, n, 1) != ")") n--
+         split(substr($0, n + 2), f, " "); print f[12] + f[13] }' "/proc/$1/stat" 2>/dev/null
+}
+
+# stack_usage_start [NAME=PID...]: starts a CPU window over every running
+# stack process and the NAME=PID extras (loadgen), for per-process sizing:
+# CPU-seconds and cores in the window, resident memory at its end.
+declare -A STACK_USAGE0=()
+STACK_USAGE_PIDS=()
+STACK_USAGE_T0=0
+stack_usage_start() {
+  local name e
+  STACK_USAGE0=() STACK_USAGE_PIDS=()
+  for name in "${STACK_ORDER[@]}"; do STACK_USAGE_PIDS+=("$name=${STACK_PIDS[$name]}"); done
+  STACK_USAGE_PIDS+=("$@")
+  for e in "${STACK_USAGE_PIDS[@]}"; do STACK_USAGE0[${e%%=*}]=$(stack_ticks "${e#*=}"); done
+  STACK_USAGE_T0=$(date +%s%N)
+}
+
+# stack_usage_json: {"window_s": W, NAME: {"cpu_s", "cores", "rss_mb"}, ...}
+# since stack_usage_start (cores = cpu_s / W); a process gone since is null.
+stack_usage_json() {
+  local hz e name pid t1 out
+  hz=$(getconf CLK_TCK)
+  t1=$(date +%s%N)
+  out="\"window_s\": $(awk -v d=$((t1 - STACK_USAGE_T0)) 'BEGIN { printf "%.1f", d / 1e9 }')"
+  for e in "${STACK_USAGE_PIDS[@]}"; do
+    name=${e%%=*} pid=${e#*=}
+    out+=", \"$name\": $(awk -v t0="${STACK_USAGE0[$name]:-}" -v t1="$(stack_ticks "$pid")" -v hz="$hz" \
+      -v w=$((t1 - STACK_USAGE_T0)) -v rss="$(awk '/^VmRSS:/ { print $2 }' "/proc/$pid/status" 2>/dev/null)" '
+      BEGIN { if (t0 == "" || t1 == "" || rss == "") { print "null"; exit }
+              c = (t1 - t0) / hz
+              printf "{\"cpu_s\": %.2f, \"cores\": %.3f, \"rss_mb\": %d}", c, c / (w / 1e9), rss / 1024 }')"
+  done
+  echo "{$out}"
 }
 
 # stack_pinned NAME CPUS: the process's affinity is exactly CPUS.

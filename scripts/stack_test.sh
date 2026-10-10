@@ -23,10 +23,11 @@ ncpu=$(getconf _NPROCESSORS_ONLN)
 T2_CPUS_GATEWAY=0-$((ncpu - 1))
 T2_CPUS_LOGIC=0
 STACK_GATEWAY_ARGS=(-max-conns 1000 -pending-cap 1000 -logout-queue 1000)
+STACK_GATEWAY_ENV=(GOGC=50 GOMEMLIMIT=1GiB)
 procs=$((ncpu / 2 > 1 ? ncpu / 2 : 1))
 
 # The ports checked before stack_up include loadgen's control port.
-stack_ports | grep -qx $((STACK_PORT_BASE + 5)) && ok "ports: loadgen's control port" || bad "ports: loadgen's control port missing"
+grep -qx $((STACK_PORT_BASE + 5)) <<<"$(stack_ports)" && ok "ports: loadgen's control port" || bad "ports: loadgen's control port missing"
 
 # stack_term records what wait reports, "killed" only for a process our
 # SIGKILL ended (M1): a kill -KILL that lands on an exited, unreaped process
@@ -92,6 +93,45 @@ for f in logic gw-0 gw-1; do
   grep -q 'goroutine profile:' "$STACK_DIR/artifacts/idle/$f.goroutine.txt" 2>/dev/null && ok "snapshot: $f goroutines" || bad "snapshot: $f goroutines"
   gzip -t "$STACK_DIR/artifacts/idle/$f.heap.pb.gz" 2>/dev/null && ok "snapshot: $f heap profile" || bad "snapshot: $f heap profile"
 done
+# The gateways run with STACK_GATEWAY_ENV (#88), Logic without it.
+for name in gw-0 gw-1; do
+  expect "env: $name has GOGC and GOMEMLIMIT" "$(tr '\0' '\n' <"/proc/${STACK_PIDS[$name]}/environ" | grep -E '^GO(GC|MEMLIMIT)=' | sort | tr '\n' ' ')" "GOGC=50 GOMEMLIMIT=1GiB "
+done
+expect "env: Logic has no GOGC" "$(tr '\0' '\n' <"/proc/${STACK_PIDS[logic]}/environ" | grep -c '^GOGC=')" 0
+
+# stack_metric sums a metric's samples, filtered by a label; null when absent.
+expect "metric: a gauge" "$(stack_metric gw-0 goim_gateway_tracked)" 0
+expect "metric: summed over labels" "$(stack_metric gw-0 goim_gateway_connections)" 0
+expect "metric: filtered by a label" "$(stack_metric gw-0 goim_gateway_limit 'limit="nofile"')" "$(ulimit -n)"
+expect "metric: a name is not a prefix" "$(stack_metric gw-0 go_gc_duration_seconds_coun)" null
+expect "metric: no such metric" "$(stack_metric gw-0 goim_no_such_metric)" null
+expect "metric: no such process" "$(stack_metric gw-9 goim_gateway_ready)" null
+case $(stack_metric gw-0 go_gc_duration_seconds 'quantile="1"') in
+  null | "") bad "metric: a summary quantile" ;; *) ok "metric: a summary quantile" ;;
+esac
+
+# The phase boundary (P6a2bI-3): idle at once on an idle stack; a socket open
+# on gw-0 keeps it busy, named, until the socket closes.
+stack_wait_idle 5 && ok "idle: an idle stack" || bad "idle: an idle stack"
+python3 -c 'import socket,sys,time; s=socket.create_connection(("127.0.0.1", int(sys.argv[1]))); time.sleep(3)' $((STACK_PORT_BASE + 100)) &
+holder=$!
+sleep 0.5
+out=$(stack_wait_idle 1 2>&1) && bad "idle: an open socket must keep it busy" || ok "idle: an open socket keeps it busy"
+contains() { case "$2" in *"$3"*) ok "$1" ;; *) bad "$1: [$2] lacks [$3]" ;; esac; }
+contains "idle: names the gateway" "$out" "gw-0: connections 1"
+wait $holder
+stack_wait_idle 10 && ok "idle: after the socket closed" || bad "idle: after the socket closed"
+
+# stack_usage: CPU and RSS per process over a window, extras included; a
+# process gone since is null.
+sleep 30 & extra=$!
+stack_usage_start extra=$extra gone=999999999
+sleep 1
+kill $extra; wait $extra 2>/dev/null
+usage=$(stack_usage_json)
+expect "usage: every process, the extras, and the window" "$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(sorted(d), 0.9 < d["window_s"] < 3, d["gw-0"]["rss_mb"] > 0, d["gw-0"]["cpu_s"] >= 0, d["gone"], d["extra"])' "$usage")" \
+  "['devtoken', 'extra', 'gone', 'gw-0', 'gw-1', 'logic', 'redis', 'window_s'] True True True None None"
+
 stack_profile cpu 1
 # A failed profile fails stack_profile, even when it is not the last one
 # (Logic's comes first; 6a2a final review).
@@ -189,7 +229,6 @@ fi
 
 # Pinning without lib.sh is refused, not run with GOMAXPROCS 1 (M6).
 out=$(unset -f t2_cpulist_expand; STACK_PIN=1; stack_up 2>&1; echo "rc=$?"; stack_down)
-contains() { case "$2" in *"$3"*) ok "$1" ;; *) bad "$1: [$2] lacks [$3]" ;; esac; }
 contains "pin: without lib.sh is refused" "$out" "rc=1"
 contains "pin: says lib.sh is needed" "$out" "lib.sh"
 expect "pin: nothing started" "$(grep -c 'Ready\|serving' <<<"$out")" 0
