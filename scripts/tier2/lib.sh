@@ -171,6 +171,7 @@ t2_write_report() {
     echo "date:    $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "commit:  $(git rev-parse HEAD) ($(git rev-parse --abbrev-ref HEAD))"
     echo "dirty:   $(git status --porcelain | wc -l) changed files"
+    git status --porcelain | awk 'NR <= 20 { print "  " $0 } END { if (NR > 20) print "  … " NR - 20 " more" }'
     echo "host:    $T2_CORES cores, ${T2_MEM_GB}GB RAM, $(uname -sr)"
     echo "go:      $(go version)"
     if [ -n "${T2_REFUSED:-}" ]; then

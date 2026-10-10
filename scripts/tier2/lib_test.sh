@@ -107,6 +107,18 @@ expect "stopped: SIGTERM is recorded" "$(stopped)" "False {'exit': 143} None []"
 rc=$(fake_run 't2_check a true; t2_finish')
 expect "stopped: a finished run is not marked stopped" "$(stopped)" "True None None ['a']"
 
+# The report names the changed files, at most 20 (P6a1I-6).
+mkdir -p "$tmp/repo" && (cd "$tmp/repo" && git init -q . && touch stray.txt)
+rc=$(fake_run 'cd "$tmp/repo"; t2_check a true; t2_finish')
+report=$(cat "$tmp/run/out.report.txt")
+contains "report: dirty count" "$report" "dirty:   1 changed files"
+contains "report: names the changed file" "$report" "?? stray.txt"
+(cd "$tmp/repo" && for i in $(seq 25); do touch "f$i"; done)
+rc=$(fake_run 'cd "$tmp/repo"; t2_check a true; t2_finish')
+report=$(cat "$tmp/run/out.report.txt")
+expect "report: at most 20 changed files" "$(grep -c '^ *?? ' <<<"$report")" 20
+contains "report: says how many more" "$report" "… 6 more"
+
 # Run recording.
 expect "cpulist: expands ranges" "$(t2_cpulist_expand 4-6,9,16-17)" "4 5 6 9 16 17"
 t2_mem_verdict 10 12 >/dev/null; expect "mem: enough passes" "$?" 0
