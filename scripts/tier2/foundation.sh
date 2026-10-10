@@ -19,6 +19,8 @@
 #   4. netdrop:    with goim-netdrop add, a connect to gw-0 times out; after
 #                  del it connects again, and no goim-netdrop rule is left
 #   5. no_swap_in: no page swapped in during the 30s idle window
+#   6. processes:  no process died, panicked or stopped uncleanly (stack_health
+#                  after stack_down)
 set -uo pipefail
 
 . "$(dirname "$0")/lib.sh"
@@ -101,6 +103,11 @@ after=$(t2_bool connects)
 left=$(sudo -n /usr/local/sbin/goim-netdrop list | wc -l)
 t2_check netdrop "$(t2_bool [ "$before$dropped$after$left" = truefalsetrue0 ])" \
   "\"connects_before\": $before, \"connects_while_dropped\": $dropped, \"connects_after\": $after, \"rules_left\": $left"
+
+# 6: process health, after a clean stop (the exit hook's stack_down is then a no-op).
+stack_down
+problems=$(stack_health)
+t2_check processes "$(t2_bool [ -z "$problems" ])" "\"problems\": $(t2_json_str "$problems")"
 
 t2_not_covered "load: loadgen is Plan 6a2" "Redis Cluster (Plan 6c)"
 t2_finish

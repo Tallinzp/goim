@@ -9,6 +9,7 @@
 #   stack_up                    # keys, processes, waits until all are Ready
 #   stack_snapshot NAME         # /metrics of each process + redis INFO -> $STACK_DIR/artifacts/NAME/
 #   stack_down                  # gateways, then Logic, devtoken, Redis (#78); call it from the exit trap
+#   stack_health                # one line per problem: dead process, unclean stop, panic in a log
 #
 # Settings (environment, read by stack_up):
 #   STACK_DIR            work dir (required): bin/, keys/, logs/, artifacts/, stack.env
@@ -22,6 +23,8 @@
 #   STACK_GATEWAY_PROCS  each gateway's GOMAXPROCS (default: max(1, CPUs / STACK_GATEWAYS),
 #                        CPUs = T2_CPUS_GATEWAY when pinned, else all online; #79)
 #   STACK_GATEWAY_ARGS, STACK_LOGIC_ARGS   arrays of extra flags
+#   STACK_DRAIN_WINDOW   gateway -drain-window (default 1s, so stack_down's drain ends and
+#                        exits 0 well inside STACK_DOWN_WAIT; a measured drain sets 60s)
 #   STACK_DOWN_WAIT      seconds stack_down waits for the gateways to drain (default 10)
 #
 # stack.env (for loadgen, Plan 6a2) holds GATEWAY_ADDRS (comma-separated),
@@ -107,6 +110,7 @@ stack_up() {
     return 1
   fi
   mkdir -p "$STACK_DIR/keys/noise" "$STACK_DIR/logs" "$STACK_DIR/artifacts" "$STACK_DIR/redis"
+  rm -f "$STACK_DIR/exit-status"
 
   # Each gateway's GOMAXPROCS is its CPU share (#79); -loops and the
   # handshake concurrency default from it, as in a pod with a CPU limit.
@@ -159,7 +163,8 @@ stack_up() {
     local listen=127.0.0.1:$((base + 100 + 10 * i)) gadmin=127.0.0.1:$((base + 102 + 10 * i))
     stack_start "gw-$i" "$gw_cpus" env GOMAXPROCS="$procs" "$bin/gateway" -id "gw-$i" -listen "tcp://$listen" \
       -noise-keys "$STACK_DIR/keys/noise" -logic "$grpc" -lease "$lease" \
-      -kick-addr "127.0.0.1:$((base + 101 + 10 * i))" -admin-addr "$gadmin" "${STACK_GATEWAY_ARGS[@]}"
+      -kick-addr "127.0.0.1:$((base + 101 + 10 * i))" -admin-addr "$gadmin" \
+      -drain-window "${STACK_DRAIN_WINDOW:-1s}" "${STACK_GATEWAY_ARGS[@]}"
     addrs+="${addrs:+,}$listen"
     admins+=",$gadmin"
   done
@@ -199,7 +204,8 @@ stack_pinned() {
 }
 
 # stack_term WAIT NAME...: SIGTERM to NAMEs at once, wait up to WAIT seconds
-# for them to exit, then SIGKILL whatever is left.
+# for them to exit, then SIGKILL whatever is left. Appends "NAME STATUS" to
+# $STACK_DIR/exit-status, STATUS "killed" when it needed the SIGKILL.
 stack_term() {
   local wait=$1 name alive i
   shift
@@ -211,8 +217,13 @@ stack_term() {
     sleep 0.1
   done
   for name in "$@"; do
-    kill -KILL "${STACK_PIDS[$name]}" 2>/dev/null
-    wait "${STACK_PIDS[$name]}" 2>/dev/null
+    if kill -KILL "${STACK_PIDS[$name]}" 2>/dev/null; then
+      wait "${STACK_PIDS[$name]}" 2>/dev/null
+      echo "$name killed" >>"$STACK_DIR/exit-status"
+    else
+      wait "${STACK_PIDS[$name]}" 2>/dev/null
+      echo "$name $?" >>"$STACK_DIR/exit-status"
+    fi
   done
 }
 
@@ -231,4 +242,33 @@ stack_down() {
   done
   STACK_ORDER=()
   STACK_PIDS=()
+}
+
+# stack_health: one line per problem, nothing when healthy (P6a1I-2): a
+# process not running while the stack is up; once stack_down has run, a stop
+# that was not clean (status 0; devtoken has no SIGTERM handler, so 143 too)
+# or needed SIGKILL; and any log line starting with "panic:" or "fatal error:".
+stack_health() {
+  local name status f line
+  if [ -f "$STACK_DIR/exit-status" ]; then
+    while read -r name status; do
+      case "$name:$status" in
+        *:0 | devtoken:143) ;;
+        *:killed) echo "$name: did not stop after SIGTERM, killed" ;;
+        *) if [ "$status" -gt 128 ] 2>/dev/null; then
+             echo "$name: stopped by SIG$(kill -l "$((status - 128))" 2>/dev/null || echo "$((status - 128))") (status $status)"
+           else
+             echo "$name: exited with status $status"
+           fi ;;
+      esac
+    done <"$STACK_DIR/exit-status"
+  else
+    for name in "${STACK_ORDER[@]}"; do
+      kill -0 "${STACK_PIDS[$name]}" 2>/dev/null || echo "$name: not running"
+    done
+  fi
+  for f in "$STACK_DIR"/logs/*.log; do
+    [ -f "$f" ] || continue
+    line=$(grep -m 1 -E '^(panic:|fatal error:)' "$f") && echo "$(basename "$f" .log): $line"
+  done
 }

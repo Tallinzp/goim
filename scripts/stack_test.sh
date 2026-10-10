@@ -59,14 +59,23 @@ grep -q "STACK_PORT_BASE" "$STACK_DIR/second" && bad "up: still advises another 
 busy=$(stack_busy_ports)
 expect "busy: every port of the stack" "$(echo "$busy" | wc -l)" 11
 
+declare -F stack_health >/dev/null && ok "health: stack_health defined" || bad "health: stack_health not defined"
+expect "health: a running healthy stack has no problems" "$(stack_health 2>&1)" ""
+
 pids=("${STACK_PIDS[@]}")
 stack_down
+expect "health: every process's exit status recorded" "$(wc -l <"$STACK_DIR/exit-status" 2>/dev/null)" 5
+expect "health: a clean stop has no problems" "$(stack_health 2>&1)" ""
 left=0
 for p in "${pids[@]}"; do kill -0 "$p" 2>/dev/null && left=$((left + 1)); done
 expect "down: no process left" "$left" 0
 stack_port_free "$STACK_PORT_BASE" && stack_port_free $((STACK_PORT_BASE + 100)) && ok "down: ports free" || bad "down: ports still in use"
-# Gateways stop before Logic (#78), so a drain never loses its lease renewals.
-grep -q "lease renewal failed" "$STACK_DIR/logs/gw-0.log" && bad "down: gw-0 lost lease renewals while draining: $(grep -m 1 "lease renewal failed" "$STACK_DIR/logs/gw-0.log")" || ok "down: no lease renewal failed in gw-0 log"
+# Gateways stop before Logic (#78), so a drain keeps its lease renewals and
+# ends its epoch on Logic.
+for name in gw-0 gw-1; do
+  lost=$(grep -m 1 -E "lease renewal failed|EpochEnded failed" "$STACK_DIR/logs/$name.log")
+  expect "down: $name drained with Logic up" "$lost" ""
+done
 
 # STACK_GATEWAY_PROCS overrides the share (one gateway alone would get every CPU).
 STACK_GATEWAYS=1 STACK_GATEWAY_PROCS=1
@@ -75,6 +84,14 @@ if stack_up; then
 else
   bad "up: second stack"
 fi
+# A gateway that dies during the run is reported, and stays reported after the stop.
+kill -KILL "${STACK_PIDS[gw-0]}"
+sleep 0.2
+grep -q "^gw-0: not running" <<<"$(stack_health)" && ok "health: a dead gateway is reported" || bad "health: dead gateway: [$(stack_health 2>&1)]"
 stack_down
+grep -q "^gw-0: .*SIGKILL" <<<"$(stack_health)" && ok "health: its stop is reported unclean" || bad "health: killed gateway after stop: [$(stack_health 2>&1)]"
+expect "health: only the dead gateway" "$(stack_health | grep -v '^gw-0:')" ""
+echo "panic: runtime error: test" >>"$STACK_DIR/logs/logic.log"
+grep -q "^logic: panic: runtime error: test" <<<"$(stack_health)" && ok "health: a panic in a log is reported" || bad "health: panic: [$(stack_health 2>&1)]"
 
 [ "$fails" -eq 0 ] && echo "stack_test: all passed" || { echo "stack_test: $fails failed"; exit 1; }
