@@ -27,9 +27,11 @@
 #                        exits 0 well inside STACK_DOWN_WAIT; a measured drain sets 60s)
 #   STACK_DOWN_WAIT      seconds stack_down waits for the gateways to drain (default 10)
 #
-# stack.env (for loadgen, Plan 6a2) holds GATEWAY_ADDRS (comma-separated),
-# NOISE_KEY_ID, NOISE_PUBLIC, JWT_KEY (the devtoken private key file), and
-# the admin addresses. Every process is started from this shell, so it
+# stack.env (for loadgen, Plan 6a2; P6a1I-4) holds, comma-separated and in
+# the same gateway order: GATEWAY_ADDRS (client listeners), GATEWAY_IDS,
+# GATEWAY_ADMINS, GATEWAY_KICK_ADDRS; then GATEWAY_PROCS (each gateway's
+# GOMAXPROCS), NOISE_KEY_ID, NOISE_PUBLIC, JWT_KEY (the devtoken private key
+# file), REDIS_ADDR and LOGIC_ADMIN. Every process is started from this shell, so it
 # stays in the caller's process group (lib.sh counts that group as ours).
 
 declare -A STACK_PIDS=()
@@ -134,7 +136,7 @@ stack_up() {
 
   local redis_addr=127.0.0.1:$base devtoken=127.0.0.1:$((base + 1))
   local grpc=127.0.0.1:$((base + 2)) lease=127.0.0.1:$((base + 3)) admin=127.0.0.1:$((base + 4))
-  local kick="" addrs="" admins="$admin"
+  local kick="" addrs="" ids="" admins="" kicks=""
   for ((i = 0; i < n; i++)); do
     kick+="${kick:+,}\"gw-$i\": \"127.0.0.1:$((base + 101 + 10 * i))\""
   done
@@ -166,20 +168,24 @@ stack_up() {
       -kick-addr "127.0.0.1:$((base + 101 + 10 * i))" -admin-addr "$gadmin" \
       -drain-window "${STACK_DRAIN_WINDOW:-1s}" "${STACK_GATEWAY_ARGS[@]}"
     addrs+="${addrs:+,}$listen"
-    admins+=",$gadmin"
+    ids+="${ids:+,}gw-$i"
+    admins+="${admins:+,}$gadmin"
+    kicks+="${kicks:+,}127.0.0.1:$((base + 101 + 10 * i))"
   done
   for ((i = 0; i < n; i++)); do
     stack_wait "gw-$i" "http://127.0.0.1:$((base + 102 + 10 * i))/readyz" || return 1
   done
   cat >"$STACK_DIR/stack.env" <<ENV
 GATEWAY_ADDRS=$addrs
+GATEWAY_IDS=$ids
+GATEWAY_ADMINS=$admins
+GATEWAY_KICK_ADDRS=$kicks
+GATEWAY_PROCS=$procs
 NOISE_KEY_ID=1
 NOISE_PUBLIC=$pub
 JWT_KEY=$STACK_DIR/keys/jwt.jwk
 REDIS_ADDR=$redis_addr
 LOGIC_ADMIN=$admin
-ADMIN_ADDRS=$admins
-GATEWAY_PROCS=$procs
 ENV
 }
 

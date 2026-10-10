@@ -32,6 +32,13 @@ if stack_up; then ok "up: every process Ready"; else bad "up"; exit 1; fi
 expect "env: two gateway addresses" "$GATEWAY_ADDRS" "127.0.0.1:$((STACK_PORT_BASE + 100)),127.0.0.1:$((STACK_PORT_BASE + 110))"
 expect "env: Noise public key is 32 bytes" "$(printf '%s' "$NOISE_PUBLIC" | base64 -d 2>/dev/null | wc -c)" 32
 [ -s "$JWT_KEY" ] && ok "env: token key" || bad "env: token key missing"
+b=$STACK_PORT_BASE
+expect "env: gateway ids, in address order" "${GATEWAY_IDS:-}" "gw-0,gw-1"
+expect "env: gateway admin addresses" "${GATEWAY_ADMINS:-}" "127.0.0.1:$((b + 102)),127.0.0.1:$((b + 112))"
+expect "env: gateway Kick addresses" "${GATEWAY_KICK_ADDRS:-}" "127.0.0.1:$((b + 101)),127.0.0.1:$((b + 111))"
+expect "env: Logic admin" "$LOGIC_ADMIN" "127.0.0.1:$((b + 4))"
+expect "env: Redis" "$REDIS_ADDR" "127.0.0.1:$b"
+expect "env: no mixed ADMIN_ADDRS" "${ADMIN_ADDRS-unset}" unset
 expect "env: gateway procs is the CPU share" "${GATEWAY_PROCS:-}" "$procs"
 for name in gw-0 gw-1; do
   grep -q " loops=$procs " "$STACK_DIR/logs/$name.log" && ok "procs: $name runs $procs loops" || bad "procs: $name: $(grep -o ' loops=[0-9]* ' "$STACK_DIR/logs/$name.log")"
