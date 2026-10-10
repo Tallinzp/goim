@@ -15,6 +15,7 @@ import (
 
 	pb "github.com/Tallinzp/goim/api/internalpb"
 	"github.com/Tallinzp/goim/internal/fault"
+	"github.com/Tallinzp/goim/internal/pprofhttp"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
@@ -134,6 +135,7 @@ func NewServer(cfg Config, sc ServerConfig, d Deps) (*Server, error) {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(d.Registry, promhttp.HandlerOpts{}))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	pprofhttp.Register(mux)
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
 		if !s.Ready() {
 			http.Error(w, "not ready: no key set or not serving", http.StatusServiceUnavailable)

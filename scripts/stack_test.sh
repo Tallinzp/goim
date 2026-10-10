@@ -84,6 +84,15 @@ for f in logic gw-0 gw-1; do
   grep -q '^# TYPE' "$STACK_DIR/artifacts/idle/$f.metrics" && ok "snapshot: $f metrics" || bad "snapshot: $f metrics"
 done
 grep -q '^redis_version:' "$STACK_DIR/artifacts/idle/redis.info" && ok "snapshot: redis INFO" || bad "snapshot: redis INFO"
+# Profiles from pprof on the admin ports (choice #85).
+for f in logic gw-0 gw-1; do
+  grep -q 'goroutine profile:' "$STACK_DIR/artifacts/idle/$f.goroutine.txt" 2>/dev/null && ok "snapshot: $f goroutines" || bad "snapshot: $f goroutines"
+  gzip -t "$STACK_DIR/artifacts/idle/$f.heap.pb.gz" 2>/dev/null && ok "snapshot: $f heap profile" || bad "snapshot: $f heap profile"
+done
+stack_profile cpu 1
+for f in logic gw-0 gw-1; do
+  gzip -t "$STACK_DIR/artifacts/cpu/$f.cpu.pb.gz" 2>/dev/null && ok "profile: $f CPU profile" || bad "profile: $f CPU profile"
+done
 
 # A second stack on the same ports is refused before it starts anything.
 (STACK_DIR=$(mktemp -d); STACK_ORDER=(); stack_up 2>"$STACK_DIR/err"; echo $? >"$STACK_DIR/rc"; cat "$STACK_DIR/err" "$STACK_DIR/rc") >"$STACK_DIR/second" 2>&1
@@ -141,6 +150,25 @@ STACK_GATEWAYS=1
 stack_up 2>/dev/null && bad "up: should refuse the held port" || ok "up: refused while the port is held"
 expect "health: a refused stack_up reports no earlier stack" "$(stack_health 2>&1)" ""
 kill $holder; wait $holder 2>/dev/null
+
+# A gateway killed on purpose (loadgen's /kill, #84) is reaped and is not a
+# problem; a running one is refused.
+STACK_GATEWAYS=2
+if stack_up; then
+  stack_expect_dead gw-1 2>/dev/null && bad "dead: a running gateway is refused" || ok "dead: a running gateway is refused"
+  kill -KILL "${STACK_PIDS[gw-1]}"
+  stack_expect_dead gw-1 && ok "dead: a killed gateway is reaped" || bad "dead: reap"
+  expect "dead: not a problem while the stack runs" "$(stack_health 2>&1)" ""
+  stack_snapshot after-kill
+  [ -e "$STACK_DIR/artifacts/after-kill/gw-1.metrics" ] && bad "dead: snapshot skips it" || ok "dead: snapshot skips it"
+  stack_down
+  expect "dead: recorded as expected" "$(grep '^gw-1 ' "$STACK_DIR/exit-status")" "gw-1 expected:137"
+  expect "dead: not a problem after the stop" "$(stack_health 2>&1)" ""
+  echo "panic: runtime error: before the kill" >>"$STACK_DIR/logs/gw-1.log"
+  grep -q "^gw-1: panic: runtime error: before the kill" <<<"$(stack_health)" && ok "dead: a panic in its log is still reported" || bad "dead: panic not reported: [$(stack_health 2>&1)]"
+else
+  bad "up: expect-dead stack"
+fi
 
 # Pinning without lib.sh is refused, not run with GOMAXPROCS 1 (M6).
 out=$(unset -f t2_cpulist_expand; STACK_PIN=1; stack_up 2>&1; echo "rc=$?"; stack_down)

@@ -76,6 +76,9 @@ func TestServerEndToEnd(t *testing.T) {
 	if c := httpStatus(t, "http://"+adminAddr+"/healthz"); c != http.StatusOK {
 		t.Fatalf("healthz: %d", c)
 	}
+	if c := httpStatus(t, "http://"+adminAddr+"/debug/pprof/goroutine?debug=1"); c != http.StatusOK {
+		t.Fatalf("pprof: %d", c) // choice #85
+	}
 	if err := keys.Load(ctx); err != nil {
 		t.Fatal(err)
 	}

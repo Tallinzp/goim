@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"errors"
+	"io"
 	"io/fs"
 	"net/http"
 	"strings"
@@ -94,5 +95,20 @@ func TestFailedLimitsKeepTheGatewayNotReady(t *testing.T) {
 	}
 	if readyz(t, l.g) != http.StatusServiceUnavailable {
 		t.Fatal("/readyz is OK with a failed limits check")
+	}
+}
+
+// The admin port serves pprof, so load runs can save profiles (choice #85).
+func TestAdminServesPprof(t *testing.T) {
+	l := startLive(t, nil, nil)
+	_, admin := l.g.Addrs()
+	resp, err := http.Get("http://" + admin + "/debug/pprof/goroutine?debug=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "goroutine profile:") {
+		t.Fatalf("pprof: %d %.80q", resp.StatusCode, body)
 	}
 }

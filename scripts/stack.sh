@@ -7,7 +7,10 @@
 #
 #   stack_build                 # binaries into $STACK_DIR/bin
 #   stack_up                    # keys, processes, waits until all are Ready
-#   stack_snapshot NAME         # /metrics of each process + redis INFO -> $STACK_DIR/artifacts/NAME/
+#   stack_snapshot NAME         # /metrics, heap and goroutine profiles of each process + redis INFO
+#                               #   -> $STACK_DIR/artifacts/NAME/
+#   stack_profile NAME SECONDS  # CPU profiles of Logic and every gateway at once -> artifacts/NAME/
+#   stack_expect_dead NAME      # NAME was killed on purpose (loadgen /kill): reap and record it
 #   stack_down                  # gateways, then Logic, devtoken, Redis (#78); call it from the exit trap
 #   stack_health                # one line per problem: dead process, unclean stop, panic in a log
 #
@@ -200,17 +203,42 @@ LOGIC_ADMIN=$admin
 ENV
 }
 
-# stack_snapshot NAME: every process's /metrics and Redis INFO, for result
-# artifacts (spec: Automation contract, a metrics snapshot).
+# stack_admins: "NAME ADMIN" for Logic and each running gateway.
+stack_admins() {
+  local base=${STACK_PORT_BASE:-17000} i
+  [ -n "${STACK_PIDS[logic]:-}" ] && echo "logic 127.0.0.1:$((base + 4))"
+  for ((i = 0; i < ${STACK_GATEWAYS:-1}; i++)); do
+    [ -n "${STACK_PIDS[gw-$i]:-}" ] && echo "gw-$i 127.0.0.1:$((base + 102 + 10 * i))"
+  done
+}
+
+# stack_snapshot NAME: every process's /metrics, heap profile and goroutine
+# dump (pprof on the admin port, choice #85), and Redis INFO, for result
+# artifacts (spec: Automation contract: pprof, a metrics snapshot). A
+# gateway killed on purpose (stack_expect_dead) is skipped.
 stack_snapshot() {
-  local dir=$STACK_DIR/artifacts/$1 base=${STACK_PORT_BASE:-17000} i
+  local dir=$STACK_DIR/artifacts/$1 base=${STACK_PORT_BASE:-17000} name admin
   local redis=${STACK_REDIS_SERVER:-$(command -v redis-server || echo "$PWD/.cache/redis/bin/redis-server")}
   mkdir -p "$dir"
-  curl -sf "http://127.0.0.1:$((base + 4))/metrics" >"$dir/logic.metrics"
-  for ((i = 0; i < ${STACK_GATEWAYS:-1}; i++)); do
-    curl -sf "http://127.0.0.1:$((base + 102 + 10 * i))/metrics" >"$dir/gw-$i.metrics"
-  done
+  while read -r name admin; do
+    curl -sf "http://$admin/metrics" >"$dir/$name.metrics"
+    curl -sf "http://$admin/debug/pprof/heap" >"$dir/$name.heap.pb.gz"
+    curl -sf "http://$admin/debug/pprof/goroutine?debug=1" >"$dir/$name.goroutine.txt"
+  done < <(stack_admins)
   "$(dirname "$redis")/redis-cli" -p "$base" info all >"$dir/redis.info" 2>&1
+}
+
+# stack_profile NAME SECONDS: a CPU profile of Logic and every running
+# gateway over the same SECONDS, into artifacts/NAME/<process>.cpu.pb.gz.
+# Blocks for SECONDS; a scenario takes it inside its measured window.
+stack_profile() {
+  local dir=$STACK_DIR/artifacts/$1 name admin pids=()
+  mkdir -p "$dir"
+  while read -r name admin; do
+    curl -sf -m $(($2 + 30)) "http://$admin/debug/pprof/profile?seconds=$2" >"$dir/$name.cpu.pb.gz" &
+    pids+=($!)
+  done < <(stack_admins)
+  wait "${pids[@]}"
 }
 
 # stack_pinned NAME CPUS: the process's affinity is exactly CPUS.
@@ -218,6 +246,35 @@ stack_pinned() {
   local have
   have=$(taskset -pc "${STACK_PIDS[$1]}" 2>/dev/null) || return 1
   [ "$(t2_cpulist_expand "${have##*: }")" = "$(t2_cpulist_expand "$2")" ]
+}
+
+# stack_forget NAME: drops NAME from STACK_PIDS and STACK_ORDER.
+stack_forget() {
+  local n order=()
+  unset "STACK_PIDS[$1]"
+  for n in "${STACK_ORDER[@]}"; do [ "$n" = "$1" ] || order+=("$n"); done
+  STACK_ORDER=("${order[@]}")
+}
+
+# stack_expect_dead NAME: NAME was killed on purpose (a load scenario's
+# SIGKILL through loadgen's /kill, choice #84). Waits up to 5s for it to
+# end, records "NAME expected:STATUS" in exit-status and forgets it, so
+# stack_health does not report it and stack_down does not stop it again.
+# Fails, keeping NAME, if it is still running.
+stack_expect_dead() {
+  local pid=${STACK_PIDS[$1]:-} i
+  [ -n "$pid" ] || { echo "stack: no process $1" >&2; return 1; }
+  for i in $(seq 50); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "stack: $1 is still running" >&2
+    return 1
+  fi
+  wait "$pid" 2>/dev/null
+  echo "$1 expected:$?" >>"$STACK_DIR/exit-status"
+  stack_forget "$1"
 }
 
 # stack_term WAIT NAME...: SIGTERM to NAMEs at once, wait up to WAIT seconds
@@ -233,7 +290,7 @@ stack_term() {
     [ -z "$alive" ] && break
     sleep 0.1
   done
-  local pid status sent n order
+  local pid status sent
   for name in "$@"; do
     pid=${STACK_PIDS[$name]} sent=""
     kill -KILL "$pid" 2>/dev/null && sent=1
@@ -245,10 +302,7 @@ stack_term() {
     echo "$name $status" >>"$STACK_DIR/exit-status"
     # Forgotten once recorded, so a stack_down cut short by a signal and
     # finished by the exit hook records each process once.
-    unset "STACK_PIDS[$name]"
-    order=()
-    for n in "${STACK_ORDER[@]}"; do [ "$n" = "$name" ] || order+=("$n"); done
-    STACK_ORDER=("${order[@]}")
+    stack_forget "$name"
   done
 }
 
@@ -273,13 +327,15 @@ stack_down() {
 # process not running while the stack is up; once stack_down has run, a stop
 # that was not clean (status 0; devtoken has no SIGTERM handler, so 143 too)
 # or needed SIGKILL; and any log line starting with "panic:" or "fatal error:".
+# A process killed on purpose (stack_expect_dead) is not a problem, but its
+# log is still scanned.
 stack_health() {
   local name status line names=()
   # Stopped processes by their recorded status, running ones by kill -0.
   if [ -f "$STACK_DIR/exit-status" ]; then
     while read -r name status; do
       case "$name:$status" in
-        *:0 | devtoken:143) ;;
+        *:0 | devtoken:143 | *:expected:*) ;;
         *:killed) echo "$name: did not stop after SIGTERM, killed" ;;
         *) if [ "$status" -gt 128 ] 2>/dev/null; then
              echo "$name: stopped by SIG$(kill -l "$((status - 128))" 2>/dev/null || echo "$((status - 128))") (status $status)"

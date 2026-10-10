@@ -13,6 +13,7 @@ import (
 
 	pb "github.com/Tallinzp/goim/api/internalpb"
 	"github.com/Tallinzp/goim/internal/fault"
+	"github.com/Tallinzp/goim/internal/pprofhttp"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
@@ -104,6 +105,7 @@ func (g *Gateway) Start(ctx context.Context, sc ServerConfig) error {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(g.registry, promhttp.HandlerOpts{}))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	pprofhttp.Register(mux)
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
 		if err := g.Ready(); err != nil {
 			http.Error(w, "not ready: "+err.Error(), http.StatusServiceUnavailable)
