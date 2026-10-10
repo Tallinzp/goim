@@ -1,6 +1,6 @@
-# Connection & Session Core — Reader's Guide (spec rev4)
+# Connection & Session Core — Reader's Guide (spec rev6)
 
-*As of 2026-10-04. Plain-language companion to [the rev4 spec](../superpowers/specs/2026-10-03-connection-session-core-design-rev4.md). When the two disagree, the spec wins. 中文版: [connection-session-core-guide.zh-CN.md](connection-session-core-guide.zh-CN.md).*
+*As of 2026-10-09. Plain-language companion to [the rev6 spec](../superpowers/specs/2026-10-03-connection-session-core-design-rev6.md). When the two disagree, the spec wins. 中文版: [connection-session-core-guide.zh-CN.md](connection-session-core-guide.zh-CN.md).*
 
 ## What this is
 
@@ -11,10 +11,12 @@ Sub-project 1 keeps track of **who is online and on which server**, for a WeChat
 | Goal | Target |
 | --- | --- |
 | Capacity | One gateway server can hold 600k connections (a benchmark). In production we run each at no more than 200k, so losing one hurts less. |
-| Recovery | If one gateway dies, 99% of its users are logged in again within 30s. |
+| Recovery | If one gateway dies, 99% of its users are logged in again within 30s: counted from the crash when the process dies (clients see the socket close), or from when the client notices when a whole node or network path goes silent (at most one heartbeat interval plus 10s). |
 | Correctness | A late or out-of-order event never kicks out or erases a newer session. Automated tests check every race we know of. |
 
 For 1M users we run at least 6 gateways: 5 carry the load and 1 is spare, so any single one can die.
+
+Two bigger events are **best effort, with no SLO**: losing several gateways at once (a whole zone), and the whole population reconnecting at once (the load balancer resets, or a city's network comes back). Admission control shapes them: 1M users at the 20k/s login rate take about 50s, and nothing may fall over meanwhile.
 
 ## The big picture
 
@@ -60,12 +62,12 @@ In Redis, a session is stored as `sess:{uid}` → one field per slot, holding `g
 
 A connection moves through four states: **HANDSHAKE → AUTH_PENDING → ONLINE → CLOSED**.
 
-1. **Connect.** The phone opens TCP to the NLB, which picks a gateway. If that gateway is full (250k sockets), it closes the socket at once and the phone retries in 1–3s, probably landing on another gateway.
-2. **Handshake (HANDSHAKE, 5s limit).** Phone and gateway run a Noise NK handshake. The server's public key is built into the app, so no certificates are involved. After this every frame is encrypted with ChaCha20-Poly1305.
-3. **Login (AUTH_PENDING, 5s limit to send it).** The phone sends its token, app, platform, device_id and conn_seq. The gateway stamps the arrival time (`recv_ms`) and forwards it to Logic in a batch.
-4. **Logic decides.** It checks the token's signature locally (no database call), then runs one atomic Redis script that either writes the session or rejects it (see the next section). If an older connection lost its slot, Logic sends a **Kick** to that connection's gateway.
+1. **Connect.** The phone opens TCP to the NLB, which picks a gateway. If that gateway is full (250k sockets), it closes the socket at once and the phone retries in 0.5–1.5s, probably landing on another gateway.
+2. **Handshake (HANDSHAKE, 5s limit).** Phone and gateway run a Noise NK handshake. The server's public key is built into the app (with a key ID, so keys can be rotated), so no certificates are involved. Every frame has a small 6-byte header (version, command, flags, length) followed by the payload; after the handshake the payload is encrypted with ChaCha20-Poly1305, and the header is covered by the same check, so tampering with it closes the connection.
+3. **Login (AUTH_PENDING, 5s limit to send it).** The phone sends its token, app, platform, device_id and conn_seq. The gateway stamps the arrival time (`recv_ms`) and forwards it to Logic in a batch. Logic returns each login's result as soon as that one finishes, so one slow Redis shard holds back only its own users, not the whole batch.
+4. **Logic decides.** It checks the token's signature locally (no database call), then runs one atomic Redis script that either writes the session or rejects it (see the next section). If an older connection lost its slot, Logic sends a **Kick** to that connection's gateway, after replying, so a login never waits for a Kick. A token signed with a key Logic doesn't know yet is rejected at once as `KEY_UNKNOWN` (the phone retries in 1–3s while Logic refreshes its keys in the background).
 5. **Online (ONLINE).** The server tells the phone to ping every 150s. Any frame counts as a sign of life. After 310s of silence the gateway treats the connection as dead.
-6. **Close (CLOSED).** The gateway sends a **Logout** to Logic, which deletes the Redis record only if it still points at this exact connection.
+6. **Close (CLOSED).** The gateway sends a **Logout** to Logic, which deletes the Redis record only if it still points at this exact connection. When the app logs out by itself, the gateway confirms at once and closes; the Logout to Logic follows the same safe path as any other (see the Logout fence below).
 
 **Kick reasons the user may see.** None of them makes the app reconnect by itself, which prevents two devices from kicking each other forever.
 
@@ -77,7 +79,7 @@ A connection moves through four states: **HANDSHAKE → AUTH_PENDING → ONLINE 
 
 **Login tokens** are short-lived (about 1h) and checked only at login. An already-online connection is not cut off when its token expires; revocation handles security for long-lived connections.
 
-**Revocation markers.** Revoking writes a marker in Redis (`rev:{uid}`): "tokens issued before time T are no good". It can cover the whole user or just one slot, for example "log this device out". The marker is written and confirmed on a Redis replica *before* the session is deleted or the Kick is sent. So even if the Kick is lost, the next Reconcile sees the marker and closes the connection instead of bringing the session back. When the app itself logs out, no marker is needed: the gateway closes that connection, so nothing can bring it back.
+**Revocation markers.** Revoking writes a marker in Redis (`rev:{uid}`): "tokens issued before time T are no good". T is set by the account service on its own clock and stays the same on every retry, so a retried revoke never moves it. It can cover the whole user or just one slot, for example "log this device out". The marker is written and confirmed on a Redis replica *before* the session is deleted or the Kick is sent. So even if the Kick is lost, the next Reconcile sees the marker and closes the connection instead of bringing the session back. When the app itself logs out, no marker is needed: the gateway closes that connection, so nothing can bring it back.
 
 ## Staying correct under races
 
@@ -103,7 +105,7 @@ The classic bug: a user's old connection drops, they reconnect elsewhere, and th
 - its Login has a definite answer, **or** 6s (the deadline + 1s for clock skew) have passed since the gateway received it; **and**
 - no Reconcile report that contains the connection is still waiting for an answer (same 6s rule).
 
-Together these mean a Logout always lands *after* anything it might race with, so it can never be overwritten by a late write.
+Together these mean a Logout always lands *after* anything it might race with, so it can never be overwritten by a late write. The fence also applies when the app logs out by itself; in practice it waits only while a Reconcile report is in flight, normally milliseconds.
 
 **Example.** A phone on connection A goes into a tunnel and reconnects as connection B on another gateway. B logs in, so Redis says "B". Minutes later A's gateway notices the silence and sends Logout(A). Redis says "B", not "A", so nothing is deleted.
 
@@ -113,7 +115,7 @@ A dead gateway's sessions stop counting within 30s and are deleted shortly after
 
 **Step 1: sessions stop counting (≤ 30s).** A session only counts if its gateway's lease exists. A dead gateway stops renewing, so its lease expires and all its sessions become invalid at once, before anything is deleted. Its users have already started reconnecting elsewhere.
 
-**Step 2: the sweeper cleans up (after about 60s).** Every Logic node runs a sweeper. It looks for epochs that haven't renewed for 60s (twice the lease TTL), or that announced a clean shutdown. It claims one so no other node works on it, then deletes that epoch's session records about 10k users/s at a time.
+**Step 2: the sweeper cleans up (after about 60s).** Every Logic node runs a sweeper. It looks for epochs that haven't renewed for 60s (twice the lease TTL), or that announced a clean shutdown. It claims one so no other node works on it, then checks the lease key itself: the list of epochs is only an index, and if the lease key exists the gateway is alive whatever the index says, so the sweeper lets go. Otherwise it deletes that epoch's session records about 10k users/s at a time.
 
 **Step 3: the safety guard.** If Redis or Logic has a bad minute, *every* gateway stops renewing, and a naive sweeper would delete everyone. So the sweeper sweeps only when:
 
@@ -145,7 +147,7 @@ Messages get lost: a Logout is dropped, a Kick never arrives, a Redis failover l
 - Each write is a compare-and-set that gives up if Redis changed meanwhile, or if the batch is more than 5s old. A batch refused for being late is simply resent within the same pass, up to 3 times.
 - Only one pass runs per gateway at a time. If a `missing` lease reply arrives during a normal pass, that pass is cancelled (no ReconcileEnd) and a fast pass starts.
 
-**Cost.** About 330 Redis script calls/s per gateway normally, about 2k/s across 6 gateways.
+**Cost.** About 660 Redis operations/s per gateway at the normal pace (330 for the chunks, 330 for the ReconcileEnd cleanup, which is rate-limited to about 10k users/s), about 4k/s across 6 gateways. ReconcileEnd replies only when the cleanup is done; if it fails, the gateway resends the same list (deleting is idempotent).
 
 ## Surviving reconnect storms
 
@@ -156,23 +158,39 @@ When a 200k-user gateway dies, all 200k phones reconnect at once. Spread over a 
 | Situation | Wait before retrying |
 | --- | --- |
 | An established connection dropped unexpectedly | Random 0–20s, then exponential backoff up to 5 min |
-| Server closed the socket before the handshake finished (gateway full or overloaded) | 1–3s, up to 5 times in a row, then exponential backoff |
-| Server replied `Busy{retry_after}` | What the server says (1–3s) |
+| The phone's network changed, or the app came back to the foreground while disconnected | Cut the 0–20s wait short: retry within 0–1s |
+| Server closed the socket before the handshake finished (gateway full, handshake limit, unknown version or key) | 0.5–1.5s, up to 10 times in a row, then exponential backoff |
+| `Busy{retry_after}`, a login rejected as `EXPIRED` or `KEY_UNKNOWN`, or closed after the handshake with no answer | 1–3s (or what the server says), up to 5 times in a row, then exponential backoff |
+| Server sent `Reconnect{jitter_ms}` (the gateway is draining for a deploy) | Random 0–`jitter_ms` (default 5s) |
 | No reply within 10s of a Ping | Treat the server as dead and reconnect |
 | Kicked (any reason) | Do not reconnect automatically |
 
-Every retry uses a new source port, so the NLB will probably pick a different gateway.
+Every retry uses a new source port, so the NLB will probably pick a different gateway. A network change only removes the 0–20s storm wait; it never shortens a wait the server asked for, or a backoff.
+
+**Why two retry counters.** A close before the handshake costs the gateway almost nothing (one accept, one close, no crypto), so those retries can be faster and more numerous. That matters during a rolling restart behind a load balancer that doesn't look at load: when 3 of 5 gateways are full, 10 retries leave only 0.6% of rejected phones in backoff, against 7.8% with 5.
+
+**Windows the server can change.** The 0–20s, 0–1s, 0.5–1.5s and 1–3s windows are defaults. `LoginResp` can send new ones, so ops can widen them during an incident without an app release. The SDK saves them, and clamps each to a safe range built into the app, so a bad config can't cause a zero-delay storm or an endless wait.
 
 **What the gateway does (admission control)**
 
 - **Connection cap, 250k sockets.** Beyond it, new sockets are closed before any crypto work, which keeps load even across gateways.
 - **Handshake limit.** A gateway-wide cap on handshakes in progress and per second, so a flood can't starve existing connections. It is never per IP, because many mobile users share one IP through carrier NAT.
-- **Login queue cap.** If Logic is slow and too many logins are waiting, reply `Busy` (1–3s).
+- **Login queue cap.** If Logic is slow and too many logins are waiting, reply `Busy` (1–3s). The cap is sized so a queued login can't run past the 5s deadline: overload shows up as a cheap `Busy` at the gateway, not as `EXPIRED` after Logic has done the work.
 - **Timeouts.** 5s to finish the handshake and 5s to send the login, so slow or idle sockets can't hold slots.
 
-**What Logic does.** It is stateless and runs enough replicas to handle the 20k/s peak *without* waiting for autoscaling. It verifies tokens locally, and lease renewals have their own connection and worker pool so a login storm can't block them.
+**What Logic does.** It is stateless and runs enough replicas to handle the 20k/s peak *without* waiting for autoscaling. It verifies tokens locally, and lease renewals have their own connection and worker pool so a login storm can't block them. Kicks to a gateway that's gone can't slow logins down: each attempt gives up after about 1s, and each target has a bounded queue; overflow is dropped and Reconcile closes the connection later.
 
-**Out of scope for an SLO.** Losing several gateways at once (a whole zone) is best effort: survivors fill to the cap, and the rest retry until Kubernetes reschedules the lost pods.
+**Out of scope for an SLO.** Losing several gateways at once (a whole zone) is best effort: survivors fill to the cap, and the rest retry until Kubernetes reschedules the lost pods. So is the whole population reconnecting at once: the handshake limit, connection cap and login queue cap turn the excess away cheaply, and recovery takes roughly users ÷ login rate (about 50s for 1M) plus the backoff tail.
+
+## Running it on Kubernetes
+
+The SLOs hold only if the cluster around the gateways behaves. The spec sets these requirements:
+
+- **Load balancer.** Use least-connections where the cloud offers it. Where it only hashes flows, the 10 fast pre-handshake retries are what carry a rolling restart.
+- **One disruption at a time.** The gateway PodDisruptionBudget allows one gateway down at a time, and gateway nodes are never removed by the autoscaler, so an upgrade waits rather than turning one lost gateway into two. Logic never drops below the replicas the storm needs.
+- **Node loss.** Kubernetes won't recreate a StatefulSet pod whose node is unreachable. After the node has been NotReady for 2 minutes, a controller marks it out-of-service, so `gw-k` is recreated elsewhere and the fleet is back to full in about 2–3 minutes. This is safe even if the old `gw-k` is still running somewhere: it has a different epoch, so the two can't conflict.
+- **Redis placement.** At least 3 masters over at least 3 zones, each replica in a different zone from its master, so losing a zone never loses a majority.
+- **System limits.** The gateway checks its open-file limit and the node's connection-tracking table at startup, and stays not-ready (saying which limit failed) if either is too small for its 250k cap. Load balancer limits (concurrent connections, new connections/s, idle timeout above the 150s heartbeat) are checked in the cloud test run.
 
 ## What later sub-projects can rely on
 
@@ -192,18 +210,18 @@ Redis presence is *eventually* right, and the table below gives the bounds. Mess
 - Don't check validity by reading every session and its lease one at a time. An efficient read path is sub-project 2/3's job.
 - Don't trigger mass offline pushes just because sessions read as invalid. The last row of the table can make everyone look offline during an outage.
 
-## Still open, and where to read more
+## Decisions and where to read more
 
-Two small points are still open; both are already handled in the current spec and only wait for a formal sign-off.
+No points are open in rev6. The last two were closed in rev5:
 
-- **Lease check outside the script.** Reconcile checks whether a gateway is alive in Logic, then writes with a compare-and-set, because the lease key lives in a different Redis slot.
-- **Error order at login.** If a login is both revoked and too late, the client sees `REVOKED` rather than `EXPIRED`. Only the error code differs.
+- **Lease check outside the script.** Reconcile checks whether a gateway is alive in Logic, then writes with a compare-and-set, because the lease key lives in a different Redis slot. The check is only an observation and can be stale; if a write lands on a stale one, the real owner's next lease renewal reports `missing`, and its fast Reconcile pass puts the newer session back within about a minute.
+- **Error order at login.** If a login is both revoked and too late, the client sees `REVOKED` rather than `EXPIRED`, so it goes straight to the login screen instead of retrying with a dead token.
 
-Already decided this round: "log this device out" writes a per-slot revocation marker (see *Life of a connection*); a failed ReconcileEnd is retried for up to 60s; a gateway ignores `missing` on its very first lease renewal; a sweeper that aborts releases its claim; and Reconcile has a fourth result, `unchanged`, for a write that lost a race.
+Two sizes are left to the implementation plans: the Kick queue per target gateway and the SDK's clamp ranges.
 
-**Deliberately left out (confirmed for this iteration):** per-user login rate limits, per-IP limits, distributed locks and a reverse index. Each one either harmed legitimate users in a storm or was unnecessary given the atomic per-user script.
+**Deliberately left out:** per-user login rate limits, per-IP limits, distributed locks, a reverse index and a session version. Each one either harmed legitimate users in a storm or was unnecessary given the atomic per-user script.
 
 **Read next**
 
-- Full spec: `docs/superpowers/specs/2026-10-03-connection-session-core-design-rev4.md`, including the full race list (17 cases), failure table, metrics and test plan.
-- Why each rule exists: the review decisions in `docs/superpowers/objections/` (three rounds).
+- Full spec: [rev6](../superpowers/specs/2026-10-03-connection-session-core-design-rev6.md), including the full race list (18 cases), failure table, deployment requirements, metrics and test plan.
+- Why each rule exists: the review decisions in `docs/superpowers/objections/` (five rounds, including outside reviews and a system-design review).
