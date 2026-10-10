@@ -99,8 +99,13 @@ stack_up() {
   local n=${STACK_GATEWAYS:-1} base=${STACK_PORT_BASE:-17000} bin=$STACK_DIR/bin i
   local redis=${STACK_REDIS_SERVER:-$(command -v redis-server || echo "$PWD/.cache/redis/bin/redis-server")}
   local gw_cpus=${T2_CPUS_GATEWAY:-} logic_cpus=${T2_CPUS_LOGIC:-}
+  rm -f "$STACK_DIR/exit-status" # an earlier stack's, even if this one is refused
   if [ "${STACK_PIN:-0}" = 1 ] && { [ -z "$gw_cpus" ] || [ -z "$logic_cpus" ]; }; then
     echo "stack: STACK_PIN=1 needs T2_CPUS_GATEWAY and T2_CPUS_LOGIC" >&2
+    return 1
+  fi
+  if [ "${STACK_PIN:-0}" = 1 ] && ! declare -F t2_cpulist_expand >/dev/null; then
+    echo "stack: STACK_PIN=1 needs scripts/tier2/lib.sh sourced (t2_cpulist_expand)" >&2
     return 1
   fi
   [ -x "$redis" ] || { echo "stack: $redis not found (make redis-server)" >&2; return 1; }
@@ -112,7 +117,6 @@ stack_up() {
     return 1
   fi
   mkdir -p "$STACK_DIR/keys/noise" "$STACK_DIR/logs" "$STACK_DIR/artifacts" "$STACK_DIR/redis"
-  rm -f "$STACK_DIR/exit-status"
 
   # Each gateway's GOMAXPROCS is its CPU share (#79); -loops and the
   # handshake concurrency default from it, as in a pod with a CPU limit.
@@ -255,7 +259,7 @@ stack_down() {
 # that was not clean (status 0; devtoken has no SIGTERM handler, so 143 too)
 # or needed SIGKILL; and any log line starting with "panic:" or "fatal error:".
 stack_health() {
-  local name status f line
+  local name status line names=()
   if [ -f "$STACK_DIR/exit-status" ]; then
     while read -r name status; do
       case "$name:$status" in
@@ -267,14 +271,16 @@ stack_health() {
              echo "$name: exited with status $status"
            fi ;;
       esac
+      names+=("$name")
     done <"$STACK_DIR/exit-status"
   else
     for name in "${STACK_ORDER[@]}"; do
       kill -0 "${STACK_PIDS[$name]}" 2>/dev/null || echo "$name: not running"
     done
+    names=("${STACK_ORDER[@]}")
   fi
-  for f in "$STACK_DIR"/logs/*.log; do
-    [ -f "$f" ] || continue
-    line=$(grep -m 1 -E '^(panic:|fatal error:)' "$f") && echo "$(basename "$f" .log): $line"
+  # Only this stack's processes: a log left by an earlier, larger stack is not.
+  for name in "${names[@]}"; do
+    line=$(grep -m 1 -E '^(panic:|fatal error:)' "$STACK_DIR/logs/$name.log" 2>/dev/null) && echo "$name: $line"
   done
 }

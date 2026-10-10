@@ -113,6 +113,10 @@ rc=$(fake_run 'PATH="$tmp/slowgit:$PATH"; t2_check a true; me=$BASHPID; (sleep 1
 expect "stopped: SIGTERM during t2_finish exits 143" "$rc" 143
 expect "stopped: SIGTERM during t2_finish leaves valid JSON" "$(valid_json "$tmp/run/out/result.json")" ""
 expect "stopped: SIGTERM during t2_finish is recorded" "$(stopped)" "False {'exit': 143} None ['a']"
+# A scenario that ends without t2_finish has not passed: exit 1, not 0.
+rc=$(fake_run 't2_check a true')
+expect "stopped: ending without t2_finish exits 1" "$rc" 1
+expect "stopped: ending without t2_finish is recorded" "$(stopped)" "False {'exit': 1, 'detail': 'ended without t2_finish'} None ['a']"
 rc=$(fake_run 't2_check a true; t2_finish')
 expect "stopped: a finished run is not marked stopped" "$(stopped)" "True None None ['a']"
 

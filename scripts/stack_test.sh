@@ -101,4 +101,20 @@ expect "health: only the dead gateway" "$(stack_health | grep -v '^gw-0:')" ""
 echo "panic: runtime error: test" >>"$STACK_DIR/logs/logic.log"
 grep -q "^logic: panic: runtime error: test" <<<"$(stack_health)" && ok "health: a panic in a log is reported" || bad "health: panic: [$(stack_health 2>&1)]"
 
+# A refused stack_up leaves no earlier stack's statuses or logs to report (M5).
+python3 -c 'import socket,sys,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(); time.sleep(30)' "$STACK_PORT_BASE" &
+holder=$!
+sleep 0.5
+STACK_GATEWAYS=1
+stack_up 2>/dev/null && bad "up: should refuse the held port" || ok "up: refused while the port is held"
+expect "health: a refused stack_up reports no earlier stack" "$(stack_health 2>&1)" ""
+kill $holder; wait $holder 2>/dev/null
+
+# Pinning without lib.sh is refused, not run with GOMAXPROCS 1 (M6).
+out=$(unset -f t2_cpulist_expand; STACK_PIN=1; stack_up 2>&1; echo "rc=$?"; stack_down)
+contains() { case "$2" in *"$3"*) ok "$1" ;; *) bad "$1: [$2] lacks [$3]" ;; esac; }
+contains "pin: without lib.sh is refused" "$out" "rc=1"
+contains "pin: says lib.sh is needed" "$out" "lib.sh"
+expect "pin: nothing started" "$(grep -c 'Ready\|serving' <<<"$out")" 0
+
 [ "$fails" -eq 0 ] && echo "stack_test: all passed" || { echo "stack_test: $fails failed"; exit 1; }

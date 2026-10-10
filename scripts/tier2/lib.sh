@@ -19,7 +19,8 @@
 #    "checks": {name: {"pass", ...}}, <fields added with t2_field>, "not_covered": [...]}
 # A run passes only if it recorded at least one check and every check passed.
 # After t2_init a result.json is written however the run ends: a run that
-# stops before t2_finish gets "stopped" (its exit code) or "refused".
+# stops before t2_finish gets "stopped" (its exit code) or "refused"; one
+# that ends without t2_finish exits 1, never 0.
 
 # CPU sets by core type on the Tier 2 host (choice #71); scripts/stack.sh
 # pins with them. Overridable for another host.
@@ -198,6 +199,10 @@ t2_exit() {
   if [ ! -f "$T2_OUT/result.json" ]; then
     if [ -n "${T2_REFUSED:-}" ]; then
       t2_result_json false "\"refused\": $(t2_json_str "$T2_REFUSED")"
+    elif [ "$rc" -eq 0 ]; then
+      # Ended without t2_finish (a bug in the scenario): not a pass.
+      rc=1
+      t2_result_json false "\"stopped\": {\"exit\": 1, \"detail\": \"ended without t2_finish\"}"
     else
       t2_result_json false "\"stopped\": {\"exit\": $rc}"
     fi >"$T2_OUT/result.json"
