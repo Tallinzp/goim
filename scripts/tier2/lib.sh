@@ -93,6 +93,9 @@ T2_FIELDS=()
 T2_DURATIONS=()
 T2_NOT_COVERED=()
 T2_EXIT_HOOKS=()
+# Process groups besides the run's own that count as ours (stack.sh starts
+# each stack process in a group of its own and adds it here).
+T2_OURS_PGIDS=()
 # Names already used in result.json, as "check:NAME", "field:KEY" and
 # "duration:NAME"; the members t2_result_json writes itself are taken.
 declare -A T2_USED=([duration:total]=1)
@@ -259,8 +262,8 @@ t2_init() {
 # t2_nofile before its setup, then t2_record_start / t2_record_end around its
 # measured window. result.json gets a "background" member and a no_swap_in
 # check: a window with any page swapped in fails (#70).
-# "Ours" is this run's process group: make, the script and every process it
-# starts (none of them calls setpgid). Kernel threads are reported apart,
+# "Ours" is this run's process group (make, the script and what it starts)
+# plus the groups in T2_OURS_PGIDS (stack.sh's processes). Kernel threads are reported apart,
 # since they do our network work. CPU used by a process that started and
 # exited inside the window is not seen.
 
@@ -329,13 +332,14 @@ t2_proc_stats() {
 # t2_pgid PID: PID's process group.
 t2_pgid() { t2_proc_stats | awk -v p="$1" '$1 == p { print $2 }'; }
 
-# t2_cpu_delta BEFORE AFTER OURS HZ: from two t2_proc_stats files, prints
+# t2_cpu_delta BEFORE AFTER OURS HZ: from two t2_proc_stats files (OURS: the
+# process groups that are ours, space-separated), prints
 # "outside_user_s kernel_threads_s top" where top is a JSON array of the
 # ten biggest outside users. Kernel threads: pid 2 and its children.
 t2_cpu_delta() {
   awk -v ours="$3" -v hz="$4" '
     NR == FNR { before[$1 " " $4] = $5; next }
-    $2 == ours { next }
+    index(" " ours " ", " " $2 " ") { next }
     {
       d = $5 - before[$1 " " $4]
       if (d <= 0) next
@@ -429,7 +433,7 @@ t2_record_end() {
   swap1=$(t2_swap_pages)
   in=$(( ${swap1% *} - ${T2_SWAP0% *} ))
   out=$(( ${swap1#* } - ${T2_SWAP0#* } ))
-  read -r user kern top <<<"$(t2_cpu_delta "$T2_OUT/.procs-before" "$T2_OUT/.procs-after" "$T2_PGID" "$hz")"
+  read -r user kern top <<<"$(t2_cpu_delta "$T2_OUT/.procs-before" "$T2_OUT/.procs-after" "$T2_PGID ${T2_OURS_PGIDS[*]}" "$hz")"
   t2_field "background$m" "{\"window_s\": $((SECONDS - T2_REC_T0)), \"host_busy_cpu_s\": $(awk -v b="$busy" -v h="$hz" 'BEGIN { printf "%.1f", b / h }'), \"outside_user_cpu_s\": $user, \"kernel_threads_cpu_s\": $kern, \"top_outside\": $top, \"swap_in_pages\": $in, \"swap_out_pages\": $out, \"cpu_clocks\": $(t2_clock_summary "$T2_OUT/clocks$f.tsv")}"
   t2_check "no_swap_in$m" "$(t2_bool [ "$in" -eq 0 ])" "\"swap_in_pages\": $in"
 }

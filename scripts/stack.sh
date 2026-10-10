@@ -31,8 +31,10 @@
 # the same gateway order: GATEWAY_ADDRS (client listeners), GATEWAY_IDS,
 # GATEWAY_ADMINS, GATEWAY_KICK_ADDRS; then GATEWAY_PROCS (each gateway's
 # GOMAXPROCS), NOISE_KEY_ID, NOISE_PUBLIC, JWT_KEY (the devtoken private key
-# file), REDIS_ADDR and LOGIC_ADMIN. Every process is started from this shell, so it
-# stays in the caller's process group (lib.sh counts that group as ours).
+# file), REDIS_ADDR and LOGIC_ADMIN. Every process is started from this shell
+# in a process group of its own, added to T2_OURS_PGIDS (lib.sh counts it as
+# ours), so a Ctrl-C reaches the run's script, whose teardown stops the stack
+# in order.
 
 declare -A STACK_PIDS=()
 STACK_ORDER=()
@@ -42,15 +44,20 @@ stack_build() {
   go build -o "$STACK_DIR/bin/" ./cmd/gateway ./cmd/logic ./cmd/devtoken
 }
 
-# stack_start NAME CPUS CMD...: starts CMD in the background, logging to
-# logs/NAME.log, pinned to CPUS when STACK_PIN=1.
+# stack_start NAME CPUS CMD...: starts CMD in the background in its own
+# process group, logging to logs/NAME.log, pinned to CPUS when STACK_PIN=1.
 stack_start() {
   local name=$1 cpus=$2
   shift 2
   if [ "${STACK_PIN:-0}" = 1 ]; then set -- taskset -c "$cpus" "$@"; fi
-  "$@" >"$STACK_DIR/logs/$name.log" 2>&1 &
+  # A process group of its own (setsid execs in place: a background job is
+  # never a group leader), so a Ctrl-C to the run's group does not stop the
+  # whole stack at once, out of #78's order; stack_down stops it. lib.sh
+  # counts the group as ours.
+  setsid "$@" >"$STACK_DIR/logs/$name.log" 2>&1 &
   STACK_PIDS[$name]=$!
   STACK_ORDER+=("$name")
+  T2_OURS_PGIDS+=("$!")
 }
 
 # stack_wait NAME URL: waits up to 30s for URL to answer 200.
@@ -226,14 +233,22 @@ stack_term() {
     [ -z "$alive" ] && break
     sleep 0.1
   done
+  local pid status sent n order
   for name in "$@"; do
-    if kill -KILL "${STACK_PIDS[$name]}" 2>/dev/null; then
-      wait "${STACK_PIDS[$name]}" 2>/dev/null
-      echo "$name killed" >>"$STACK_DIR/exit-status"
-    else
-      wait "${STACK_PIDS[$name]}" 2>/dev/null
-      echo "$name $?" >>"$STACK_DIR/exit-status"
-    fi
+    pid=${STACK_PIDS[$name]} sent=""
+    kill -KILL "$pid" 2>/dev/null && sent=1
+    wait "$pid" 2>/dev/null
+    status=$?
+    # "killed" only if our SIGKILL ended it: one that lands on a process
+    # that had just exited (not yet reaped) leaves its own status.
+    [ -n "$sent" ] && [ "$status" -eq 137 ] && status=killed
+    echo "$name $status" >>"$STACK_DIR/exit-status"
+    # Forgotten once recorded, so a stack_down cut short by a signal and
+    # finished by the exit hook records each process once.
+    unset "STACK_PIDS[$name]"
+    order=()
+    for n in "${STACK_ORDER[@]}"; do [ "$n" = "$name" ] || order+=("$n"); done
+    STACK_ORDER=("${order[@]}")
   done
 }
 
@@ -260,6 +275,7 @@ stack_down() {
 # or needed SIGKILL; and any log line starting with "panic:" or "fatal error:".
 stack_health() {
   local name status line names=()
+  # Stopped processes by their recorded status, running ones by kill -0.
   if [ -f "$STACK_DIR/exit-status" ]; then
     while read -r name status; do
       case "$name:$status" in
@@ -273,12 +289,11 @@ stack_health() {
       esac
       names+=("$name")
     done <"$STACK_DIR/exit-status"
-  else
-    for name in "${STACK_ORDER[@]}"; do
-      kill -0 "${STACK_PIDS[$name]}" 2>/dev/null || echo "$name: not running"
-    done
-    names=("${STACK_ORDER[@]}")
   fi
+  for name in "${STACK_ORDER[@]}"; do
+    kill -0 "${STACK_PIDS[$name]}" 2>/dev/null || echo "$name: not running"
+    names+=("$name")
+  done
   # Only this stack's processes: a log left by an earlier, larger stack is not.
   for name in "${names[@]}"; do
     line=$(grep -m 1 -E '^(panic:|fatal error:)' "$STACK_DIR/logs/$name.log" 2>/dev/null) && echo "$name: $line"

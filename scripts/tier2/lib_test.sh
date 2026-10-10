@@ -142,6 +142,7 @@ printf '%s\n' "10 7 1 100 250 java" "11 7 1 200 60 chrome" "12 99 1 300 900 ours
   "14 7 1 500 20 new_proc" "15 7 1 999 5 reused_pid" >"$tmp/after"
 expect "cpu delta: outside, kernel threads, top" "$(t2_cpu_delta "$tmp/before" "$tmp/after" 99 100)" \
   '2.8 1.0 [{"comm": "java", "cpu_s": 2.0}, {"comm": "chrome", "cpu_s": 0.5}, {"comm": "new_proc", "cpu_s": 0.2}, {"comm": "reused_pid", "cpu_s": 0.1}]'
+expect "cpu delta: several groups are ours" "$(t2_cpu_delta "$tmp/before" "$tmp/after" "99 7" 100)" '0.0 0.0 []'
 expect "procs: our group is this shell's" "$(t2_pgid $$)" "$(ps -o pgid= -p $$ | tr -d ' ')"
 
 # The real thing: 1.2s of CPU in another process group counts, 1.2s in
@@ -150,22 +151,26 @@ expect "procs: our group is this shell's" "$(t2_pgid $$)" "$(ps -o pgid= -p $$ |
 # since a process that exits inside it is not seen.
 ln -s "$(command -v bash)" "$tmp/t2outside"
 ln -s "$(command -v bash)" "$tmp/t2ours"
+ln -s "$(command -v bash)" "$tmp/t2stack"
 rc=$(fake_run '
   t2_record_start
   setsid "$tmp/t2outside" -c "end=\$((\${EPOCHREALTIME/./} + 1200000)); while ((\${EPOCHREALTIME/./} < end)); do :; done; sleep 30; true" & other=$!
   "$tmp/t2ours" -c "end=\$((\${EPOCHREALTIME/./} + 1200000)); while ((\${EPOCHREALTIME/./} < end)); do :; done; sleep 30; true" & mine=$!
+  # A stack process: its own process group (Ctrl-C), registered as ours.
+  setsid "$tmp/t2stack" -c "end=\$((\${EPOCHREALTIME/./} + 1200000)); while ((\${EPOCHREALTIME/./} < end)); do :; done; sleep 30; true" & stack=$!
+  T2_OURS_PGIDS+=("$stack")
   sleep 2.7
   t2_record_end
   echo "[${T2_SAMPLER:-}]" >"$tmp/run/sampler"
-  kill $other $mine
+  kill $other $mine $stack
   t2_finish')
 expect "record: result.json is JSON" "$(valid_json "$tmp/run/out/result.json")" ""
 r=$(python3 -c '
 import json,sys
 d = json.load(open(sys.argv[1])); b = d["background"]
 top = {t["comm"]: t["cpu_s"] for t in b["top_outside"]}
-print(top.get("t2outside", 0) >= 0.5, "t2ours" not in top, b["outside_user_cpu_s"] >= 0.5, "no_swap_in" in d["checks"], b["window_s"] >= 2)' "$tmp/run/out/result.json")
-expect "record: the other group counts, ours does not" "$r" "True True True True True"
+print(top.get("t2outside", 0) >= 0.5, "t2ours" not in top, "t2stack" not in top, b["outside_user_cpu_s"] >= 0.5, "no_swap_in" in d["checks"], b["window_s"] >= 2)' "$tmp/run/out/result.json")
+expect "record: the other group counts, ours and the registered groups do not" "$r" "True True True True True True"
 [ -s "$tmp/run/out/background-before.txt" ] && ok "record: background-before.txt" || bad "record: background-before.txt missing"
 expect "record: no sampler pid is left for the exit hook to kill" "$(cat "$tmp/run/sampler")" "[]"
 

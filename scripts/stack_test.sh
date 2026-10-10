@@ -25,6 +25,25 @@ T2_CPUS_LOGIC=0
 STACK_GATEWAY_ARGS=(-max-conns 1000 -pending-cap 1000 -logout-queue 1000)
 procs=$((ncpu / 2 > 1 ? ncpu / 2 : 1))
 
+# stack_term records what wait reports, "killed" only for a process our
+# SIGKILL ended (M1): a kill -KILL that lands on an exited, unreaped process
+# (stubbed here) must not turn a clean exit 0 into "killed".
+term_status() {
+  (
+    STACK_DIR=$(mktemp -d)
+    declare -A STACK_PIDS=()
+    trap '' TERM # inherited at fork: no window where SIGTERM still works
+    sleep "$2" >/dev/null 2>&1 & STACK_PIDS[p]=$!
+    trap - TERM
+    [ "$1" = stub ] && kill() { if [ "$1" = -KILL ]; then return 0; fi; command kill "$@"; }
+    stack_term 1 p
+    cat "$STACK_DIR/exit-status"
+    rm -rf "$STACK_DIR"
+  )
+}
+expect "term: a process that exits 0 at the deadline is not killed" "$(term_status stub 1.3)" "p 0"
+expect "term: a process that ignores SIGTERM is killed" "$(term_status real 30)" "p killed"
+
 stack_build || { echo "build failed"; exit 1; }
 if stack_up; then ok "up: every process Ready"; else bad "up"; exit 1; fi
 
@@ -43,6 +62,15 @@ expect "env: gateway procs is the CPU share" "${GATEWAY_PROCS:-}" "$procs"
 for name in gw-0 gw-1; do
   grep -q " loops=$procs " "$STACK_DIR/logs/$name.log" && ok "procs: $name runs $procs loops" || bad "procs: $name: $(grep -o ' loops=[0-9]* ' "$STACK_DIR/logs/$name.log")"
 done
+# Stack processes have process groups of their own, so a Ctrl-C to the
+# run's group does not reach them all at once (M3), and lib.sh counts them as ours.
+mypgid=$(ps -o pgid= -p $$ | tr -d ' ')
+apart=0
+for name in "${STACK_ORDER[@]}"; do
+  pg=$(ps -o pgid= -p "${STACK_PIDS[$name]}" | tr -d ' ')
+  [ "$pg" != "$mypgid" ] && [[ " ${T2_OURS_PGIDS[*]:-} " == *" $pg "* ]] && apart=$((apart + 1))
+done
+expect "pgid: every process in its own group, registered as ours" "$apart" 5
 for name in gw-0 gw-1; do
   stack_pinned "$name" "$T2_CPUS_GATEWAY" && ok "pin: $name on CPU $T2_CPUS_GATEWAY" || bad "pin: $name"
 done
@@ -94,10 +122,14 @@ fi
 # A gateway that dies during the run is reported, and stays reported after the stop.
 kill -KILL "${STACK_PIDS[gw-0]}"
 sleep 0.2
+# A stack_down cut short (a signal) is finished by the exit hook's: each
+# process is recorded once (M2).
+stack_term 5 devtoken
 grep -q "^gw-0: not running" <<<"$(stack_health)" && ok "health: a dead gateway is reported" || bad "health: dead gateway: [$(stack_health 2>&1)]"
 stack_down
 grep -q "^gw-0: .*SIGKILL" <<<"$(stack_health)" && ok "health: its stop is reported unclean" || bad "health: killed gateway after stop: [$(stack_health 2>&1)]"
 expect "health: only the dead gateway" "$(stack_health | grep -v '^gw-0:')" ""
+expect "health: each process recorded once" "$(cut -d' ' -f1 "$STACK_DIR/exit-status" | sort | uniq -d)" ""
 echo "panic: runtime error: test" >>"$STACK_DIR/logs/logic.log"
 grep -q "^logic: panic: runtime error: test" <<<"$(stack_health)" && ok "health: a panic in a log is reported" || bad "health: panic: [$(stack_health 2>&1)]"
 
