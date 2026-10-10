@@ -120,3 +120,24 @@ func TestRecorderBackNeedsALoss(t *testing.T) {
 		t.Fatalf("slo %+v", s)
 	}
 }
+
+// A later mark takes over members of an earlier one that were not back yet;
+// the earlier SLO counts them as missing and reports how many it lost so
+// (6a2a final review). Members already back are not counted.
+func TestRecorderSLOReportsReassignedMembers(t *testing.T) {
+	r := NewRecorder(3, []string{"gw-0", "gw-1"})
+	for i := range 3 {
+		r.Online(i, 0, at(0), at(1))
+	}
+	r.Mark("a", 0, at(10))
+	r.Lost(0, "lost", at(20))
+	r.Online(0, 1, at(30), at(40)) // back before the next mark
+	r.Mark("b", -1, at(50))        // takes 1 and 2, not back yet, and 0
+	s, _ := r.SLO("a", time.Second)
+	if s.Reassigned != 2 || s.Back != 1 || s.FromMark.Missing != 2 {
+		t.Fatalf("slo a %+v", s)
+	}
+	if s, _ := r.SLO("b", time.Second); s.Population != 3 || s.Reassigned != 0 {
+		t.Fatalf("slo b %+v", s)
+	}
+}

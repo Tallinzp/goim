@@ -32,12 +32,14 @@ type clientState struct{ gw, mark, pos int32 }
 
 // mark is a named instant and the clients logged in on its gateway then
 // (the population of an SLO), with when each lost its connection and
-// logged in again after it (0: not yet).
+// logged in again after it (0: not yet). reassigned counts members a later
+// mark took over before they were back.
 type mark struct {
 	gw         int
 	at         int64
 	members    []int32
 	lost, back []int64
+	reassigned int
 }
 
 // NewRecorder records clients 0..n-1 over gateways ids.
@@ -126,6 +128,9 @@ func (r *Recorder) Mark(name string, gw int, now time.Time) (int, error) {
 	for i := range r.clients {
 		c := &r.clients[i]
 		if c.gw >= 0 && (gw < 0 || int(c.gw) == gw) {
+			if old := r.markOf(*c); old != nil && old.back[c.pos] == 0 {
+				old.reassigned++
+			}
 			c.mark, c.pos = idx, int32(len(m.members))
 			m.members = append(m.members, int32(i))
 		}
@@ -139,7 +144,9 @@ func (r *Recorder) Mark(name string, gw int, now time.Time) (int, error) {
 // SLO is the storm distribution after a mark (spec: Load tests; loadgen
 // computes it directly). From the mark: b1's "logged in again within 30s of
 // T_death". From detection: b2's "within 30s of the client detecting the
-// loss". A member that never logged in again fails both.
+// loss". A member that never logged in again fails both, and so does one a
+// later mark took over before it was back (Reassigned: the later mark's
+// SLO has it).
 type SLO struct {
 	Mark              string `json:"mark"`
 	Gateway           string `json:"gateway"`
@@ -148,6 +155,7 @@ type SLO struct {
 	Population        int    `json:"population"`
 	Lost              int    `json:"lost"`
 	Back              int    `json:"back"`
+	Reassigned        int    `json:"reassigned"`
 	FromMark          Dist   `json:"from_mark"`
 	Detection         Dist   `json:"detection"`
 	FromDetection     Dist   `json:"from_detection"`
@@ -163,7 +171,7 @@ func (r *Recorder) SLO(name string, within time.Duration) (SLO, error) {
 	if !ok {
 		return SLO{}, fmt.Errorf("loadgen: no mark %q", name)
 	}
-	s := SLO{Mark: name, Gateway: "all", AtMs: m.at, WithinMs: within.Milliseconds(), Population: len(m.members)}
+	s := SLO{Mark: name, Gateway: "all", AtMs: m.at, WithinMs: within.Milliseconds(), Population: len(m.members), Reassigned: m.reassigned}
 	if m.gw >= 0 {
 		s.Gateway = r.ids[m.gw]
 	}
