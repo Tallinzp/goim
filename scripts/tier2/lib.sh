@@ -15,9 +15,11 @@
 # artifacts; tier2-results/<scenario>-<timestamp>.report.txt is the ONE file
 # to send back. result.json (schema 1, choice #73):
 #   {"schema": 1, "scenario", "tier": 2, "commit", "dirty", "host": {...},
-#    "pass", "duration_s": {"total", ...}, "checks": {name: {"pass", ...}},
-#    <fields added with t2_field>, "not_covered": [...]}
+#    "pass", ["stopped": {"exit"} | "refused": reason,] "duration_s": {"total", ...},
+#    "checks": {name: {"pass", ...}}, <fields added with t2_field>, "not_covered": [...]}
 # A run passes only if it recorded at least one check and every check passed.
+# After t2_init a result.json is written however the run ends: a run that
+# stops before t2_finish gets "stopped" (its exit code) or "refused".
 
 # CPU sets by core type on the Tier 2 host (choice #71); scripts/stack.sh
 # pins with them. Overridable for another host.
@@ -108,7 +110,8 @@ t2_on_exit() { T2_EXIT_HOOKS+=("$1"); }
 
 t2_join() { local IFS=,; echo "$*"; }
 
-# t2_result_json PASS: the result document.
+# t2_result_json PASS [MEMBER]: the result document; MEMBER (a run that
+# stopped early: "stopped" or "refused") follows "pass".
 t2_result_json() {
   cat <<JSON
 {
@@ -118,7 +121,8 @@ t2_result_json() {
   "commit": $(t2_json_str "$(git rev-parse HEAD 2>/dev/null)"),
   "dirty": $(git status --porcelain 2>/dev/null | wc -l),
   "host": {"cores": $T2_CORES, "mem_gb": $T2_MEM_GB, "kernel": $(t2_json_str "$(uname -r)")},
-  "pass": $1,
+  "pass": $1,${2:+
+  $2,}
   "duration_s": {"total": $((SECONDS - T2_T0))${T2_DURATIONS[0]+, $(t2_join "${T2_DURATIONS[@]}")}},
   "checks": {$(t2_join "${T2_CHECKS[@]}")}${T2_FIELDS[0]+,
   $(t2_join "${T2_FIELDS[@]}")},
@@ -169,6 +173,14 @@ t2_exit() {
   for ((i = ${#T2_EXIT_HOOKS[@]} - 1; i >= 0; i--)); do
     eval "${T2_EXIT_HOOKS[i]}" >/dev/null 2>&1
   done
+  # A run that ends before t2_finish still leaves a result.json (P6a1I-1).
+  if [ ! -f "$T2_OUT/result.json" ]; then
+    if [ -n "${T2_REFUSED:-}" ]; then
+      t2_result_json false "\"refused\": $(t2_json_str "$T2_REFUSED")"
+    else
+      t2_result_json false "\"stopped\": {\"exit\": $rc}"
+    fi >"$T2_OUT/result.json"
+  fi
   t2_write_report
   echo "report: $T2_REPORT"
   exit "$rc"

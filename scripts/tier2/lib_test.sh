@@ -77,7 +77,7 @@ rc=$(fake_run 't2_check a maybe'); expect "check: a bad pass value stops the run
 rc=$(fake_run 't2_on_exit "echo first >>$tmp/run/hooks"; t2_on_exit "echo second >>$tmp/run/hooks"; exit 7')
 expect "exit: an early stop keeps its exit code" "$rc" 7
 expect "exit: hooks run newest first" "$(paste -sd' ' "$tmp/run/hooks")" "second first"
-contains "exit: the report says the run stopped early" "$(cat "$tmp/run/out.report.txt")" "the run stopped early"
+contains "exit: the report shows the stop" "$(cat "$tmp/run/out.report.txt")" '"stopped": {"exit": 7}'
 rc=$(fake_run 't2_refuse "refused: no room"; t2_check a true')
 expect "refuse: exits 2" "$rc" 2
 contains "refuse: the report says why" "$(cat "$tmp/run/out.report.txt")" "refused: no room"
@@ -91,6 +91,21 @@ rc=$(fake_run 't2_on_exit "echo first >>$tmp/run/hooks"; t2_on_exit "kill -TERM 
 expect "exit: a signal during teardown keeps the exit code" "$rc" 3
 expect "exit: a signal during teardown runs every hook" "$(paste -sd' ' "$tmp/run/hooks" 2>/dev/null)" "second first"
 [ -s "$tmp/run/out.report.txt" ] && ok "exit: a signal during teardown writes the report" || bad "exit: a signal during teardown wrote no report"
+
+# result.json is written however the run ends after t2_init (P6a1I-1).
+stopped() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["pass"], d.get("stopped"), d.get("refused"), sorted(d["checks"]))' "$tmp/run/out/result.json" 2>&1; }
+rc=$(fake_run 't2_check a true; exit 1')
+expect "stopped: an early exit keeps its code" "$rc" 1
+expect "stopped: result.json is JSON" "$(valid_json "$tmp/run/out/result.json")" ""
+expect "stopped: pass false, exit code, checks so far" "$(stopped)" "False {'exit': 1} None ['a']"
+rc=$(fake_run 't2_refuse "refused: no \"room\""')
+expect "stopped: a late refusal exits 2" "$rc" 2
+expect "stopped: result.json names the refusal" "$(stopped)" "False None refused: no \"room\" []"
+rc=$(fake_run 'kill -TERM $BASHPID; sleep 5')
+expect "stopped: SIGTERM exits 143" "$rc" 143
+expect "stopped: SIGTERM is recorded" "$(stopped)" "False {'exit': 143} None []"
+rc=$(fake_run 't2_check a true; t2_finish')
+expect "stopped: a finished run is not marked stopped" "$(stopped)" "True None None ['a']"
 
 # Run recording.
 expect "cpulist: expands ranges" "$(t2_cpulist_expand 4-6,9,16-17)" "4 5 6 9 16 17"
