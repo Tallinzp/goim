@@ -29,6 +29,27 @@ procs=$((ncpu / 2 > 1 ? ncpu / 2 : 1))
 # The ports checked before stack_up include loadgen's control port.
 grep -qx $((STACK_PORT_BASE + 5)) <<<"$(stack_ports)" && ok "ports: loadgen's control port" || bad "ports: loadgen's control port missing"
 
+# stack_metric prints byte-sized sums whole, as Prometheus writes them
+# (5.36870912e+09), also under an awk whose %d stops at 2^31 (busybox; 6b1
+# minor M1). A fake gw-0 /metrics, before the real stack.
+if command -v busybox >/dev/null; then
+  (
+    mkdir -p "$STACK_DIR/fake"
+    printf '%s\n' 'go_memstats_heap_inuse_bytes 5.36870912e+09' 'goim_x{a="1"} 3e+09' 'goim_x{a="2"} 3e+09' >"$STACK_DIR/fake/metrics"
+    python3 -m http.server --bind 127.0.0.1 -d "$STACK_DIR/fake" $((STACK_PORT_BASE + 102)) >/dev/null 2>&1 &
+    srv=$!
+    trap 'kill $srv' EXIT
+    declare -A STACK_PIDS=([gw-0]=$srv)
+    awk() { busybox awk "$@"; }
+    for i in $(seq 50); do curl -sf -o /dev/null "http://127.0.0.1:$((STACK_PORT_BASE + 102))/metrics" && break; sleep 0.1; done
+    expect "metric: bytes past 2^31" "$(stack_metric gw-0 go_memstats_heap_inuse_bytes)" 5368709120
+    expect "metric: a sum past 2^32" "$(stack_metric gw-0 goim_x)" 6000000000
+    exit $fails
+  ) || fails=$((fails + $?))
+else
+  echo "skip metric: bytes past 2^31 (no busybox)"
+fi
+
 # stack_term records what wait reports, "killed" only for a process our
 # SIGKILL ended (M1): a kill -KILL that lands on an exited, unreaped process
 # (stubbed here) must not turn a clean exit 0 into "killed".

@@ -254,15 +254,16 @@ stack_profile() {
 
 # stack_metric NAME METRIC [MATCH]: the sum of METRIC's samples on NAME's
 # /metrics (lines "METRIC{...} V" or "METRIC V", and containing MATCH if
-# given, e.g. 'state="online"'), as an integer when whole; "null" if NAME
-# does not answer or has no such sample, so it can go straight into JSON.
+# given, e.g. 'state="online"'), as an integer when whole (%.0f, not %d,
+# which stops at 2^31 in some awks); "null" if NAME does not answer or has
+# no such sample, so it can go straight into JSON.
 stack_metric() {
   local admin body
   admin=$(stack_admins | awk -v n="$1" '$1 == n { print $2 }')
   [ -n "$admin" ] && body=$(curl -sf -m 10 "http://$admin/metrics") || { echo null; return; }
   awk -v m="$2" -v want="${3:-}" '
-    ($1 == m || index($1, m "{") == 1) && index($0, want) { s += $NF; n++ }
-    END { if (!n) print "null"; else if (s == int(s)) printf "%d\n", s; else printf "%.6g\n", s }' <<<"$body"
+    ($1 == m || index($1, m "{") == 1) && (want == "" || index($0, want)) { s += $NF; n++ }
+    END { if (!n) print "null"; else if (s == int(s)) printf "%.0f\n", s; else printf "%.6g\n", s }' <<<"$body"
 }
 
 # stack_wait_idle SECONDS: the phase boundary on a shared stack (P6a2bI-3):

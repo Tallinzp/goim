@@ -63,7 +63,9 @@ except Exception:
 
 lg_true() { [ "$(lg_py "$1" "bool($2)")" = true ] && echo true || echo false; }
 
-lg_get() { curl -sf "http://$(lg_control)$1" | lg_py - "$2"; }
+# lg_get gives up after LG_CURL_TIMEOUT seconds (default 10), so a wedged
+# loadgen reads as null rather than hanging the run.
+lg_get() { curl -sf -m "${LG_CURL_TIMEOUT:-10}" "http://$(lg_control)$1" | lg_py - "$2"; }
 
 lg_post() { curl -sf -X POST "http://$(lg_control)$1"; }
 

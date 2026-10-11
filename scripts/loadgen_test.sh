@@ -25,4 +25,18 @@ expect "true: a false expression" "$(lg_true "$dir/r.json" 'd["online"] > 3')" f
 expect "true: a missing file is false" "$(lg_true "$dir/none.json" 'd["online"] == 3')" false
 expect "true: a non-bool value is judged by truth" "$(lg_true "$dir/r.json" 'd["online"]')" true
 
+# A control API that accepts but never answers reads as null within
+# LG_CURL_TIMEOUT, so a wedged loadgen cannot hang a run (6b1 minor M7).
+port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+python3 -c 'import socket, sys, time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(8); time.sleep(30)' "$port" &
+mute=$!
+sleep 0.5
+start=$SECONDS
+got=$(STACK_PORT_BASE=$((port - 5)) LG_CURL_TIMEOUT=1 timeout 10 bash -c '. scripts/loadgen.sh; lg_get /stats "d[\"online\"]"')
+expect "get: a silent control API is null" "$got" null
+expect "get: within the timeout" "$((SECONDS - start < 5))" 1
+kill $mute 2>/dev/null; wait $mute 2>/dev/null
+
 [ "$fails" -eq 0 ] && echo "loadgen_test: all passed" || { echo "loadgen_test: $fails failed"; exit 1; }
