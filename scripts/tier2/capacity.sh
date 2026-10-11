@@ -82,9 +82,11 @@ t2_report_extra() {
 
 # gc_mark_cpu_pct PROFILE: the share of the profile's samples in the GC's
 # mark workers and mark assists (sweeping not included), in percent; null if
-# go tool pprof cannot read it.
+# go tool pprof cannot read it. No node cut: by default pprof drops nodes
+# under 0.5%, which would turn a small share into 0. The mark workers
+# include idle-mode ones, which run on otherwise idle CPU.
 gc_mark_cpu_pct() {
-  go tool pprof -top "$1" 2>/dev/null | awk '
+  go tool pprof -top -nodefraction=0 -edgefraction=0 "$1" 2>/dev/null | awk '
     $NF == "runtime.gcBgMarkWorker" || $NF == "runtime.gcAssistAlloc" { s += $5; n++ }
     /^Showing nodes/ { ok = 1 }
     END { if (ok) printf "%.1f\n", s; else print "null" }'
@@ -128,6 +130,7 @@ for phase in $PHASES; do
   t=$SECONDS
   online=false
   lg_wait_online "$clients" $((clients / RATE * 3 + 60)) && online=$(lg_get /stats 'd["online_by_gateway"].get("gw-0") == '"$clients"' and "gave-up" not in d["failed"]')
+  [ "$online" = true ] || online=false # null: /stats unreadable, a failed phase, not a stopped run
   ramp_s=$((SECONDS - t))
   ramp=$(stack_usage_json)
   t2_check "${name}_online" "$online" "\"want\": $clients, \"online\": $(lg_get /stats 'd["online"]'), \"ramp_s\": $ramp_s, \"failed\": $(lg_get /stats 'd["failed"]')"
@@ -142,19 +145,21 @@ for phase in $PHASES; do
     t2_check pinning "$(t2_bool [ -z "$wrong" ])" "\"gateway_cpus\": $(t2_json_str "$T2_CPUS_GATEWAY"), \"gateway_procs\": $(. "$STACK_DIR/stack.env"; echo "$GATEWAY_PROCS"), \"wrong\": $(t2_json_str "${wrong# }")"
   fi
 
-  # The window: whole heartbeats after a 10s settle, with CPU profiles of
-  # its first 30s and the gateway's GC counters at both ends.
-  sleep 10 & wait $!
+  # The settle: 30s CPU profiles of the gateway, Logic and loadgen, taken
+  # before the window so their sampling cost is not in its CPU numbers.
+  stack_profile window 30 & p1=$!
+  lg_profile window 30 & p2=$!
+  wait $p1; wait $p2
+  profile_end=$(date +%s%N)
+  # The window: whole heartbeats, with the gateway's GC counters at both ends.
   pongs0=$(lg_get /stats 'd["pongs"]')
   gc0=$(stack_metric gw-0 go_gc_duration_seconds_count)
   pause0=$(stack_metric gw-0 go_gc_duration_seconds_sum)
   rec0=$(stack_metric gw-0 goim_gateway_reconcile_entries_total)
   t2_record_start "$name"
   stack_usage_start loadgen="$LG_PID"
-  stack_profile window 30 & p1=$!
-  lg_profile window 30 & p2=$!
+  profile_in_window=$(awk -v d=$((profile_end - STACK_USAGE_T0)) 'BEGIN { printf "%.1f", (d > 0 ? d / 1e9 : 0) }')
   sleep "$window" & wait $!
-  wait $p1; wait $p2
   win=$(stack_usage_json)
   t2_record_end "$name"
   # Reconcile entries in the window (no sample until the first entry, so
@@ -172,20 +177,25 @@ gc0, gc1, p0, p1 = map(n, sys.argv[1:5])
 print(json.dumps({"gc_cycles_before_window": gc0,
   "gc_cycles": None if None in (gc0, gc1) else gc1 - gc0,
   "gc_pause_s": None if None in (p0, p1) else round(p1 - p0, 4),
-  "gc_pause_max_s": n(sys.argv[5]), "gc_mark_cpu_pct": n(sys.argv[6]),
+  "gc_pause_max_recent_s": n(sys.argv[5]), "gc_mark_cpu_pct": n(sys.argv[6]),
   "heap_inuse_mb": None if sys.argv[7] == "null" else int(n(sys.argv[7]) / 2**20),
   "next_gc_mb": None if sys.argv[8] == "null" else int(n(sys.argv[8]) / 2**20),
   "goroutines": n(sys.argv[9])}))' \
     "$gc0" "$(stack_metric gw-0 go_gc_duration_seconds_count)" "$pause0" "$(stack_metric gw-0 go_gc_duration_seconds_sum)" \
     "$(stack_metric gw-0 go_gc_duration_seconds 'quantile="1"')" "$(gc_mark_cpu_pct "$STACK_DIR/artifacts/window/gw-0.cpu.pb.gz")" \
     "$(stack_metric gw-0 go_memstats_heap_inuse_bytes)" "$(stack_metric gw-0 go_memstats_next_gc_bytes)" "$(stack_metric gw-0 go_goroutines)")
+  # gc_pause_max_recent_s is the largest of the recent pauses Go keeps (since
+  # start, ramp included), not the window's.
   stack_snapshot window
   # The live heap: after the window, a forced GC (with GOGC=off the heap may
-  # not have been collected since the ramp), then heap in use and a heap
-  # profile of what is live, for bytes per connection and pooling.
+  # not have been collected since the ramp), then the heap allocated (live
+  # objects; heap in use, with span slack, beside it) and a heap profile of
+  # what is live, for bytes per connection and pooling.
   curl -sf -m 120 "http://$(stack_admins | awk '$1 == "gw-0" { print $2 }')/debug/pprof/heap?gc=1" >"$STACK_DIR/artifacts/window/gw-0.heap-live.pb.gz"
-  live=$(stack_metric gw-0 go_memstats_heap_inuse_bytes)
+  live=$(stack_metric gw-0 go_memstats_heap_alloc_bytes)
+  live_inuse=$(stack_metric gw-0 go_memstats_heap_inuse_bytes)
   live_mb=$([ "$live" = null ] && echo null || echo $((live / 1048576)))
+  live_inuse_mb=$([ "$live_inuse" = null ] && echo null || echo $((live_inuse / 1048576)))
   per_conn=$([ "$live" = null ] && echo null || echo $((live / clients)))
   pings=$(python3 -c 'import sys; print(int(sys.argv[2]) - int(sys.argv[1]))' "$pongs0" "$pongs1" 2>/dev/null || echo null)
   per=$(python3 -c 'import json, sys
@@ -214,7 +224,7 @@ print(round(w["gw-0"]["cpu_s"] / p * 1e6, 1) if p > 0 and w.get("gw-0") else "nu
   problems=$(stack_health)
   t2_check "${name}_processes" "$(t2_bool [ -z "$problems" ])" "\"problems\": $(t2_json_str "$problems")"
 
-  t2_field "$name" "{\"clients\": $clients, \"heartbeat_s\": $hb, \"window_s\": $window, \"gc\": $(t2_json_str "$gc"), \"gateway_env\": $(t2_json_str "${STACK_GATEWAY_ENV[*]}"), \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"ramp_s\": $ramp_s, \"ramp\": $ramp, \"window\": $win, \"gateway\": $gw, \"live_heap_mb\": $live_mb, \"live_bytes_per_conn\": $per_conn, \"pings_in_window\": $pings, \"gateway_us_per_pong\": $per, \"reconcile_entries\": $reconcile, \"stop_s\": $stop_s, \"login_latency\": $(lg_json 'd["login_latency"]'), \"pong_rtt\": $(lg_json 'd["pong_rtt"]'), \"failed\": $(lg_json 'd["failed"]'), \"sources\": $(lg_json 'd["sources"]')}"
+  t2_field "$name" "{\"clients\": $clients, \"heartbeat_s\": $hb, \"window_s\": $window, \"gc\": $(t2_json_str "$gc"), \"gateway_env\": $(t2_json_str "${STACK_GATEWAY_ENV[*]}"), \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"ramp_s\": $ramp_s, \"ramp\": $ramp, \"window\": $win, \"gateway\": $gw, \"live_heap_mb\": $live_mb, \"live_heap_inuse_mb\": $live_inuse_mb, \"live_bytes_per_conn\": $per_conn, \"pings_in_window\": $pings, \"gateway_us_per_pong\": $per, \"reconcile_entries\": $reconcile, \"profile_in_window_s\": $profile_in_window, \"stop_s\": $stop_s, \"loadgen_exit\": $LG_STATUS, \"login_latency\": $(lg_json 'd["login_latency"]'), \"pong_rtt\": $(lg_json 'd["pong_rtt"]'), \"failed\": $(lg_json 'd["failed"]'), \"sources\": $(lg_json 'd["sources"]')}"
   summary+=("$(t2_json_str "$name"): {\"clients\": $clients, \"heartbeat_s\": $hb, \"gc\": $(t2_json_str "$gc"), \"gateway_cores\": $(echo "$win" | lg_py - 'd["gw-0"]["cores"]'), \"gateway_rss_mb\": $(echo "$win" | lg_py - 'd["gw-0"]["rss_mb"]'), \"live_heap_mb\": $live_mb, \"live_bytes_per_conn\": $per_conn, \"gateway_us_per_pong\": $per, \"gc_mark_cpu_pct\": $(echo "$gw" | lg_py - 'd["gc_mark_cpu_pct"]'), \"ramp_gateway_cores\": $(echo "$ramp" | lg_py - 'd["gw-0"]["cores"]'), \"loadgen_rss_mb\": $(echo "$win" | lg_py - 'd["loadgen"]["rss_mb"]')}")
   t2_duration "$name" $((SECONDS - t0))
 done
