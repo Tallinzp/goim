@@ -12,6 +12,7 @@
 #   stack_profile NAME SECONDS  # CPU profiles of Logic and every gateway at once -> artifacts/NAME/
 #   stack_expect_dead NAME      # NAME was killed on purpose (loadgen /kill): reap and record it
 #   stack_metric NAME METRIC [MATCH]  # sum of METRIC's samples (with MATCH in the line) on NAME's /metrics
+#   stack_metrics NAME          # NAME's /metrics once; stack_metric_in BODY METRIC [MATCH] reads it
 #   stack_wait_idle SECONDS     # phase boundary: every gateway at 0 connections and 0 awaiting Logout
 #   stack_usage_start [N=PID..] # start a CPU window over the stack's processes (and N=PID extras)
 #   stack_usage_json            # {"window_s", NAME: {"cpu_s", "cores", "rss_mb"}...} since the start
@@ -258,9 +259,22 @@ stack_profile() {
 # which stops at 2^31 in some awks); "null" if NAME does not answer or has
 # no such sample, so it can go straight into JSON.
 stack_metric() {
-  local admin body
+  local body
+  body=$(stack_metrics "$1") || { echo null; return; }
+  stack_metric_in "$body" "$2" "${3:-}"
+}
+
+# stack_metrics NAME: NAME's /metrics, once; fails if NAME does not answer.
+# With stack_metric_in, several readings come from the same scrape.
+stack_metrics() {
+  local admin
   admin=$(stack_admins | awk -v n="$1" '$1 == n { print $2 }')
-  [ -n "$admin" ] && body=$(curl -sf -m 10 "http://$admin/metrics") || { echo null; return; }
+  [ -n "$admin" ] && curl -sf -m 10 "http://$admin/metrics"
+}
+
+# stack_metric_in BODY METRIC [MATCH]: stack_metric over a scrape already taken.
+stack_metric_in() {
+  local body=$1
   awk -v m="$2" -v want="${3:-}" '
     ($1 == m || index($1, m "{") == 1) && (want == "" || index($0, want)) { s += $NF; n++ }
     END { if (!n) print "null"; else if (s == int(s)) printf "%.0f\n", s; else printf "%.6g\n", s }' <<<"$body"

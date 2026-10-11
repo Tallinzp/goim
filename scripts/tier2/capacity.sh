@@ -42,11 +42,16 @@
 #   P_pongs            a Pong for every Ping in the window, one per client per heartbeat
 #   P_held             no connection lost
 #   no_swap_in_P       no page swapped in during the window (#70)
+#   no_lo_drops_in_P   loopback dropped no packet from the ramp's start to the
+#                      window's end: a dropped SYN or segment is resent 1s, 3s,
+#                      7s later, so the run would measure the host's input
+#                      queue (net.core.netdev_max_backlog), not the gateway (run 14)
 #   P_loadgen_headroom loadgen used under 3/4 of its CPU set in the ramp and the
 #                      window, so the gateway, not loadgen, set the pace (P6a2aI-4)
 #   P_idle             after loadgen stops, gw-0 reaches 0 connections and 0
-#                      awaiting Logout within 300s, with one Logout done per
-#                      client (counted, so a missing metric cannot pass)
+#                      awaiting Logout within 300s; then, from one scrape, a
+#                      Logout done for every Login that succeeded (more for
+#                      Logins with an unknown outcome) and none dropped
 #   P_processes        nothing died, panicked or stopped uncleanly
 # and once: pinning (in the first phase), artifacts.
 set -uo pipefail
@@ -93,6 +98,21 @@ gc_mark_cpu_pct() {
 }
 
 # usage_ok JSON: loadgen used under 3/4 of its CPU set.
+# logouts_settled DONE DROPPED LOGINS_OK, read from one scrape: every
+# session that logged in got its fenced Logout (a client that retried after
+# a timeout has two sessions, and a Login with an unknown outcome gets one
+# too, so DONE can exceed LOGINS_OK), and none was dropped. DONE and
+# LOGINS_OK must be read; an absent DROPPED in the same scrape means none.
+logouts_settled() {
+  [ "$1" != null ] && [ "$3" != null ] && [ "$1" -ge "$3" ] && [ "$2" = null -o "$2" = 0 ] && echo true || echo false
+}
+
+# lo_dropped: packets loopback dropped on input since boot (host-wide).
+lo_dropped() { cat /sys/class/net/lo/statistics/rx_dropped 2>/dev/null || echo null; }
+
+# lo_drops_between A B: B - A, null if either is unread.
+lo_drops_between() { [ "$1" = null ] || [ "$2" = null ] && echo null || echo $(($2 - $1)); }
+
 usage_ok() { [ "$(echo "$1" | lg_true - 'd["loadgen"]["cores"] < '"$LG_CPUS"' * 0.75')" = true ]; }
 
 t=$SECONDS
@@ -125,6 +145,7 @@ for phase in $PHASES; do
   [ $up -eq 0 ] || t2_finish
 
   # The ramp.
+  lo0=$(lo_dropped)
   lg_start "$name" -mode light -clients "$clients" -rate "$RATE" -ping-every "${hb}s" -uid-prefix "$name"
   stack_usage_start loadgen="$LG_PID"
   t=$SECONDS
@@ -133,6 +154,7 @@ for phase in $PHASES; do
   [ "$online" = true ] || online=false # null: /stats unreadable, a failed phase, not a stopped run
   ramp_s=$((SECONDS - t))
   ramp=$(stack_usage_json)
+  lo1=$(lo_dropped)
   t2_check "${name}_online" "$online" "\"want\": $clients, \"online\": $(lg_get /stats 'd["online"]'), \"ramp_s\": $ramp_s, \"failed\": $(lg_get /stats 'd["failed"]')"
 
   if [ -n "$first" ]; then
@@ -162,6 +184,10 @@ for phase in $PHASES; do
   sleep "$window" & wait $!
   win=$(stack_usage_json)
   t2_record_end "$name"
+  lo2=$(lo_dropped)
+  lo_ramp=$(lo_drops_between "$lo0" "$lo1") lo_window=$(lo_drops_between "$lo1" "$lo2")
+  t2_check "no_lo_drops_in_$name" "$(t2_bool [ "$lo_ramp" = 0 ] && [ "$lo_window" = 0 ])" \
+    "\"ramp\": $lo_ramp, \"settle_and_window\": $lo_window, \"netdev_max_backlog\": $(cat /proc/sys/net/core/netdev_max_backlog 2>/dev/null || echo null)"
   # Reconcile entries in the window (no sample until the first entry, so
   # null at both ends is 0; null at one end only is unknown).
   rec1=$(stack_metric gw-0 goim_gateway_reconcile_entries_total)
@@ -216,10 +242,12 @@ print(round(w["gw-0"]["cpu_s"] / p * 1e6, 1) if p > 0 and w.get("gw-0") else "nu
   t=$SECONDS
   idle=$(t2_bool stack_wait_idle 300 2>"$STACK_DIR/idle.err")
   stop_s=$((SECONDS - t))
-  done_logouts=$(stack_metric gw-0 goim_gateway_logouts_total 'result="done"')
-  dropped=$(stack_metric gw-0 goim_gateway_logouts_total 'result="dropped"')
-  [ "$done_logouts" = "$clients" ] || idle=false
-  t2_check "${name}_idle" "$idle" "\"stop_s\": $stop_s, \"done_logouts\": $done_logouts, \"want\": $clients, \"dropped_logouts\": $dropped, \"error\": $(t2_json_str "$(cat "$STACK_DIR/idle.err")")"
+  body=$(stack_metrics gw-0) || body=""
+  done_logouts=$(stack_metric_in "$body" goim_gateway_logouts_total 'result="done"')
+  dropped=$(stack_metric_in "$body" goim_gateway_logouts_total 'result="dropped"')
+  logins_ok=$(stack_metric_in "$body" goim_gateway_logins_total 'result="ok"')
+  [ "$(logouts_settled "$done_logouts" "$dropped" "$logins_ok")" = true ] || idle=false
+  t2_check "${name}_idle" "$idle" "\"stop_s\": $stop_s, \"done_logouts\": $done_logouts, \"logins_ok\": $logins_ok, \"dropped_logouts\": $dropped, \"error\": $(t2_json_str "$(cat "$STACK_DIR/idle.err")")"
   stack_down
   problems=$(stack_health)
   t2_check "${name}_processes" "$(t2_bool [ -z "$problems" ])" "\"problems\": $(t2_json_str "$problems")"

@@ -131,6 +131,15 @@ case $(stack_metric gw-0 go_gc_duration_seconds 'quantile="1"') in
   null | "") bad "metric: a summary quantile" ;; *) ok "metric: a summary quantile" ;;
 esac
 
+# stack_metrics + stack_metric_in: several readings from ONE scrape, so an
+# absent sample means no sample, not a failed scrape (run 14's P_idle).
+body=$(stack_metrics gw-0) && ok "metrics: one scrape" || bad "metrics: one scrape"
+expect "metrics: a reading from the scrape" "$(stack_metric_in "$body" goim_gateway_connections)" 0
+expect "metrics: an absent sample" "$(stack_metric_in "$body" goim_no_such_metric)" null
+expect "metrics: a label filter" "$(stack_metric_in 'goim_x{r="done"} 5
+goim_x{r="dropped"} 2' goim_x 'r="done"')" 5
+stack_metrics gw-9 >/dev/null && bad "metrics: no such process must fail" || ok "metrics: no such process fails"
+
 # The phase boundary (P6a2bI-3): idle at once on an idle stack; a socket open
 # on gw-0 keeps it busy, named, until the socket closes.
 stack_wait_idle 5 && ok "idle: an idle stack" || bad "idle: an idle stack"
