@@ -362,6 +362,48 @@ t2_cpu_delta() {
 # t2_busy_ticks: host-wide busy CPU ticks (all CPUs; idle and iowait excluded).
 t2_busy_ticks() { awk '/^cpu / { print $2 + $3 + $4 + $7 + $8 + $9; exit }' /proc/stat; }
 # t2_swap_pages: "pswpin pswpout" since boot.
+# t2_cpustat_snap FILE [STAT SOFTNET]: per-CPU ticks from /proc/stat and
+# softnet drops and budget squeezes from /proc/net/softnet_stat (hex; the
+# CPU is its last column when present, else its row) into FILE, for
+# t2_cpusets_json. Plain awk: the Tier 2 host's mawk has no strtonum.
+t2_cpustat_snap() {
+  awk 'function hex(s,   i, n) { n = 0; s = tolower(s)
+         for (i = 1; i <= length(s); i++) n = n * 16 + index("0123456789abcdef", substr(s, i, 1)) - 1
+         return n }
+       FNR == NR { if ($1 ~ /^cpu[0-9]+$/) print $1, $2 + $3, $4, $5 + $6, $7 + $8, $9; next }
+       { print "softnet" (NF >= 13 ? hex($13) : FNR - 1), hex($2), hex($3) }' \
+    "${2:-/proc/stat}" "${3:-/proc/net/softnet_stat}" >"$1" 2>/dev/null
+}
+
+# t2_cpusets_json SNAP0 SNAP1: for the gateway, Logic and loadgen CPU sets
+# (T2_CPUS_*), the share of the set's CPU time in user, system, softirq
+# (with irq) and idle (with iowait) between the snapshots, and the softnet
+# drops and squeezes on its CPUs; null if a snapshot is missing. Averaged
+# CPU per process can look idle while its CPUs are busy in softirq (run 15).
+t2_cpusets_json() {
+  [ -s "$1" ] && [ -s "$2" ] || { echo null; return; }
+  awk -v sets="gateway=$(t2_cpulist_expand "$T2_CPUS_GATEWAY" | tr ' ' ,) logic=$(t2_cpulist_expand "$T2_CPUS_LOGIC" | tr ' ' ,) loadgen=$(t2_cpulist_expand "$T2_CPUS_LOADGEN" | tr ' ' ,)" '
+    FNR == NR { a[$1] = $0; next }
+    { b[$1] = $0 }
+    END {
+      n = split(sets, s, " "); out = ""
+      for (k = 1; k <= n; k++) {
+        split(s[k], kv, "="); m = split(kv[2], cpus, ",")
+        u = sy = si = id = dr = sq = 0
+        for (c = 1; c <= m; c++) {
+          split(a["cpu" cpus[c]], x, " "); split(b["cpu" cpus[c]], y, " ")
+          u += y[2] - x[2]; sy += y[3] - x[3]; id += y[4] - x[4]; si += y[5] - x[5] + y[6] - x[6]
+          split(a["softnet" cpus[c]], x, " "); split(b["softnet" cpus[c]], y, " ")
+          dr += y[2] - x[2]; sq += y[3] - x[3]
+        }
+        t = u + sy + si + id; if (t <= 0) t = 1
+        out = out (k > 1 ? ", " : "") sprintf("\"%s\": {\"cpus\": %d, \"user_pct\": %.1f, \"sys_pct\": %.1f, \"softirq_pct\": %.1f, \"idle_pct\": %.1f, \"softnet_dropped\": %d, \"softnet_squeezed\": %d}",
+          kv[1], m, 100 * u / t, 100 * sy / t, 100 * si / t, 100 * id / t, dr, sq)
+      }
+      print "{" out "}"
+    }' "$1" "$2"
+}
+
 t2_swap_pages() { awk '/^pswpin / { i = $2 } /^pswpout / { o = $2 } END { print i + 0, o + 0 }' /proc/vmstat; }
 
 # t2_clock_sampler FILE: appends "unix_s cpu khz" for every CPU every 5s.

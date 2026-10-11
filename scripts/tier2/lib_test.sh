@@ -252,6 +252,19 @@ if [ "$(id -u)" != 0 ]; then
   done
 fi
 
+# Per CPU set: user, system and softirq shares of the set's time, and the
+# softnet drops and budget squeezes on its CPUs, between two snapshots (run 15:
+# loadgen stalled while its averaged CPU looked idle). softnet_stat is hex.
+printf '%s\n' 'cpu  1 1 1 1 1 1 1 1' 'cpu0 100 0 50 800 0 0 50 0' 'cpu1 100 0 50 800 0 0 50 0' 'cpu2 0 0 0 1000 0 0 0 0' >"$tmp/stat0"
+printf '%s\n' 'cpu  1 1 1 1 1 1 1 1' 'cpu0 400 0 150 900 0 0 550 0' 'cpu1 400 0 150 900 0 0 550 0' 'cpu2 0 0 0 2000 0 0 0 0' >"$tmp/stat1"
+printf '%s\n' '00000010 00000000 00000001 0 0 0 0 0 0 0 0 0 00000000' '00000010 00000000 00000002 0 0 0 0 0 0 0 0 0 00000001' '00000010 00000000 00000000 0 0 0 0 0 0 0 0 0 00000002' >"$tmp/softnet0"
+printf '%s\n' '000000ff 00000003 00000011 0 0 0 0 0 0 0 0 0 00000000' '000000ff 00000000 0000000a 0 0 0 0 0 0 0 0 0 00000001' '00000010 00000000 00000000 0 0 0 0 0 0 0 0 0 00000002' >"$tmp/softnet1"
+t2_cpustat_snap "$tmp/snap0" "$tmp/stat0" "$tmp/softnet0"
+t2_cpustat_snap "$tmp/snap1" "$tmp/stat1" "$tmp/softnet1"
+expect "cpusets: shares and softnet per set" "$(T2_CPUS_GATEWAY=2 T2_CPUS_LOGIC=2 T2_CPUS_LOADGEN=0-1 t2_cpusets_json "$tmp/snap0" "$tmp/snap1")" \
+  '{"gateway": {"cpus": 1, "user_pct": 0.0, "sys_pct": 0.0, "softirq_pct": 0.0, "idle_pct": 100.0, "softnet_dropped": 0, "softnet_squeezed": 0}, "logic": {"cpus": 1, "user_pct": 0.0, "sys_pct": 0.0, "softirq_pct": 0.0, "idle_pct": 100.0, "softnet_dropped": 0, "softnet_squeezed": 0}, "loadgen": {"cpus": 2, "user_pct": 30.0, "sys_pct": 10.0, "softirq_pct": 50.0, "idle_pct": 10.0, "softnet_dropped": 3, "softnet_squeezed": 24}}'
+expect "cpusets: a missing snapshot is null" "$(T2_CPUS_GATEWAY=2 T2_CPUS_LOGIC=2 T2_CPUS_LOADGEN=0-1 t2_cpusets_json "$tmp/none" "$tmp/snap1")" null
+
 # make test-tier2 shows the script's own exit code (make itself exits 2 on any failure).
 out=$(GOIM_TEST_TIER= make -s test-tier2 SCENARIO=race 2>&1)
 contains "make: shows the scenario's exit code" "$out" "test-tier2: race exited 2"
