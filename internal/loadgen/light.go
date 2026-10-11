@@ -21,12 +21,13 @@ import (
 // lightAttempts times, as the SDK retries a pre-handshake close: a gateway's
 // handshake limit closes the excess of a fast ramp (spec: Admission control).
 type lightConn struct {
-	i       int
-	pingAt  atomic.Int64 // unix ns of the unanswered Ping, 0: none
-	reqID   atomic.Uint32
-	mu      sync.Mutex
-	c       *clientconn.Conn
-	stopped bool
+	i        int
+	pingAt   atomic.Int64 // unix ns of the unanswered Ping, 0: none
+	lastPing atomic.Int64 // unix ns of the last Ping sent (or of add)
+	reqID    atomic.Uint32
+	mu       sync.Mutex
+	c        *clientconn.Conn
+	stopped  bool
 }
 
 // stop closes the connection, or keeps it from opening.
@@ -170,16 +171,17 @@ func (lc *lightConn) read(rec *Recorder) string {
 // 100ms tick. A Ping due while the last one is unanswered is counted
 // missing.
 type pinger struct {
-	tick  time.Duration
-	rec   *Recorder
-	mu    sync.Mutex
-	slots []map[*lightConn]struct{}
+	tick   time.Duration
+	rec    *Recorder
+	shards int // of the pingers it belongs to (1 alone)
+	mu     sync.Mutex
+	slots  []map[*lightConn]struct{}
 }
 
 const pingTick = 100 * time.Millisecond
 
 func newPinger(every time.Duration, rec *Recorder) *pinger {
-	p := &pinger{tick: pingTick, rec: rec, slots: make([]map[*lightConn]struct{}, max(1, int(every/pingTick)))}
+	p := &pinger{tick: pingTick, rec: rec, shards: 1, slots: make([]map[*lightConn]struct{}, max(1, int(every/pingTick)))}
 	for i := range p.slots {
 		p.slots[i] = map[*lightConn]struct{}{}
 	}
@@ -187,15 +189,44 @@ func newPinger(every time.Duration, rec *Recorder) *pinger {
 }
 
 func (p *pinger) add(lc *lightConn) {
+	lc.lastPing.Store(time.Now().UnixNano())
 	p.mu.Lock()
-	p.slots[lc.i%len(p.slots)][lc] = struct{}{}
+	p.slots[p.slot(lc)][lc] = struct{}{}
 	p.mu.Unlock()
 }
 
 func (p *pinger) remove(lc *lightConn) {
 	p.mu.Lock()
-	delete(p.slots[lc.i%len(p.slots)], lc)
+	delete(p.slots[p.slot(lc)], lc)
 	p.mu.Unlock()
+}
+
+// slot spreads a shard's clients (every shard-th index) over its slots.
+func (p *pinger) slot(lc *lightConn) int { return lc.i / max(1, p.shards) % len(p.slots) }
+
+// pingers are pinger shards, client i in shard i % len, each with its own
+// goroutine, so one shard falling behind (a slow write, a starved thread)
+// delays only its share of the Pings.
+type pingers []*pinger
+
+func newPingers(n int, every time.Duration, rec *Recorder) pingers {
+	ps := make(pingers, max(1, n))
+	for i := range ps {
+		ps[i] = newPinger(every, rec)
+		ps[i].shards = len(ps)
+	}
+	return ps
+}
+
+func (ps pingers) add(lc *lightConn)    { ps[lc.i%len(ps)].add(lc) }
+func (ps pingers) remove(lc *lightConn) { ps[lc.i%len(ps)].remove(lc) }
+
+func (ps pingers) run(ctx context.Context) {
+	var wg sync.WaitGroup
+	for _, p := range ps {
+		wg.Go(func() { p.run(ctx) })
+	}
+	wg.Wait()
 }
 
 func (p *pinger) run(ctx context.Context) {
@@ -219,6 +250,7 @@ func (p *pinger) run(ctx context.Context) {
 			if lc.pingAt.Swap(now) != 0 {
 				p.rec.PongMissing()
 			}
+			p.rec.PingGap(time.Duration(now - lc.lastPing.Swap(now)))
 			lc.c.Send(clientpb.Cmd_CMD_PING, lc.reqID.Add(1), nil) // a failure ends read
 		}
 	}

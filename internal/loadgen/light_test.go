@@ -64,3 +64,66 @@ func TestDialFailuresAreCountedByReason(t *testing.T) {
 		}
 	}
 }
+
+// The longest gap between two Pings to one client is recorded: a pinger that
+// falls behind its ticks gets its clients closed by the gateway's heartbeat
+// check while no Pong is ever missing (run 15: 146,836 heartbeat closes,
+// pong_missing 0).
+func TestPingerRecordsTheLongestPingGap(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	rec := NewRecorder(1, []string{"gw-0"})
+	p := newPinger(2*pingTick, rec) // two slots: client 0 every 200ms
+	lc := &lightConn{i: 0, c: clientconn.New(a)}
+	p.add(lc)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { p.run(ctx); close(done) }()
+	defer func() { cancel(); <-done }()
+	time.Sleep(7 * pingTick)
+	if g := rec.Counts().PingGapMaxMs; g < 150 || g > 400 {
+		t.Fatalf("on time: longest gap %dms, want ~200ms", g)
+	}
+	p.mu.Lock() // the pinger stalls for 1s
+	time.Sleep(10 * pingTick)
+	p.mu.Unlock()
+	time.Sleep(5 * pingTick)
+	if g := rec.Counts().PingGapMaxMs; g < 1000 {
+		t.Fatalf("after a 1s stall: longest gap %dms, want >= 1000ms", g)
+	}
+}
+
+// Clients are spread over pinger shards, each with its own goroutine, and
+// every shard pings its clients.
+func TestPingerShardsPingEveryClient(t *testing.T) {
+	rec := NewRecorder(4, []string{"gw-0"})
+	ps := newPingers(4, pingTick, rec)
+	var lcs []*lightConn
+	for i := range 4 {
+		a, b := net.Pipe()
+		defer a.Close()
+		defer b.Close()
+		lc := &lightConn{i: i, c: clientconn.New(a)}
+		ps.add(lc)
+		lcs = append(lcs, lc)
+	}
+	for i, p := range ps {
+		if n := len(p.slots[0]); n != 1 {
+			t.Fatalf("shard %d holds %d clients, want 1", i, n)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { ps.run(ctx); close(done) }()
+	waitFor(t, "every client pinged", 2*time.Second, func() bool {
+		for _, lc := range lcs {
+			if lc.pingAt.Load() == 0 {
+				return false
+			}
+		}
+		return true
+	})
+	cancel()
+	<-done
+}

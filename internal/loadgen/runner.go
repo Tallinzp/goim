@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -52,7 +53,7 @@ type Runner struct {
 	env      Env
 	rec      *Recorder
 	bal      *Balancer
-	pinger   *pinger
+	pinger   pingers
 	begin    atomic.Int64 // unix ns Run started, 0: not yet
 	started  atomic.Int64
 	rampDone atomic.Bool
@@ -84,7 +85,7 @@ func New(cfg Config, env Env) (*Runner, error) {
 	}
 	r := &Runner{cfg: cfg, env: env, rec: NewRecorder(cfg.Clients, env.GatewayIDs), bal: bal}
 	if cfg.Mode == "light" {
-		r.pinger = newPinger(cfg.PingEvery, r.rec)
+		r.pinger = newPingers(runtime.GOMAXPROCS(0), cfg.PingEvery, r.rec)
 	}
 	return r, nil
 }

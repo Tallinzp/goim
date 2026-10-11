@@ -23,6 +23,7 @@ type Recorder struct {
 	failed  map[string]int64
 	pongs   int64
 	missing int64
+	gapMax  time.Duration
 	pongRTT *hist
 	marks   []*mark // by index
 	byName  map[string]*mark
@@ -114,6 +115,14 @@ func (r *Recorder) Pong(rtt time.Duration) {
 func (r *Recorder) PongMissing() {
 	r.mu.Lock()
 	r.missing++
+	r.mu.Unlock()
+}
+
+// PingGap: a client's Ping went out gap after its previous one (or after
+// it was added); the longest is kept.
+func (r *Recorder) PingGap(gap time.Duration) {
+	r.mu.Lock()
+	r.gapMax = max(r.gapMax, gap)
 	r.mu.Unlock()
 }
 
@@ -220,6 +229,7 @@ type Counts struct {
 	LoginLatency    Dist             `json:"login_latency"`
 	Pongs           int64            `json:"pongs"`
 	PongMissing     int64            `json:"pong_missing"`
+	PingGapMaxMs    int64            `json:"ping_gap_max_ms"`
 	PongRTT         Dist             `json:"pong_rtt"`
 }
 
@@ -228,7 +238,7 @@ func (r *Recorder) Counts() Counts {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	c := Counts{OnlineByGateway: map[string]int{}, Logins: r.logins, Lost: map[string]int64{}, Failed: map[string]int64{},
-		LoginLatency: r.login.dist(r.login.n), Pongs: r.pongs, PongMissing: r.missing, PongRTT: r.pongRTT.dist(r.pongRTT.n)}
+		LoginLatency: r.login.dist(r.login.n), Pongs: r.pongs, PongMissing: r.missing, PingGapMaxMs: r.gapMax.Milliseconds(), PongRTT: r.pongRTT.dist(r.pongRTT.n)}
 	for i, n := range r.online {
 		c.Online += n
 		c.OnlineByGateway[r.ids[i]] = n
