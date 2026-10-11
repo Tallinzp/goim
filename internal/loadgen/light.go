@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"math/rand/v2"
+	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/Tallinzp/goim/api/clientpb"
@@ -79,7 +81,7 @@ func (r *Runner) lightConnect(ctx context.Context, lc *lightConn, deadline time.
 	nc, gw, err := r.bal.Dial(dctx)
 	cancel()
 	if err != nil {
-		return gw, "dial"
+		return gw, dialReason(err)
 	}
 	c := clientconn.New(nc)
 	lc.mu.Lock()
@@ -94,6 +96,23 @@ func (r *Runner) lightConnect(ctx context.Context, lc *lightConn, deadline time.
 		c.Close()
 	}
 	return gw, why
+}
+
+// dialReason names a failed dial for the failed counts: dial-timeout (no
+// SYN-ACK by the attempt's deadline: SYNs lost, e.g. loopback drops in run
+// 14), dial-refused, dial-no-port (EADDRNOTAVAIL: the source's ports are
+// used up), else dial.
+func dialReason(err error) string {
+	var ne net.Error
+	switch {
+	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &ne) && ne.Timeout():
+		return "dial-timeout"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "dial-refused"
+	case errors.Is(err, syscall.EADDRNOTAVAIL):
+		return "dial-no-port"
+	}
+	return "dial"
 }
 
 // lightLogin runs the handshake and Login; "" means logged in.
