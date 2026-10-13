@@ -155,6 +155,7 @@ for phase in $PHASES; do
   # The ramp.
   lo0=$(lo_dropped)
   t2_cpustat_snap "$STACK_DIR/cpustat-0"
+  t2_tcpstat_snap "$STACK_DIR/tcpstat-0"
   lg_start "$name" -mode light -clients "$clients" -rate "$RATE" -ping-every "${hb}s" -uid-prefix "$name" ${SOURCES:+-sources "$SOURCES"}
   stack_usage_start loadgen="$LG_PID"
   # A ramp of 90s or more gets CPU profiles of the gateway, Logic and
@@ -172,6 +173,7 @@ for phase in $PHASES; do
   ramp=$(stack_usage_json)
   lo1=$(lo_dropped)
   t2_cpustat_snap "$STACK_DIR/cpustat-1"
+  t2_tcpstat_snap "$STACK_DIR/tcpstat-1"
   [ -z "$ramp_prof" ] || wait "$ramp_prof"
   t2_check "${name}_online" "$online" "\"want\": $clients, \"online\": $(lg_get /stats 'd["online"]'), \"ramp_s\": $ramp_s, \"failed\": $(lg_get /stats 'd["failed"]')"
 
@@ -198,13 +200,18 @@ for phase in $PHASES; do
   rec0=$(stack_metric gw-0 goim_gateway_reconcile_entries_total)
   t2_record_start "$name"
   t2_cpustat_snap "$STACK_DIR/cpustat-2"
+  t2_tcpstat_snap "$STACK_DIR/tcpstat-2"
   stack_usage_start loadgen="$LG_PID"
   profile_in_window=$(awk -v d=$((profile_end - STACK_USAGE_T0)) 'BEGIN { printf "%.1f", (d > 0 ? d / 1e9 : 0) }')
   sleep "$window" & wait $!
   win=$(stack_usage_json)
   t2_cpustat_snap "$STACK_DIR/cpustat-3"
+  t2_tcpstat_snap "$STACK_DIR/tcpstat-3"
   t2_record_end "$name"
   cpu_sets="{\"ramp\": $(t2_cpusets_json "$STACK_DIR/cpustat-0" "$STACK_DIR/cpustat-1"), \"window\": $(t2_cpusets_json "$STACK_DIR/cpustat-2" "$STACK_DIR/cpustat-3")}"
+  # Kernel TCP counters (host-wide) over the ramp and the window: failed
+  # connects, SYNs resent, full accept queues, TIME_WAIT reuse, resets (run 16).
+  tcp="{\"ramp\": $(t2_tcpstat_json "$STACK_DIR/tcpstat-0" "$STACK_DIR/tcpstat-1"), \"window\": $(t2_tcpstat_json "$STACK_DIR/tcpstat-2" "$STACK_DIR/tcpstat-3")}"
   lo2=$(lo_dropped)
   lo_ramp=$(lo_drops_between "$lo0" "$lo1") lo_window=$(lo_drops_between "$lo1" "$lo2")
   t2_check "no_lo_drops_in_$name" "$(t2_bool [ "$lo_ramp" = 0 ] && [ "$lo_window" = 0 ])" \
@@ -276,7 +283,7 @@ print(round(w["gw-0"]["cpu_s"] / p * 1e6, 1) if p > 0 and w.get("gw-0") else "nu
   problems=$(stack_health)
   t2_check "${name}_processes" "$(t2_bool [ -z "$problems" ])" "\"problems\": $(t2_json_str "$problems")"
 
-  t2_field "$name" "{\"clients\": $clients, \"heartbeat_s\": $hb, \"window_s\": $window, \"gc\": $(t2_json_str "$gc"), \"gateway_env\": $(t2_json_str "${STACK_GATEWAY_ENV[*]}"), \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"ramp_s\": $ramp_s, \"ramp\": $ramp, \"window\": $win, \"gateway\": $gw, \"live_heap_mb\": $live_mb, \"live_heap_inuse_mb\": $live_inuse_mb, \"live_bytes_per_conn\": $per_conn, \"pings_in_window\": $pings, \"gateway_us_per_pong\": $per, \"cpu_sets\": $cpu_sets, \"heartbeat_closes\": $heartbeat_closes, \"ping_gap_max_ms\": $(lg_json 'd["ping_gap_max_ms"]'), \"reconcile_entries\": $reconcile, \"profile_in_window_s\": $profile_in_window, \"stop_s\": $stop_s, \"loadgen_exit\": $LG_STATUS, \"login_latency\": $(lg_json 'd["login_latency"]'), \"pong_rtt\": $(lg_json 'd["pong_rtt"]'), \"failed\": $(lg_json 'd["failed"]'), \"sources\": $(lg_json 'd["sources"]')}"
+  t2_field "$name" "{\"clients\": $clients, \"heartbeat_s\": $hb, \"window_s\": $window, \"gc\": $(t2_json_str "$gc"), \"gateway_env\": $(t2_json_str "${STACK_GATEWAY_ENV[*]}"), \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"ramp_s\": $ramp_s, \"ramp\": $ramp, \"window\": $win, \"gateway\": $gw, \"live_heap_mb\": $live_mb, \"live_heap_inuse_mb\": $live_inuse_mb, \"live_bytes_per_conn\": $per_conn, \"pings_in_window\": $pings, \"gateway_us_per_pong\": $per, \"cpu_sets\": $cpu_sets, \"tcp\": $tcp, \"heartbeat_closes\": $heartbeat_closes, \"ping_gap_max_ms\": $(lg_json 'd["ping_gap_max_ms"]'), \"reconcile_entries\": $reconcile, \"profile_in_window_s\": $profile_in_window, \"stop_s\": $stop_s, \"loadgen_exit\": $LG_STATUS, \"login_latency\": $(lg_json 'd["login_latency"]'), \"pong_rtt\": $(lg_json 'd["pong_rtt"]'), \"failed\": $(lg_json 'd["failed"]'), \"sources\": $(lg_json 'd["sources"]')}"
   summary+=("$(t2_json_str "$name"): {\"clients\": $clients, \"heartbeat_s\": $hb, \"gc\": $(t2_json_str "$gc"), \"gateway_cores\": $(echo "$win" | lg_py - 'd["gw-0"]["cores"]'), \"gateway_rss_mb\": $(echo "$win" | lg_py - 'd["gw-0"]["rss_mb"]'), \"live_heap_mb\": $live_mb, \"live_bytes_per_conn\": $per_conn, \"gateway_us_per_pong\": $per, \"gc_mark_cpu_pct\": $(echo "$gw" | lg_py - 'd["gc_mark_cpu_pct"]'), \"ramp_gateway_cores\": $(echo "$ramp" | lg_py - 'd["gw-0"]["cores"]'), \"loadgen_rss_mb\": $(echo "$win" | lg_py - 'd["loadgen"]["rss_mb"]'), \"ping_gap_max_ms\": $(lg_json 'd["ping_gap_max_ms"]'), \"heartbeat_closes\": $heartbeat_closes}")
   t2_duration "$name" $((SECONDS - t0))
 done

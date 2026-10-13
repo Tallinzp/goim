@@ -404,6 +404,30 @@ t2_cpusets_json() {
     }' "$1" "$2"
 }
 
+# t2_tcpstat_snap FILE [NETSTAT SNMP]: the Tcp and TcpExt counters of
+# /proc/net/snmp and /proc/net/netstat ("Prefix: names" then "Prefix:
+# values") as "name value" lines into FILE, for t2_tcpstat_json.
+t2_tcpstat_snap() {
+  awk '$1 == "Tcp:" || $1 == "TcpExt:" {
+         if (hdr[$1] == "") { hdr[$1] = $0; next }
+         n = split(hdr[$1], h, " "); split($0, v, " "); for (i = 2; i <= n; i++) print h[i], v[i]
+         hdr[$1] = "" }' "${2:-/proc/net/netstat}" "${3:-/proc/net/snmp}" >"$1" 2>/dev/null
+}
+
+# t2_tcpstat_json SNAP0 SNAP1: {NAME: delta} for T2_TCPSTAT_NAMES (a counter
+# the kernel lacks is null); null if a snapshot is missing. The defaults
+# tell a connect that fails (AttemptFails), a SYN resent (TCPSynRetrans), a
+# full accept queue (ListenOverflows/Drops), a TIME_WAIT port reused with an
+# old timestamp (PAWSActive) and resets.
+T2_TCPSTAT_NAMES="ActiveOpens PassiveOpens AttemptFails EstabResets RetransSegs OutRsts InErrs TCPSynRetrans TCPTimeouts ListenOverflows ListenDrops TCPReqQFullDrop TCPReqQFullDoCookies PAWSActive PAWSEstab TW TWRecycled TCPTimeWaitOverflow TCPChallengeACK TCPAbortOnTimeout TCPAbortOnData TCPAbortOnClose TCPAbortOnMemory TCPMemoryPressures"
+t2_tcpstat_json() {
+  [ -s "$1" ] && [ -s "$2" ] || { echo null; return; }
+  awk -v names="$T2_TCPSTAT_NAMES" 'FNR == NR { a[$1] = $2; next } { b[$1] = $2 }
+    END { n = split(names, k, " "); out = ""
+          for (i = 1; i <= n; i++) out = out (i > 1 ? ", " : "") "\"" k[i] "\": " ((k[i] in a) && (k[i] in b) ? sprintf("%.0f", b[k[i]] - a[k[i]]) : "null")
+          print "{" out "}" }' "$1" "$2"
+}
+
 t2_swap_pages() { awk '/^pswpin / { i = $2 } /^pswpout / { o = $2 } END { print i + 0, o + 0 }' /proc/vmstat; }
 
 # t2_clock_sampler FILE: appends "unix_s cpu khz" for every CPU every 5s.

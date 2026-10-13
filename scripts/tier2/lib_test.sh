@@ -265,6 +265,18 @@ expect "cpusets: shares and softnet per set" "$(T2_CPUS_GATEWAY=2 T2_CPUS_LOGIC=
   '{"gateway": {"cpus": 1, "user_pct": 0.0, "sys_pct": 0.0, "softirq_pct": 0.0, "idle_pct": 100.0, "softnet_dropped": 0, "softnet_squeezed": 0}, "logic": {"cpus": 1, "user_pct": 0.0, "sys_pct": 0.0, "softirq_pct": 0.0, "idle_pct": 100.0, "softnet_dropped": 0, "softnet_squeezed": 0}, "loadgen": {"cpus": 2, "user_pct": 30.0, "sys_pct": 10.0, "softirq_pct": 50.0, "idle_pct": 10.0, "softnet_dropped": 3, "softnet_squeezed": 24}}'
 expect "cpusets: a missing snapshot is null" "$(T2_CPUS_GATEWAY=2 T2_CPUS_LOGIC=2 T2_CPUS_LOADGEN=0-1 t2_cpusets_json "$tmp/none" "$tmp/snap1")" null
 
+# Kernel TCP counters between two snapshots, by name (run 16: dials timed
+# out with loadgen 76% idle; only boot totals were known).
+printf '%s\n' 'TcpExt: ListenOverflows TCPSynRetrans PAWSActive' 'TcpExt: 1 100 5' 'IpExt: InNoRoutes' 'IpExt: 1' >"$tmp/netstat0"
+printf '%s\n' 'TcpExt: ListenOverflows TCPSynRetrans PAWSActive' 'TcpExt: 1 350 9' 'IpExt: InNoRoutes' 'IpExt: 7' >"$tmp/netstat1"
+printf '%s\n' 'Tcp: RtoAlgorithm AttemptFails EstabResets' 'Tcp: 1 10 3' >"$tmp/snmp0"
+printf '%s\n' 'Tcp: RtoAlgorithm AttemptFails EstabResets' 'Tcp: 1 25 3' >"$tmp/snmp1"
+t2_tcpstat_snap "$tmp/tcp0" "$tmp/netstat0" "$tmp/snmp0"
+t2_tcpstat_snap "$tmp/tcp1" "$tmp/netstat1" "$tmp/snmp1"
+expect "tcpstat: deltas of the named counters" "$(T2_TCPSTAT_NAMES="TCPSynRetrans PAWSActive ListenOverflows AttemptFails EstabResets NoSuchCounter" t2_tcpstat_json "$tmp/tcp0" "$tmp/tcp1")" \
+  '{"TCPSynRetrans": 250, "PAWSActive": 4, "ListenOverflows": 0, "AttemptFails": 15, "EstabResets": 0, "NoSuchCounter": null}'
+expect "tcpstat: a missing snapshot is null" "$(t2_tcpstat_json "$tmp/none" "$tmp/tcp1")" null
+
 # make test-tier2 shows the script's own exit code (make itself exits 2 on any failure).
 out=$(GOIM_TEST_TIER= make -s test-tier2 SCENARIO=race 2>&1)
 contains "make: shows the scenario's exit code" "$out" "test-tier2: race exited 2"
