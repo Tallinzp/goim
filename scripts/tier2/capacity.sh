@@ -31,6 +31,10 @@
 #   CAPACITY_RATE      clients started per second (default 5000)
 #   CAPACITY_WINDOW    measured window in seconds (default: whole heartbeats,
 #                      at least 120s: 150s at 150s, 120s at 60s)
+#   CAPACITY_SOURCES   loadgen's source addresses, 1-253 (default: loadgen's, one
+#                      per 20,000 connections; more sources leave each fewer
+#                      ports to the gateway, so connect() searches less: run 16
+#                      spent a third of loadgen's ramp CPU in the kernel)
 #   CAPACITY_RECONCILE_CYCLE the gateway's -reconcile-cycle (default 24h: the
 #                      production 10m cycle starts its first pass at a random
 #                      point, which would land in some windows and not others;
@@ -72,6 +76,7 @@ PHASES=${CAPACITY_PHASES:-a_default:600000:150:default a_tuned:600000:150:tuned 
 TUNED=(GOGC=${CAPACITY_GOGC:-off} GOMEMLIMIT=${CAPACITY_GOMEMLIMIT:-4GiB})
 CAP=${CAPACITY_CAP:-650000} RATE=${CAPACITY_RATE:-5000}
 RECONCILE=${CAPACITY_RECONCILE_CYCLE:-24h}
+SOURCES=${CAPACITY_SOURCES:-}
 export STACK_GATEWAYS=1 STACK_PIN=1
 STACK_PORT_BASE=${STACK_PORT_BASE:-17000}
 STACK_REDIS_SERVER=$PWD/.cache/redis/bin/redis-server
@@ -150,7 +155,7 @@ for phase in $PHASES; do
   # The ramp.
   lo0=$(lo_dropped)
   t2_cpustat_snap "$STACK_DIR/cpustat-0"
-  lg_start "$name" -mode light -clients "$clients" -rate "$RATE" -ping-every "${hb}s" -uid-prefix "$name"
+  lg_start "$name" -mode light -clients "$clients" -rate "$RATE" -ping-every "${hb}s" -uid-prefix "$name" ${SOURCES:+-sources "$SOURCES"}
   stack_usage_start loadgen="$LG_PID"
   # A ramp of 90s or more gets CPU profiles of the gateway, Logic and
   # loadgen from 60s in (artifacts/ramp/), finished before the settle's.
