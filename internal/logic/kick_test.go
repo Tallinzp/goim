@@ -10,6 +10,7 @@ import (
 	pb "github.com/Tallinzp/goim/api/internalpb"
 	"github.com/Tallinzp/goim/internal/store"
 	"github.com/Tallinzp/goim/internal/testredis"
+	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -98,6 +99,7 @@ func staticDial(addrs map[string]string) DialFunc {
 type kickEnv struct {
 	k   *Kicker
 	st  *store.Store
+	rdb *redis.Client
 	m   *Metrics
 	cfg KickConfig
 }
@@ -105,11 +107,11 @@ type kickEnv struct {
 func newKickEnv(t *testing.T, cfg KickConfig, addrs map[string]string) kickEnv {
 	t.Helper()
 	full := testConfig()
-	st, _ := newStore(t, full)
+	st, rdb := newStore(t, full)
 	m := newMetrics()
 	k := NewKicker(cfg, NewLeaseCache(st, 20*time.Millisecond, time.Now), m, staticDial(addrs))
 	t.Cleanup(k.Close)
-	return kickEnv{k: k, st: st, m: m, cfg: cfg}
+	return kickEnv{k: k, st: st, rdb: rdb, m: m, cfg: cfg}
 }
 
 func waitFor(t *testing.T, what string, cond func() bool) {
@@ -242,6 +244,60 @@ func TestKickRefusedDoesNotRetry(t *testing.T) {
 	}
 	if n := counter(env.m.KickGiveUps.WithLabelValues("live")); n != 0 {
 		t.Fatalf("%v live give-ups for a refused address", n)
+	}
+}
+
+// R1-O7's dead-epoch cross-check during a crash storm (P6b2a-b1I-7): a
+// crashed gateway's lease stays live for up to its TTL, so the relogins
+// that land meanwhile are not seen by Login's cross-check. Their first Kick
+// is refused, and that give-up records now − the epoch's last renewal.
+func TestKickRefusedRecordsDeadEpochCrossCheck(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := lis.Addr().String()
+	lis.Close() // nothing listens: connects are refused
+	gw := testredis.Gateway()
+	env := newKickEnv(t, testConfig().Kick, map[string]string{gw: addr})
+	ref := store.EpochRef{Gateway: gw, Epoch: 13}
+	res, err := env.st.RenewLease(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env.k.Kick(ref, 1, pb.KickReason_KICK_REASON_REPLACED)
+	waitFor(t, "give-up", func() bool { return counter(env.m.KickGiveUps.WithLabelValues("dead")) == 1 })
+	h := env.m.DeadEpochRelogin
+	if n := sampleCount(t, h); n != 1 {
+		t.Fatalf("cross-check samples %d, want 1", n)
+	}
+	if s := sampleSum(t, h); s < 0 || s > float64(time.Now().UnixMilli()-res.RedisNowMs)/1000+0.01 {
+		t.Fatalf("cross-check %vs", s)
+	}
+}
+
+// A refused Kick to an epoch whose lease is already gone records nothing:
+// Login's cross-check has recorded that relogin, and each relogin counts once.
+func TestKickRefusedDeadLeaseNoSecondCrossCheck(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := lis.Addr().String()
+	lis.Close()
+	gw := testredis.Gateway()
+	env := newKickEnv(t, testConfig().Kick, map[string]string{gw: addr})
+	ref := store.EpochRef{Gateway: gw, Epoch: 14}
+	if _, err := env.st.RenewLease(ctx, ref); err != nil { // its last renewal stays in gwepochs
+		t.Fatal(err)
+	}
+	if _, err := env.rdb.Del(ctx, "gwlease:"+gw+":{14}").Result(); err != nil {
+		t.Fatal(err)
+	}
+	env.k.Kick(ref, 1, pb.KickReason_KICK_REASON_REPLACED)
+	waitFor(t, "give-up", func() bool { return counter(env.m.KickGiveUps.WithLabelValues("dead")) == 1 })
+	if n := sampleCount(t, env.m.DeadEpochRelogin); n != 0 {
+		t.Fatalf("cross-check samples %d for an expired lease, want 0", n)
 	}
 }
 

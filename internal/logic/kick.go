@@ -193,7 +193,11 @@ func (k *Kicker) attempt(t *kickTarget, j kickJob) {
 		// gateway still completes TCP connects in its kernel and times out
 		// instead, so it keeps its retries (#97, R2-O6). Its lease stays live
 		// for up to a TTL after a crash, so the give-up counts as dead: a
-		// crash must not raise the live give-up alert once per relogin.
+		// crash must not raise the live give-up alert once per relogin. The
+		// cross-check is recorded first, so a counted give-up has its sample.
+		if j.attempt == 0 {
+			k.crossCheck(t.ref)
+		}
 		k.m.KickGiveUps.WithLabelValues("dead").Inc()
 		return
 	}
@@ -208,6 +212,28 @@ func (k *Kicker) attempt(t *kickTarget, j kickJob) {
 	}
 	j.attempt++
 	time.AfterFunc(k.cfg.RetrySpacing, func() { k.enqueue(t.ref, j) })
+}
+
+// crossCheck records R1-O7's dead-epoch cross-check for a first attempt
+// refused while the target's lease is still live: now − the epoch's last
+// renewal, the time from gateway death to relogin within the renewal
+// interval (P6b2a-b1I-7). A crashed gateway's lease stays live for up to its
+// TTL, so Login's cross-check, which needs the lease gone, misses the
+// relogins that land meanwhile, nearly all of a crash storm's. A lease
+// already gone means Login recorded that relogin, so each counts once. A
+// retry comes RetrySpacing after the relogin and is not recorded. It may
+// read Redis: call it from a worker only.
+func (k *Kicker) crossCheck(ref store.EpochRef) {
+	ctx, cancel := context.WithTimeout(context.Background(), k.cfg.Deadline)
+	defer cancel()
+	if live, err := k.leases.LiveOne(ctx, ref); err != nil || !live {
+		return
+	}
+	renewed, ok, err := k.leases.RenewedMs(ctx, ref)
+	if err != nil || !ok || renewed == 0 {
+		return
+	}
+	k.m.DeadEpochRelogin.Observe(float64(time.Now().UnixMilli()-renewed) / 1000)
 }
 
 // logErr logs each distinct error once per target (at most
