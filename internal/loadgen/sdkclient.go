@@ -38,6 +38,9 @@ func (r *Runner) newSDK(i int) (*sdk.Client, error) {
 // event runs on the client's run loop: it must not block.
 func (sc *sdkClient) event(e sdk.Event) {
 	now := time.Now()
+	if e.Kind == sdk.EventWaiting && (e.Wait.Kind == sdk.WaitBackoff || e.Wait.Kind == sdk.WaitFailure) {
+		sc.r.rec.Backoff(sc.i, e.Wait.Kind.String())
+	}
 	switch e.Kind {
 	case sdk.EventConnecting:
 		sc.start = now

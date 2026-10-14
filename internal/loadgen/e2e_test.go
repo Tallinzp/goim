@@ -193,6 +193,27 @@ func TestSDKStormAfterAGatewayStops(t *testing.T) {
 	}
 }
 
+// b_stress's ramp (#93): with gw-1 down from the start every client logs in
+// on gw-0; after /up the next dials go to gw-1.
+func TestRampAloneThenUp(t *testing.T) {
+	env, _ := startStack(t, 2)
+	r, err := New(Config{Mode: "light", Clients: 4, Rate: 100, UIDPrefix: "alone", PingEvery: time.Second,
+		Timeout: 5 * time.Second, Down: []string{env.GatewayIDs[1]}}, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := run(r)
+	defer stop()
+	waitFor(t, "4 online", 10*time.Second, func() bool { return r.Stats().Online == 4 })
+	if st := r.Stats(); st.OnlineByGateway[env.GatewayIDs[0]] != 4 {
+		t.Fatalf("by gateway %v, want all 4 on gw-0", st.OnlineByGateway)
+	}
+	r.Up(1)
+	if _, gw, err := r.bal.Dial(context.Background()); err != nil || gw != 1 {
+		t.Fatalf("dial after Up: gw %d %v, want gw 1", gw, err)
+	}
+}
+
 // closeFirst forwards to addr, but closes its first n connections once
 // their handshake arrives, before any reply, as a gateway's handshake limit
 // does.
@@ -312,6 +333,17 @@ func TestControlAPI(t *testing.T) {
 	if !r.bal.Down(1) {
 		t.Fatal("killed gateway still in the balancer")
 	}
+	// /up puts it back (a restarted gateway, or b_stress's survivors).
+	if code, m := post(t, srv.URL+"/up?gateway="+env.GatewayIDs[1]); code != http.StatusOK || m["gateway"] != env.GatewayIDs[1] {
+		t.Fatalf("/up: %d %v", code, m)
+	}
+	if r.bal.Down(1) {
+		t.Fatal("/up left the gateway down")
+	}
+	if code, _ := post(t, srv.URL+"/up?gateway=nope"); code != http.StatusBadRequest {
+		t.Fatalf("/up unknown gateway: %d", code)
+	}
+	r.bal.SetDown(1)
 	// A taken mark name: no signal, gw-0 stays in the balancer.
 	other := exec.Command("sleep", "30")
 	if err := other.Start(); err != nil {

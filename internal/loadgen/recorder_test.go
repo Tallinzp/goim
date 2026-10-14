@@ -141,3 +141,15 @@ func TestRecorderSLOReportsReassignedMembers(t *testing.T) {
 		t.Fatalf("slo b %+v", s)
 	}
 }
+
+// Clients that reach backoff (P6a2bI-2): each client once, every wait by kind.
+func TestRecorderCountsBackoffClients(t *testing.T) {
+	r := NewRecorder(3, []string{"gw-0"})
+	r.Backoff(0, "backoff")
+	r.Backoff(0, "backoff")
+	r.Backoff(1, "failure")
+	c := r.Counts()
+	if c.BackoffClients != 2 || c.BackoffWaits["backoff"] != 2 || c.BackoffWaits["failure"] != 1 || len(c.BackoffWaits) != 2 {
+		t.Fatalf("backoff: clients %d, waits %v", c.BackoffClients, c.BackoffWaits)
+	}
+}

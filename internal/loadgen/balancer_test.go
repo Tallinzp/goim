@@ -84,6 +84,27 @@ func TestBalancerSkipsDownGateways(t *testing.T) {
 	}
 }
 
+// SetUp puts a gateway back in rotation (b_stress: the victim ramps alone,
+// then the others come up, #93); least connections then fills it first.
+func TestBalancerSetUpReturnsAGateway(t *testing.T) {
+	b, _ := NewBalancer(listeners(t, 2), 1)
+	b.SetDown(1)
+	for range 3 {
+		if _, gw, err := b.Dial(context.Background()); err != nil || gw != 0 {
+			t.Fatalf("dial while gw-1 is down: gw %d %v, want gw 0", gw, err)
+		}
+	}
+	b.SetUp(1)
+	if b.Down(1) {
+		t.Fatal("gw-1 still down after SetUp")
+	}
+	for range 3 {
+		if _, gw, err := b.Dial(context.Background()); err != nil || gw != 1 {
+			t.Fatalf("dial after SetUp: gw %d %v, want gw 1", gw, err)
+		}
+	}
+}
+
 func TestBalancerFailedDialFreesTheSlot(t *testing.T) {
 	addrs := listeners(t, 1)
 	l, _ := net.Listen("tcp", "127.0.0.1:0")

@@ -24,12 +24,32 @@ func TestRunRefusesBadFlags(t *testing.T) {
 		{nil, "-env is required"},
 		{[]string{"-env", "/nonexistent"}, "no such file"},
 		{[]string{"-nope"}, "flag provided but not defined"},
+		{[]string{"-env", "ENV", "-down", "gw-9"}, "down"},
 	} {
+		for i, a := range tc.args {
+			if a == "ENV" {
+				tc.args[i] = writeEnv(t, "127.0.0.1:1")
+			}
+		}
 		err := run(context.Background(), tc.args, &bytes.Buffer{})
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%v: err %v, want %q", tc.args, err, tc.want)
 		}
 	}
+}
+
+// writeEnv writes a stack.env for one gateway gw-0 at addr and returns its path.
+func writeEnv(t *testing.T, addr string) string {
+	t.Helper()
+	dir := t.TempDir()
+	k, _ := auth.GenerateKey("k1")
+	doc, _ := auth.MarshalPrivateJWK(k)
+	noise, _ := wire.GenerateKey() // a zero key fails the handshake before any byte is sent
+	os.WriteFile(filepath.Join(dir, "jwt.jwk"), doc, 0o600)
+	env := "GATEWAY_ADDRS=" + addr + "\nGATEWAY_IDS=gw-0\nNOISE_KEY_ID=1\nNOISE_PUBLIC=" +
+		base64.StdEncoding.EncodeToString(noise.Public) + "\nJWT_KEY=" + filepath.Join(dir, "jwt.jwk") + "\n"
+	os.WriteFile(filepath.Join(dir, "stack.env"), []byte(env), 0o644)
+	return filepath.Join(dir, "stack.env")
 }
 
 // A run against a "gateway" that closes every connection stops at
@@ -50,16 +70,9 @@ func TestRunWritesTheResultAtTheEnd(t *testing.T) {
 			c.Close()
 		}
 	}()
-	dir := t.TempDir()
-	k, _ := auth.GenerateKey("k1")
-	doc, _ := auth.MarshalPrivateJWK(k)
-	noise, _ := wire.GenerateKey() // a zero key fails the handshake before any byte is sent
-	os.WriteFile(filepath.Join(dir, "jwt.jwk"), doc, 0o600)
-	env := "GATEWAY_ADDRS=" + l.Addr().String() + "\nGATEWAY_IDS=gw-0\nNOISE_KEY_ID=1\nNOISE_PUBLIC=" +
-		base64.StdEncoding.EncodeToString(noise.Public) + "\nJWT_KEY=" + filepath.Join(dir, "jwt.jwk") + "\n"
-	os.WriteFile(filepath.Join(dir, "stack.env"), []byte(env), 0o644)
-	out := filepath.Join(dir, "result.json")
-	err = run(context.Background(), []string{"-env", filepath.Join(dir, "stack.env"), "-clients", "3", "-rate", "100",
+	envPath := writeEnv(t, l.Addr().String())
+	out := filepath.Join(filepath.Dir(envPath), "result.json")
+	err = run(context.Background(), []string{"-env", envPath, "-clients", "3", "-rate", "100",
 		"-duration", "1s", "-control", "127.0.0.1:0", "-out", out}, &bytes.Buffer{})
 	if err != nil {
 		t.Fatal(err)

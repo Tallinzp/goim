@@ -32,6 +32,7 @@ func (r *Runner) Result(within time.Duration) Result {
 //	POST /kill?gateway=gw-1&pid=N&mark=death  SIGKILL and mark T_death  {"mark", "population"}
 //	                                          409: pid gone or mark taken, nothing changed; 500: ErrKillAfterMark
 //	POST /mark?gateway=gw-1|all&mark=drop     a mark; &down=1 also takes the gateway out of the balancer
+//	POST /up?gateway=gw-1                     the gateway is back in the balancer  {"gateway"}
 //	GET  /slo?mark=death&within=30s           SLO
 //	/debug/pprof/                             loadgen's own profiles
 func (r *Runner) Handler() http.Handler {
@@ -69,6 +70,15 @@ func (r *Runner) Handler() http.Handler {
 			return
 		}
 		writeJSON(w, map[string]any{"mark": q.FormValue("mark"), "population": n})
+	})
+	mux.HandleFunc("POST /up", func(w http.ResponseWriter, q *http.Request) {
+		gw := r.env.Gateway(q.FormValue("gateway"))
+		if gw < 0 {
+			http.Error(w, "want gateway=<id>", http.StatusBadRequest)
+			return
+		}
+		r.Up(gw)
+		writeJSON(w, map[string]any{"gateway": q.FormValue("gateway")})
 	})
 	mux.HandleFunc("GET /slo", func(w http.ResponseWriter, q *http.Request) {
 		within, err := time.ParseDuration(q.FormValue("within"))

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -32,7 +33,8 @@ type Config struct {
 	Clients   int           // client i logs in as uid <UIDPrefix>-<i>
 	Rate      float64       // clients started per second
 	UIDPrefix string        // distinct per loadgen run, so runs never replace each other's sessions
-	Sources   int           // source addresses; 0: one per 5,000 connections per gateway, with one gateway gone
+	Sources   int           // source addresses; 0: one per 5,000 connections per gateway, with one gateway gone or Down
+	Down      []string      // gateway ids out of the balancer from the start, until POST /up (b_stress, #93)
 	PingEvery time.Duration // light: the Ping interval (cmd/loadgen: 150s, the gateway's default heartbeat)
 	Timeout   time.Duration // light: dial + handshake + Login (cmd/loadgen: 10s)
 	windows   sdk.Windows   // tests only: the SDK's built-in reconnect windows
@@ -76,14 +78,32 @@ func New(cfg Config, env Env) (*Runner, error) {
 	case cfg.Mode == "light" && (cfg.PingEvery <= 0 || cfg.Timeout <= 0):
 		return nil, errors.New("loadgen: light mode needs PingEvery and Timeout")
 	}
+	var down []int
+	for _, id := range cfg.Down {
+		gw := env.Gateway(id)
+		if gw < 0 {
+			return nil, fmt.Errorf("loadgen: down: no gateway %q", id)
+		}
+		if !slices.Contains(down, gw) { // a repeated id is one gateway
+			down = append(down, gw)
+		}
+	}
+	if len(down) >= len(env.GatewayAddrs) {
+		return nil, errors.New("loadgen: down: every gateway")
+	}
 	if cfg.Sources == 0 {
-		gws := max(1, len(env.GatewayAddrs)-1)
+		// Sized for the busiest gateway: one gateway gone, or every client on
+		// the gateways up at the start.
+		gws := min(max(1, len(env.GatewayAddrs)-1), len(env.GatewayAddrs)-len(down))
 		perGW := (cfg.Clients + gws - 1) / gws
 		cfg.Sources = min(maxSources, (perGW+connsPerSource-1)/connsPerSource)
 	}
 	bal, err := NewBalancer(env.GatewayAddrs, cfg.Sources)
 	if err != nil {
 		return nil, err
+	}
+	for _, gw := range down {
+		bal.SetDown(gw)
 	}
 	r := &Runner{cfg: cfg, env: env, rec: NewRecorder(cfg.Clients, env.GatewayIDs), bal: bal}
 	if cfg.Mode == "light" {
@@ -208,6 +228,9 @@ func (r *Runner) Mark(gw int, name string, down bool) (int, error) {
 	}
 	return n, err
 }
+
+// Up is POST /up: gateway gw is back in the balancer.
+func (r *Runner) Up(gw int) { r.bal.SetUp(gw) }
 
 // Stats is the run's state now.
 func (r *Runner) Stats() Stats {

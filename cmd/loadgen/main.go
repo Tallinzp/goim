@@ -2,7 +2,8 @@
 // scripts/stack.sh's stack.env, starts -clients at -rate through a
 // least-connections balancer from 127.0.0.2… (choices #69, #81), holds them,
 // and serves the control API on -control (GET /stats, POST /kill, POST /mark,
-// GET /slo; choice #84) until SIGTERM, Ctrl-C or -duration. It then writes
+// POST /up, GET /slo; choice #84) until SIGTERM, Ctrl-C or -duration.
+// -down keeps gateways out of the balancer until POST /up (#93). It then writes
 // the result, the stats at that moment and every mark's SLO against
 // -within, as JSON to -out, and only then stops every client: stopping 200k
 // SDK clients can outlast the caller's wait, and the result must survive a
@@ -24,6 +25,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -51,6 +53,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	fs.IntVar(&cfg.Sources, "sources", 0, "source addresses 127.0.0.2…; 0: one per 5,000 connections per gateway")
 	fs.DurationVar(&cfg.PingEvery, "ping-every", 150*time.Second, "light: Ping interval (the gateway's -heartbeat)")
 	fs.DurationVar(&cfg.Timeout, "timeout", 10*time.Second, "light: dial + handshake + Login per attempt")
+	down := fs.String("down", "", "gateway ids out of the balancer until POST /up, comma-separated")
 	control := fs.String("control", "", "control API listen address (none if empty)")
 	duration := fs.Duration("duration", 0, "stop after this long (0: at SIGTERM)")
 	within := fs.Duration("within", 30*time.Second, "SLO bound for the result's marks")
@@ -60,6 +63,9 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	}
 	if *envPath == "" {
 		return errors.New("-env is required")
+	}
+	if *down != "" {
+		cfg.Down = strings.Split(*down, ",")
 	}
 	env, err := loadgen.LoadEnv(*envPath)
 	if err != nil {
@@ -88,7 +94,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 		defer srv.Close()
 		slog.Info("loadgen: control API", "addr", l.Addr().String())
 	}
-	slog.Info("loadgen: starting", "mode", cfg.Mode, "clients", cfg.Clients, "rate", cfg.Rate, "gateways", len(env.GatewayAddrs))
+	slog.Info("loadgen: starting", "mode", cfg.Mode, "clients", cfg.Clients, "rate", cfg.Rate, "gateways", len(env.GatewayAddrs), "down", cfg.Down)
 	done := make(chan struct{})
 	go func() { r.Run(runCtx); close(done) }()
 	<-ctx.Done()

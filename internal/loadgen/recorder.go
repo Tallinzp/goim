@@ -13,25 +13,30 @@ import (
 // below what a mutex serves; callers pass the times in, so a wait for the
 // lock never shows in a sample (P6a2aI-4).
 type Recorder struct {
-	mu      sync.Mutex
-	ids     []string
-	clients []clientState
-	online  []int
-	logins  int64
-	login   *hist
-	lost    map[string]int64
-	failed  map[string]int64
-	pongs   int64
-	missing int64
-	gapMax  time.Duration
-	pongRTT *hist
-	marks   []*mark // by index
-	byName  map[string]*mark
+	mu             sync.Mutex
+	ids            []string
+	clients        []clientState
+	online         []int
+	logins         int64
+	login          *hist
+	lost           map[string]int64
+	failed         map[string]int64
+	backoff        map[string]int64 // waits by kind
+	backoffClients int64
+	pongs          int64
+	missing        int64
+	gapMax         time.Duration
+	pongRTT        *hist
+	marks          []*mark // by index
+	byName         map[string]*mark
 }
 
 // clientState: gw is the gateway it is logged in on (-1: none); mark and
-// pos place it in its latest mark (-1: none).
-type clientState struct{ gw, mark, pos int32 }
+// pos place it in its latest mark (-1: none); backoff: it has reached backoff.
+type clientState struct {
+	gw, mark, pos int32
+	backoff       bool
+}
 
 // mark is a named instant and the clients logged in on its gateway then
 // (the population of an SLO), with when each lost its connection and
@@ -48,7 +53,7 @@ type mark struct {
 // NewRecorder records clients 0..n-1 over gateways ids.
 func NewRecorder(n int, ids []string) *Recorder {
 	r := &Recorder{ids: ids, clients: make([]clientState, n), online: make([]int, len(ids)),
-		login: newHist(), pongRTT: newHist(), lost: map[string]int64{}, failed: map[string]int64{}, byName: map[string]*mark{}}
+		login: newHist(), pongRTT: newHist(), lost: map[string]int64{}, failed: map[string]int64{}, backoff: map[string]int64{}, byName: map[string]*mark{}}
 	for i := range r.clients {
 		r.clients[i] = clientState{gw: -1, mark: -1}
 	}
@@ -101,6 +106,18 @@ func (r *Recorder) Failed(why string) {
 	r.mu.Lock()
 	r.failed[why]++
 	r.mu.Unlock()
+}
+
+// Backoff: client i's next attempt waits by exponential backoff, of kind
+// (an sdk.WaitKind name: backoff or failure; P6a2bI-2).
+func (r *Recorder) Backoff(i int, kind string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.backoff[kind]++
+	if c := &r.clients[i]; !c.backoff {
+		c.backoff = true
+		r.backoffClients++
+	}
 }
 
 // Pong: a Ping was answered after rtt.
@@ -226,6 +243,8 @@ type Counts struct {
 	Logins          int64            `json:"logins"`
 	Lost            map[string]int64 `json:"lost"`
 	Failed          map[string]int64 `json:"failed"`
+	BackoffClients  int64            `json:"backoff_clients"` // clients that reached backoff, each once
+	BackoffWaits    map[string]int64 `json:"backoff_waits"`   // backoff waits by kind
 	LoginLatency    Dist             `json:"login_latency"`
 	Pongs           int64            `json:"pongs"`
 	PongMissing     int64            `json:"pong_missing"`
@@ -238,6 +257,7 @@ func (r *Recorder) Counts() Counts {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	c := Counts{OnlineByGateway: map[string]int{}, Logins: r.logins, Lost: map[string]int64{}, Failed: map[string]int64{},
+		BackoffClients: r.backoffClients, BackoffWaits: map[string]int64{},
 		LoginLatency: r.login.dist(r.login.n), Pongs: r.pongs, PongMissing: r.missing, PingGapMaxMs: r.gapMax.Milliseconds(), PongRTT: r.pongRTT.dist(r.pongRTT.n)}
 	for i, n := range r.online {
 		c.Online += n
@@ -248,6 +268,9 @@ func (r *Recorder) Counts() Counts {
 	}
 	for k, v := range r.failed {
 		c.Failed[k] = v
+	}
+	for k, v := range r.backoff {
+		c.BackoffWaits[k] = v
 	}
 	return c
 }

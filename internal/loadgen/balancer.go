@@ -58,11 +58,19 @@ func NewBalancer(addrs []string, sources int) (*Balancer, error) {
 		next: make([]int, len(addrs))}, nil
 }
 
-// SetDown takes gateway gw out of rotation for new dials. It is permanent:
-// a scenario that restarts a gateway adds a SetUp (P6a2aI-1).
+// SetDown takes gateway gw out of rotation for new dials, until a SetUp.
 func (b *Balancer) SetDown(gw int) {
 	b.mu.Lock()
 	b.down[gw] = true
+	b.mu.Unlock()
+}
+
+// SetUp puts gateway gw back in rotation (P6a2aI-1): b_stress's survivors
+// after the victim's ramp (#93), or a restarted gateway. Least connections
+// then sends it the next dials until it catches up.
+func (b *Balancer) SetUp(gw int) {
+	b.mu.Lock()
+	b.down[gw] = false
 	b.mu.Unlock()
 }
 
