@@ -34,9 +34,11 @@
 #   b1_stack           redis, devtoken, Logic, gw-0 and gw-1 become Ready
 #   pinning            gateways, Logic + Redis and loadgen on their CPU sets
 #   b1_online          every client logs in, each gateway holds 45-55% of
-#                      them, none gave up
+#                      them
 #   b1_slo             loadgen SIGKILLs gw-1: 99% of its clients log in again
-#                      within 30s of T_death (R4M-17)
+#                      within 30s of T_death (R4M-17), and the survivor
+#                      rejected none at capacity (SDK clients retry a reject
+#                      without counting it, P6b2a-b1I-2)
 #   b1_kicks           Kick first attempts in the storm, sent or dropped by a
 #                      full queue (R5S-O2), are 0.9-1.1 per relogin, none is
 #                      retried and none gives up as live: a refused Kick is
@@ -98,6 +100,7 @@ GW_COUNTERS=(
   lease_missing='goim_gateway_lease_calls_total:result="missing"'
   lease_error='goim_gateway_lease_calls_total:result="error"'
   logins_ok='goim_gateway_logins_total:result="ok"'
+  rejects_at_capacity='goim_gateway_admission_rejects_total:reason="at_capacity"'
 )
 
 t2_report_extra() {
@@ -146,7 +149,7 @@ stack_usage_start loadgen="$LG_PID"
 t=$SECONDS
 online=false
 lg_wait_online "$CLIENTS" $((CLIENTS / RATE * 3 + 60)) &&
-  online=$(lg_get /stats 'd["online"] == '"$CLIENTS"' and min(d["online_by_gateway"].get(g, 0) for g in ("gw-0", "gw-1")) >= '"$CLIENTS"' * 0.45 and "gave-up" not in d["failed"]')
+  online=$(lg_get /stats 'd["online"] == '"$CLIENTS"' and min(d["online_by_gateway"].get(g, 0) for g in ("gw-0", "gw-1")) >= '"$CLIENTS"' * 0.45')
 [ "$online" = true ] || online=false # null: /stats unreadable, a failed run, not a stopped one
 ramp_s=$((SECONDS - t))
 ramp=$(stack_usage_json)
@@ -182,10 +185,12 @@ back_s=$((SECONDS - kill_t))
 lg_get "/slo?mark=death&within=30s" d >"$STACK_DIR/artifacts/slo-death.json"
 # The dead epoch's sweep (2 x TTL after its last renewal, then its uids at
 # the sweeper's rate): the storm's window ends when it is done.
+# A sweep done since the kill, not before it (P6b2a-b1I-3).
 swept=false
+done0=$(echo "$logic0" | lg_py - 'd["sweeps_done"] or 0')
 while [ $((SECONDS - kill_t)) -lt "$SWEEP_WAIT" ]; do
   d=$(stack_counters logic sweeps_done='goim_logic_sweeps_total:result="done"')
-  [ "$(echo "$d" | lg_true - 'd["sweeps_done"] >= 1')" = true ] && { swept=true; break; }
+  [ "$(echo "$d" | lg_true - 'd["sweeps_done"] > '"$done0")" = true ] && { swept=true; break; }
   sleep 1
 done
 sweep_s=$((SECONDS - kill_t))
@@ -205,8 +210,9 @@ window_s=$(echo "$storm" | lg_py - 'd["window_s"]')
 slo=$STACK_DIR/artifacts/slo-death.json
 pop=$(lg_py "$slo" 'd["population"]')
 pass=false
-[ $dead -eq 0 ] && pass=$(lg_true "$slo" 'd["pass_from_mark"] and d["population"] >= '"$CLIENTS"' * 0.45')
-t2_check "${name}_slo" "$pass" "\"kill\": ${reply:-null}, \"back_all\": $back, \"back_s\": $back_s, \"slo\": $(cat "$slo")"
+rejects=$(echo "$gw_d" | lg_py - 'd["rejects_at_capacity"]')
+[ $dead -eq 0 ] && [ "$rejects" = 0 ] && pass=$(lg_true "$slo" 'd["pass_from_mark"] and d["population"] >= '"$CLIENTS"' * 0.45')
+t2_check "${name}_slo" "$pass" "\"kill\": ${reply:-null}, \"back_all\": $back, \"back_s\": $back_s, \"rejects_at_capacity\": ${rejects:-null}, \"slo\": $(cat "$slo")"
 t2_check "${name}_kicks" "$(echo "{\"d\": $logic_d, \"pop\": $pop}" | lg_true - 'd["d"]["kick_retry"] == 0 and d["d"]["kick_giveups_live"] == 0 and 0.9 * d["pop"] <= d["d"]["kick_first"] + (d["d"]["kick_dropped"] or 0) <= 1.1 * d["pop"]')" \
   "\"relogins\": $pop, \"first\": $(echo "$logic_d" | lg_py - 'd["kick_first"]'), \"retries\": $(echo "$logic_d" | lg_py - 'd["kick_retry"]'), \"giveups_dead\": $(echo "$logic_d" | lg_py - 'd["kick_giveups_dead"]'), \"giveups_live\": $(echo "$logic_d" | lg_py - 'd["kick_giveups_live"]'), \"dropped\": $(echo "$logic_d" | lg_py - 'd["kick_dropped"]')"
 # One renewal per 10s interval (the gateway's -lease-interval default): the

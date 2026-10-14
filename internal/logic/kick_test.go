@@ -162,6 +162,26 @@ func TestKickToBlackholeEndsWithinDeadline(t *testing.T) {
 	}
 }
 
+// R2-O6, #97 (P6b2a-b1I-1): an attempt that times out (a starved but alive
+// gateway: its kernel accepts the connect) is not refused, so with the lease
+// live it keeps its retries and gives up as live.
+func TestKickTimeoutRetriesWhileLeaseLive(t *testing.T) {
+	gw := testredis.Gateway()
+	env := newKickEnv(t, testConfig().Kick, map[string]string{gw: blackhole(t)})
+	ref := store.EpochRef{Gateway: gw, Epoch: 13}
+	if _, err := env.st.RenewLease(ctx, ref); err != nil {
+		t.Fatal(err)
+	}
+	env.k.Kick(ref, 1, pb.KickReason_KICK_REASON_REPLACED)
+	waitFor(t, "live give-up", func() bool { return counter(env.m.KickGiveUps.WithLabelValues("live")) == 1 })
+	if n := counter(env.m.KickAttempts.WithLabelValues("retry", "error")); n != float64(env.cfg.Retries) {
+		t.Fatalf("%v retries to a timing-out address with a live lease, want %d", n, env.cfg.Retries)
+	}
+	if n := counter(env.m.KickGiveUps.WithLabelValues("dead")); n != 0 {
+		t.Fatalf("%v dead give-ups for a timing-out address", n)
+	}
+}
+
 func TestKickRetriesOnlyWhileLeaseLive(t *testing.T) {
 	g := &fakeGateway{fail: true, got: make(chan struct{}, 8)}
 	gw := testredis.Gateway()

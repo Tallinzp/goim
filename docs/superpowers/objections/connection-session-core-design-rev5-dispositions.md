@@ -218,3 +218,20 @@ These come from the user's review of the session store interfaces (Plan 1), not 
 - *Logic, RPCs and Revoke:* `Revoke(uid, scope = all | slot, before_ms, reason)`. `before_ms` is on the token issuer's clock, in the unit of `tok_iat` (ms); the account service sets it when it decides the revocation and resends the same value on every retry. The marker write is `revoked_before_ms = max(stored, before_ms)`.
 - *Logic, Revoke validation:* reject `before_ms ≤ 0` or more than 5 minutes ahead of Redis `TIME` (`INVALID_ARGUMENT`, not retryable); this catches a seconds-vs-ms bug.
 - *Tests:* a retried `Revoke` with the same `before_ms` leaves the marker unchanged; a token whose `iat` is ≥ `before_ms` logs in after the revoke; `before_ms` 10 minutes in the future is rejected.
+
+---
+
+## Follow-up (2026-10-14) — a Kick refused at connect is not retried (roadmap #97)
+
+This comes from Plan 6b2a-b1's prototype and its interface review (P6b2a-b1I-5), not from a new review round. It changes behaviour the rev6 spec states, so it is recorded here for the next spec revision. **Not yet applied to the spec.**
+
+### #97 — a refused Kick gives up at once, counted `dead` — DECIDED: ACCEPT (the user, 2026-10-14)
+
+**Claim.** *Failure modes* says a gateway crash gets "one Kick attempt per relogin, with no retries", and also that a Kick that can't reach the gateway is "retried while the target lease is live". After a SIGKILL the lease stays live for up to its TTL (30s), so both cannot hold: in the prototype (1,000 relogins) Logic sent 1,000 first attempts and 2,049 retries, all `connection refused`.
+
+**Rationale.** R2-O6's retries protect a starved but alive gateway, whose kernel still completes the TCP connect, so its Kick times out (`DEADLINE_EXCEEDED`). A refused connect means nothing listens at the address: the process is gone, and the connection the Kick targets is gone with it. The gateway opens its Kick listener before it accepts a client, so a live gateway with sessions never refuses. Logic connects to each epoch separately, so a gateway restarted on the same address (Kubernetes container restart) is not affected by the old epoch's cached failure.
+
+**Spec changes to apply:**
+- *Failure modes, "Kick can't reach the gateway":* retried while the target lease is live, **unless the connect was refused** (`UNAVAILABLE` carrying `connection refused`): that attempt gives up at once.
+- *Observability:* a refused give-up counts as `kick_giveups_total{target_lease="dead"}`, whatever the lease says, so a crash does not raise the `live` give-up alert once per relogin.
+- *Tests:* a refused Kick with a live lease makes one attempt (`TestKickRefusedDoesNotRetry`); a timed-out Kick with a live lease keeps its retries and gives up `live` (`TestKickTimeoutRetriesWhileLeaseLive`).

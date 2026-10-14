@@ -87,7 +87,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		return v
 	}
 	lat := prometheus.ExponentialBuckets(0.0005, 2, 16) // 0.5ms … ~16s
-	return &Metrics{
+	m := &Metrics{
 		Conns:          gv("connections", "Open connections by state.", "state"),
 		AwaitingLogout: g("awaiting_logout", "Closed connections still tracked: their fenced Logout is pending."),
 		Tracked:        g("tracked", "Connection table entries (the tracked set)."),
@@ -120,4 +120,11 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		Ready:   g("ready", "1 while the gateway reports Ready."),
 		RPCSecs: hv("rpc_seconds", "Gateway → Logic RPC latency.", lat, "method", "code"),
 	}
+	// Every reject reason is exported from the start, at 0: "no reject" must
+	// read 0, not "no sample" (P6b2a-b1I-2: Tier 2 checks a storm's rejects).
+	for _, r := range []string{RejectAtCapacity, RejectPendingMem, RejectDraining, RejectLoginQueue,
+		RejectHandshakeTimeout, RejectAuthTimeout, RejectHandshakeRate, RejectBadVersion, RejectNoiseUnknownKey} {
+		m.Rejects.WithLabelValues(r)
+	}
+	return m
 }

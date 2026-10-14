@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // testConfig is a small valid configuration: 4 loops, caps of 1000.
@@ -104,5 +105,16 @@ func TestNewMetricsRegistersEverything(t *testing.T) {
 	families, err := reg.Gather()
 	if err != nil || len(families) < 2 {
 		t.Fatalf("gathered %d families, err %v", len(families), err)
+	}
+}
+
+// P6b2a-b1I-2: every reject reason is exported at 0 before its first reject,
+// so a scrape reads "no reject" as 0, not as a missing series.
+func TestRejectReasonsExportedAtZero(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	NewMetrics(reg)
+	n, err := testutil.GatherAndCount(reg, "goim_gateway_admission_rejects_total")
+	if err != nil || n != 9 {
+		t.Fatalf("%d admission_rejects_total series before any reject, want 9 (err %v)", n, err)
 	}
 }
