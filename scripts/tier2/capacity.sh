@@ -62,6 +62,7 @@
 #                      awaiting Logout within 300s; then, from one scrape, a
 #                      Logout done for every Login that succeeded (more for
 #                      Logins with an unknown outcome) and none dropped
+#                      (in stack_wait_idle since 6b2a-stress, P6b1I-4)
 #   P_reconcile_end    only with CAPACITY_RECONCILE_CYCLE set: after the window,
 #                      a ReconcileEnd listing at least every client succeeds
 #                      (4.8MB at 600k, over gRPC's 4MB default; P6b1I-1) and
@@ -113,15 +114,6 @@ gc_mark_cpu_pct() {
 }
 
 # usage_ok JSON: loadgen used under 3/4 of its CPU set.
-# logouts_settled DONE DROPPED LOGINS_OK, read from one scrape: every
-# session that logged in got its fenced Logout (a client that retried after
-# a timeout has two sessions, and a Login with an unknown outcome gets one
-# too, so DONE can exceed LOGINS_OK), and none was dropped. DONE and
-# LOGINS_OK must be read; an absent DROPPED in the same scrape means none.
-logouts_settled() {
-  [ "$1" != null ] && [ "$3" != null ] && [ "$1" -ge "$3" ] && [ "$2" = null -o "$2" = 0 ] && echo true || echo false
-}
-
 # lo_dropped: packets loopback dropped on input since boot (host-wide).
 lo_dropped() { cat /sys/class/net/lo/statistics/rx_dropped 2>/dev/null || echo null; }
 
@@ -302,7 +294,6 @@ print(round(w["gw-0"]["cpu_s"] / p * 1e6, 1) if p > 0 and w.get("gw-0") else "nu
   dropped=$(stack_metric_in "$body" goim_gateway_logouts_total 'result="dropped"')
   logins_ok=$(stack_metric_in "$body" goim_gateway_logins_total 'result="ok"')
   heartbeat_closes=$(stack_metric_in "$body" goim_gateway_closes_total 'reason="heartbeat"')
-  [ "$(logouts_settled "$done_logouts" "$dropped" "$logins_ok")" = true ] || idle=false
   t2_check "${name}_idle" "$idle" "\"stop_s\": $stop_s, \"done_logouts\": $done_logouts, \"logins_ok\": $logins_ok, \"dropped_logouts\": $dropped, \"error\": $(t2_json_str "$(cat "$STACK_DIR/idle.err")")"
   stack_down
   problems=$(stack_health)

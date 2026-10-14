@@ -7,6 +7,7 @@ set -uo pipefail
 cd "$(git rev-parse --show-toplevel)"
 . scripts/tier2/lib.sh
 . scripts/stack.sh
+. scripts/loadgen.sh
 STACK_DIR=$(mktemp -d)
 trap 'stack_down; rm -rf "$STACK_DIR"' EXIT
 fails=0
@@ -49,6 +50,37 @@ if command -v busybox >/dev/null; then
 else
   echo "skip metric: bytes past 2^31 (no busybox)"
 fi
+
+# stack_wait_idle also waits for each running gateway's Logouts to settle
+# (P6b1I-4): one done per login, none dropped, read from one scrape. A fake
+# gw-0 /metrics, before the real stack.
+(
+  mkdir -p "$STACK_DIR/fake-idle"
+  fake() { printf '%s\n' goim_gateway_connections\ 0 goim_gateway_awaiting_logout\ 0 "$@" >"$STACK_DIR/fake-idle/metrics"; }
+  fake 'goim_gateway_logins_total{result="ok"} 5' 'goim_gateway_logouts_total{result="done"} 4'
+  python3 -m http.server --bind 127.0.0.1 -d "$STACK_DIR/fake-idle" $((STACK_PORT_BASE + 102)) >/dev/null 2>&1 &
+  srv=$!
+  trap 'kill $srv' EXIT
+  STACK_GATEWAYS=1
+  declare -A STACK_PIDS=([gw-0]=$srv)
+  for i in $(seq 50); do curl -sf -o /dev/null "http://127.0.0.1:$((STACK_PORT_BASE + 102))/metrics" && break; sleep 0.1; done
+  out=$(stack_wait_idle 1 2>&1) && bad "idle: a Logout short must keep it busy" || ok "idle: a Logout short keeps it busy"
+  case $out in *"gw-0: connections 0, awaiting_logout 0, logouts done 4 of 5 logins"*) ok "idle: names the Logouts" ;; *) bad "idle: Logouts not named: [$out]" ;; esac
+  fake 'goim_gateway_logins_total{result="ok"} 5' 'goim_gateway_logouts_total{result="done"} 6'
+  stack_wait_idle 2 && ok "idle: more Logouts than logins settle (retried logins)" || bad "idle: done 6 of 5 logins"
+  fake
+  stack_wait_idle 2 && ok "idle: no login and no Logout yet settle" || bad "idle: a fresh gateway"
+  fake 'goim_gateway_logins_total{result="ok"} 5' 'goim_gateway_logouts_total{result="done"} 4' 'goim_gateway_logouts_total{result="dropped"} 1'
+  start=$SECONDS
+  out=$(stack_wait_idle 10 2>&1) && bad "idle: a dropped Logout must fail" || ok "idle: a dropped Logout fails"
+  [ $((SECONDS - start)) -lt 3 ] && ok "idle: a dropped Logout fails at once" || bad "idle: a dropped Logout waited $((SECONDS - start))s"
+  case $out in *"dropped 1"*) ok "idle: names the dropped Logout" ;; *) bad "idle: dropped not named: [$out]" ;; esac
+  # A gateway that does not answer is busy, never idle.
+  kill $srv; wait $srv 2>/dev/null
+  out=$(stack_wait_idle 1 2>&1) && bad "idle: a silent gateway must keep it busy" || ok "idle: a silent gateway keeps it busy"
+  case $out in *"gw-0: no answer"*) ok "idle: names the silent gateway" ;; *) bad "idle: silent gateway not named: [$out]" ;; esac
+  exit $fails
+) || fails=$((fails + $?))
 
 # stack_term records what wait reports, "killed" only for a process our
 # SIGKILL ended (M1): a kill -KILL that lands on an exited, unreaped process
@@ -164,6 +196,23 @@ contains() { case "$2" in *"$3"*) ok "$1" ;; *) bad "$1: [$2] lacks [$3]" ;; esa
 contains "idle: names the gateway" "$out" "gw-0: connections 1"
 wait $holder
 stack_wait_idle 10 && ok "idle: after the socket closed" || bad "idle: after the socket closed"
+
+# Loadgen runs with LG_ENV (GOMEMLIMIT, #93); its logins settle on the
+# gateways after it stops (P6b1I-4); Redis's per-command latency since a
+# reset covers the run's commands and none of the readers' own.
+stack_redis_resetstat && ok "redis: resetstat" || bad "redis: resetstat"
+LG_ENV=(GOMEMLIMIT=1GiB)
+STACK_PIN=0 # loadgen's CPU set is the Tier 2 host's
+lg_start t -mode light -clients 4 -rate 100 -uid-prefix st && lg_wait_online 4 20 && ok "loadgen: 4 online" || bad "loadgen: not online"
+STACK_PIN=1
+expect "loadgen: runs with LG_ENV" "$(tr '\0' '\n' <"/proc/$LG_PID/environ" | grep '^GOMEMLIMIT=')" GOMEMLIMIT=1GiB
+lat=$(stack_redis_latency)
+expect "redis: latency of the logins' commands" "$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(any(v["calls"] > 0 and v["p99_us"] > 0 for v in d.values()), "info" in d, any(k.startswith("config") for k in d))' "$lat")" "True False False"
+expect "redis: no answer is null" "$(STACK_PORT_BASE=1; stack_redis_latency)" null
+lg_stop
+stack_wait_idle 30 && ok "idle: the logins' Logouts settle" || bad "idle: after loadgen"
+expect "idle: one Logout done per login" "$(stack_metric gw-0 goim_gateway_logouts_total 'result="done"')" "$(stack_metric gw-0 goim_gateway_logins_total 'result="ok"')"
+LG_ENV=()
 
 # stack_usage: CPU and RSS per process over a window, extras included; a
 # process gone since is null.

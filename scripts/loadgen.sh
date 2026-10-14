@@ -2,7 +2,8 @@
 # loadgen.sh: run cmd/loadgen against a scripts/stack.sh stack (Plan 6a2).
 # Source it after stack.sh; stack_build has built bin/loadgen. Then:
 #
-#   lg_start NAME ARGS...       # loadgen in the background, reading $STACK_DIR/stack.env
+#   lg_start NAME ARGS...       # loadgen in the background, reading $STACK_DIR/stack.env,
+#                               #   with LG_ENV (VAR=VALUE..., e.g. GOMEMLIMIT=16GiB, #93) in its environment
 #   lg_wait_online N SECONDS    # until the ramp is done and N clients are logged in
 #   lg_get PATH EXPR            # EXPR (python, over the JSON as d) of GET PATH on the control API
 #   lg_post PATH                # POST PATH; prints the reply, fails on an HTTP error
@@ -25,13 +26,14 @@
 LG_PID=""
 LG_NAME=""
 LG_STATUS=""
+LG_ENV=()
 
 lg_control() { echo "127.0.0.1:$((${STACK_PORT_BASE:-17000} + 5))"; }
 
 lg_start() {
   LG_NAME=$1
   shift
-  local cmd=("$STACK_DIR/bin/loadgen" -env "$STACK_DIR/stack.env" -control "$(lg_control)"
+  local cmd=(env "${LG_ENV[@]}" "$STACK_DIR/bin/loadgen" -env "$STACK_DIR/stack.env" -control "$(lg_control)"
     -out "$STACK_DIR/artifacts/loadgen-$LG_NAME.json" "$@")
   if [ "${STACK_PIN:-0}" = 1 ]; then cmd=(taskset -c "$T2_CPUS_LOADGEN" "${cmd[@]}"); fi
   mkdir -p "$STACK_DIR/artifacts" "$STACK_DIR/logs"

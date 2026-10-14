@@ -13,11 +13,14 @@
 #   stack_expect_dead NAME      # NAME was killed on purpose (loadgen /kill): reap and record it
 #   stack_metric NAME METRIC [MATCH]  # sum of METRIC's samples (with MATCH in the line) on NAME's /metrics
 #   stack_metrics NAME          # NAME's /metrics once; stack_metric_in BODY METRIC [MATCH] reads it
-#   stack_wait_idle SECONDS     # phase boundary: every gateway at 0 connections and 0 awaiting Logout
+#   stack_wait_idle SECONDS     # phase boundary: every gateway at 0 connections, 0 awaiting Logout,
+#                               #   its Logouts settled (one done per login, none dropped)
 #   stack_usage_start [N=PID..] # start a CPU window over the stack's processes (and N=PID extras)
 #   stack_usage_json            # {"window_s", NAME: {"cpu_s", "cores", "rss_mb", "rss_peak_mb"}...} since the start
 #   stack_counters NAME KEY=METRIC[:MATCH]...  # {"KEY": sum, ...} from one scrape of NAME (null: no answer)
 #   stack_counters_delta A B    # {"KEY": B - A, ...} of two stack_counters readings
+#   stack_redis_resetstat       # Redis CONFIG RESETSTAT: a latency window starts
+#   stack_redis_latency         # {"CMD": {"calls", "p50_us", "p99_us", "p999_us"}...} since the reset (null: no answer)
 #   stack_down                  # gateways, then Logic, devtoken, Redis (#78); call it from the exit trap
 #   stack_health                # one line per problem: dead process, unclean stop, panic in a log
 #
@@ -228,14 +231,44 @@ stack_admins() {
 # gateway killed on purpose (stack_expect_dead) is skipped.
 stack_snapshot() {
   local dir=$STACK_DIR/artifacts/$1 base=${STACK_PORT_BASE:-17000} name admin
-  local redis=${STACK_REDIS_SERVER:-$(command -v redis-server || echo "$PWD/.cache/redis/bin/redis-server")}
   mkdir -p "$dir"
   while read -r name admin; do
     curl -sf "http://$admin/metrics" >"$dir/$name.metrics"
     curl -sf "http://$admin/debug/pprof/heap" >"$dir/$name.heap.pb.gz"
     curl -sf "http://$admin/debug/pprof/goroutine?debug=1" >"$dir/$name.goroutine.txt"
   done < <(stack_admins)
-  "$(dirname "$redis")/redis-cli" -p "$base" info all >"$dir/redis.info" 2>&1
+  stack_redis_cli info all >"$dir/redis.info" 2>&1
+}
+
+# stack_redis_cli ARGS...: redis-cli against the stack's Redis.
+stack_redis_cli() {
+  local redis=${STACK_REDIS_SERVER:-$(command -v redis-server || echo "$PWD/.cache/redis/bin/redis-server")}
+  "$(dirname "$redis")/redis-cli" -p "${STACK_PORT_BASE:-17000}" "$@"
+}
+
+# stack_redis_resetstat: CONFIG RESETSTAT, so Redis's per-command latency
+# percentiles and call counts cover a window from now (Plan 6b2a-stress).
+stack_redis_resetstat() { [ "$(stack_redis_cli config resetstat 2>/dev/null)" = OK ]; }
+
+# stack_redis_latency: Redis's own per-command latency since the last
+# resetstat, from INFO latencystats (p50, p99 and p99.9 in µs, Redis 7's
+# defaults) and the calls from INFO commandstats, as {"CMD": {"calls",
+# "p50_us", "p99_us", "p999_us"}, ...}: the single Redis's p99 for the
+# spec's per-shard numbers (R4M-9), which need a Cluster (6c). The readers'
+# own INFO and CONFIG are left out. Prints null if Redis does not answer.
+stack_redis_latency() {
+  local info
+  info=$(stack_redis_cli info latencystats 2>/dev/null && stack_redis_cli info commandstats 2>/dev/null) &&
+    grep -q '^# Latencystats' <<<"$info" || { echo null; return; }
+  awk -F'[:,=]' '{ sub(/\r$/, "") }
+    /^latency_percentiles_usec_/ { c = substr($1, 26); p50[c] = $3; p99[c] = $5; p999[c] = $7; cmd[++n] = c }
+    /^cmdstat_/ { calls[substr($1, 9)] = $3 }
+    END { out = ""
+          for (i = 1; i <= n; i++) {
+            c = cmd[i]
+            if (c == "info" || index(c, "config") == 1) continue
+            out = out (out == "" ? "" : ", ") sprintf("\"%s\": {\"calls\": %d, \"p50_us\": %s, \"p99_us\": %s, \"p999_us\": %s}", c, calls[c], p50[c], p99[c], p999[c]) }
+          print "{" out "}" }' <<<"$info"
 }
 
 # stack_profile NAME SECONDS: a CPU profile of Logic and every running
@@ -283,19 +316,38 @@ stack_metric_in() {
 }
 
 # stack_wait_idle SECONDS: the phase boundary on a shared stack (P6a2bI-3):
-# waits until every running gateway has no open connection and no closed
-# one still awaiting its fenced Logout, so a stopped loadgen's closes and
-# Logouts do not spill into the next phase. Fails, naming what is left, after
-# SECONDS. A gateway that does not answer counts as busy.
+# waits until every running gateway has no open connection, no closed one
+# still awaiting its fenced Logout, and its Logouts settled: at least one
+# done per login, none dropped (P6b1I-4). A client that retried after a
+# timeout has two sessions, and a Login with an unknown outcome gets one
+# too, so done can exceed the logins. So a stopped loadgen's closes and
+# Logouts do not spill into the next phase. Each gateway is read from one
+# scrape, where a counter with no sample yet is 0; a gateway that does not
+# answer counts as busy. Only running gateways count: a killed one's
+# sessions end by EpochEnded, not Logouts, and it is gone from stack_admins
+# (stack_expect_dead). Fails, naming what is left, after SECONDS, or at once
+# on a dropped Logout, which never settles.
 stack_wait_idle() {
-  local end=$((SECONDS + $1)) name admin busy c a
+  local end=$((SECONDS + $1)) name admin busy body c a done logins dropped
   while :; do
     busy=""
     while read -r name admin; do
       [[ $name == gw-* ]] || continue
-      c=$(stack_metric "$name" goim_gateway_connections)
-      a=$(stack_metric "$name" goim_gateway_awaiting_logout)
-      [ "$c" = 0 ] && [ "$a" = 0 ] || busy+=" $name: connections $c, awaiting_logout $a;"
+      body=$(stack_metrics "$name") || { busy+=" $name: no answer;"; continue; }
+      c=$(stack_metric_in "$body" goim_gateway_connections)
+      a=$(stack_metric_in "$body" goim_gateway_awaiting_logout)
+      done=$(stack_metric_in "$body" goim_gateway_logouts_total 'result="done"')
+      logins=$(stack_metric_in "$body" goim_gateway_logins_total 'result="ok"')
+      dropped=$(stack_metric_in "$body" goim_gateway_logouts_total 'result="dropped"')
+      [ "$done" = null ] && done=0
+      [ "$logins" = null ] && logins=0
+      [ "$dropped" = null ] && dropped=0
+      if [ "$dropped" != 0 ]; then
+        echo "stack: $name dropped $dropped Logouts: they never settle (logouts done $done of $logins logins, dropped $dropped)" >&2
+        return 1
+      fi
+      [ "$c" = 0 ] && [ "$a" = 0 ] && [ "$done" -ge "$logins" ] ||
+        busy+=" $name: connections $c, awaiting_logout $a, logouts done $done of $logins logins;"
     done < <(stack_admins)
     [ -z "$busy" ] && return 0
     if [ $SECONDS -ge $end ]; then
