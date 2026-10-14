@@ -209,7 +209,11 @@ func TestRampAloneThenUp(t *testing.T) {
 		t.Fatalf("by gateway %v, want all 4 on gw-0", st.OnlineByGateway)
 	}
 	r.Up(1)
-	if _, gw, err := r.bal.Dial(context.Background()); err != nil || gw != 1 {
+	c, gw, err := r.bal.Dial(context.Background())
+	if c != nil {
+		c.Close() // frees its balancer slot
+	}
+	if err != nil || gw != 1 {
 		t.Fatalf("dial after Up: gw %d %v, want gw 1", gw, err)
 	}
 }

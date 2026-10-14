@@ -229,7 +229,10 @@ func (r *Runner) Mark(gw int, name string, down bool) (int, error) {
 	return n, err
 }
 
-// Up is POST /up: gateway gw is back in the balancer.
+// Up is POST /up: gateway gw is back in the balancer. It is not refused for
+// a gateway that /kill or /mark&down=1 took out (#99): a scenario that
+// restarts one needs it. The caller sends it only once gw listens again:
+// before that, new dials go to a dead address, fail and back off.
 func (r *Runner) Up(gw int) { r.bal.SetUp(gw) }
 
 // Stats is the run's state now.
