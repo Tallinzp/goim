@@ -156,8 +156,11 @@ func TestKickToBlackholeEndsWithinDeadline(t *testing.T) {
 	if d := time.Since(start); d > cfg.Deadline+500*time.Millisecond {
 		t.Fatalf("attempt took %v, deadline %v", d, cfg.Deadline)
 	}
+	if n := counter(env.m.KickAttempts.WithLabelValues("first", "timeout")); n != 1 {
+		t.Fatalf("%v first attempts counted as timeouts, want 1", n)
+	}
 	time.Sleep(3 * cfg.RetrySpacing)
-	if n := counter(env.m.KickAttempts.WithLabelValues("retry", "error")); n != 0 {
+	if n := attempts(env.m, "retry"); n != 0 {
 		t.Fatalf("%v retries to a dead target", n)
 	}
 }
@@ -174,7 +177,7 @@ func TestKickTimeoutRetriesWhileLeaseLive(t *testing.T) {
 	}
 	env.k.Kick(ref, 1, pb.KickReason_KICK_REASON_REPLACED)
 	waitFor(t, "live give-up", func() bool { return counter(env.m.KickGiveUps.WithLabelValues("live")) == 1 })
-	if n := counter(env.m.KickAttempts.WithLabelValues("retry", "error")); n != float64(env.cfg.Retries) {
+	if n := counter(env.m.KickAttempts.WithLabelValues("retry", "timeout")); n != float64(env.cfg.Retries) {
 		t.Fatalf("%v retries to a timing-out address with a live lease, want %d", n, env.cfg.Retries)
 	}
 	if n := counter(env.m.KickGiveUps.WithLabelValues("dead")); n != 0 {
@@ -230,13 +233,60 @@ func TestKickRefusedDoesNotRetry(t *testing.T) {
 	}
 	env.k.Kick(ref, 1, pb.KickReason_KICK_REASON_REPLACED)
 	waitFor(t, "give-up", func() bool { return counter(env.m.KickGiveUps.WithLabelValues("dead")) == 1 })
+	if n := counter(env.m.KickAttempts.WithLabelValues("first", "refused")); n != 1 {
+		t.Fatalf("%v first attempts counted as refused, want 1", n)
+	}
 	time.Sleep(3 * env.cfg.RetrySpacing)
-	if n := counter(env.m.KickAttempts.WithLabelValues("retry", "error")); n != 0 {
+	if n := attempts(env.m, "retry"); n != 0 {
 		t.Fatalf("%v retries to a refused address with a live lease", n)
 	}
 	if n := counter(env.m.KickGiveUps.WithLabelValues("live")); n != 0 {
 		t.Fatalf("%v live give-ups for a refused address", n)
 	}
+}
+
+// #97 amended (Tier 2 run 20): a SIGKILLed gateway's Kick listener lives on
+// in the kernel while its sockets are torn down, then closes with Logic's
+// connect still queued: the connection is reset before the server's
+// preface. Nothing alive is behind it, so it gives up as refused does, and
+// the fail-fast RPCs that carry the same error until gRPC reconnects do too.
+func TestKickResetBeforePrefaceDoesNotRetry(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw := testredis.Gateway()
+	env := newKickEnv(t, testConfig().Kick, map[string]string{gw: lis.Addr().String()})
+	ref := store.EpochRef{Gateway: gw, Epoch: 12}
+	if _, err := env.st.RenewLease(ctx, ref); err != nil {
+		t.Fatal(err)
+	}
+	// Nothing accepts: the kernel completes the connect and queues it, and
+	// the attempt waits for the server's preface until the listener closes
+	// (well within the attempt's deadline), resetting the queued connection.
+	env.k.Kick(ref, 1, pb.KickReason_KICK_REASON_REPLACED)
+	time.Sleep(env.cfg.Deadline / 3)
+	lis.Close()
+	waitFor(t, "give-up", func() bool { return counter(env.m.KickGiveUps.WithLabelValues("dead")) == 1 })
+	if n := counter(env.m.KickAttempts.WithLabelValues("first", "refused")); n != 1 {
+		t.Fatalf("%v first attempts counted as refused, want 1", n)
+	}
+	time.Sleep(3 * env.cfg.RetrySpacing)
+	if n := attempts(env.m, "retry"); n != 0 {
+		t.Fatalf("%v retries after a reset before the preface, with a live lease", n)
+	}
+	if n := counter(env.m.KickGiveUps.WithLabelValues("live")); n != 0 {
+		t.Fatalf("%v live give-ups after a reset before the preface", n)
+	}
+}
+
+// attempts sums kind's (first or retry) attempts over every result.
+func attempts(m *Metrics, kind string) float64 {
+	var n float64
+	for _, r := range []string{"ok", "refused", "timeout", "error"} {
+		n += counter(m.KickAttempts.WithLabelValues(kind, r))
+	}
+	return n
 }
 
 // R5S-O2: a full per-target queue drops and counts instead of growing.

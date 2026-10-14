@@ -265,7 +265,7 @@ func TestLoginDoesNotWaitForKick(t *testing.T) {
 	if r.Code != pb.LoginCode_LOGIN_CODE_OK {
 		t.Fatalf("result %+v", r)
 	}
-	waitFor(t, "the kick attempt", func() bool { return counter(e.m.KickAttempts.WithLabelValues("first", "error")) == 1 })
+	waitFor(t, "the kick attempt", func() bool { return counter(e.m.KickAttempts.WithLabelValues("first", "timeout")) == 1 })
 }
 
 func TestLoginDeadEpochCrossCheck(t *testing.T) {

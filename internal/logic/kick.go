@@ -184,9 +184,10 @@ func (k *Kicker) attempt(t *kickTarget, j kickJob) {
 		k.m.KickAttempts.WithLabelValues(kind, "ok").Inc()
 		return
 	}
-	k.m.KickAttempts.WithLabelValues(kind, "error").Inc()
+	result := attemptResult(err)
+	k.m.KickAttempts.WithLabelValues(kind, result).Inc()
 	k.logErr(t, kind, err)
-	if refused(err) {
+	if result == "refused" {
 		// Nothing listens at the target's address: its process is gone, and
 		// with it the connection this Kick targets. A starved but alive
 		// gateway still completes TCP connects in its kernel and times out
@@ -228,12 +229,34 @@ func (k *Kicker) logErr(t *kickTarget, kind string, err error) {
 	}
 }
 
-// refused reports whether a failed Kick never reached a listener: its dial
-// got ECONNREFUSED. gRPC carries the dial error only as text in the
-// UNAVAILABLE status ("connect: connection refused"), also on the fail-fast
-// RPCs that follow while the connection stays in TRANSIENT_FAILURE.
+// attemptResult is a failed attempt's result label: refused, timeout or
+// error (#97 amended, run 20).
+func attemptResult(err error) string {
+	switch {
+	case refused(err):
+		return "refused"
+	case status.Code(err) == codes.DeadlineExceeded:
+		return "timeout"
+	}
+	return "error"
+}
+
+// refused reports whether a failed Kick reached no live process. Either its
+// dial got ECONNREFUSED (nothing listens), or the connection was reset
+// before the server's HTTP/2 preface: the listener closed with the connect
+// still in its accept queue, as a SIGKILLed gateway's does while the kernel
+// tears down its sockets (~1.5s at 200k connections, Tier 2 run 20). A
+// starved but alive gateway sends no reset (tcp_abort_on_overflow=0): its
+// Kick times out instead. gRPC carries both errors only as text in the
+// UNAVAILABLE status, also on the fail-fast RPCs that follow while the
+// connection stays in TRANSIENT_FAILURE.
 func refused(err error) bool {
-	return status.Code(err) == codes.Unavailable && strings.Contains(status.Convert(err).Message(), syscall.ECONNREFUSED.Error())
+	if status.Code(err) != codes.Unavailable {
+		return false
+	}
+	msg := status.Convert(err).Message()
+	return strings.Contains(msg, syscall.ECONNREFUSED.Error()) ||
+		strings.Contains(msg, "error reading server preface") && strings.Contains(msg, syscall.ECONNRESET.Error())
 }
 
 // leaseLabel is the target_lease label: live, dead, or unknown if the lease

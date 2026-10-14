@@ -24,7 +24,7 @@ type Metrics struct {
 	ClockSkewMs        *prometheus.GaugeVec   // gw
 	ClockSkewAlert     *prometheus.GaugeVec   // gw: 1 while |skew| > SkewAlertMs
 
-	KickAttempts       *prometheus.CounterVec // attempt: first | retry; result: ok | error
+	KickAttempts       *prometheus.CounterVec // attempt: first | retry; result: ok | refused | timeout | error (#97)
 	KickGiveUps        *prometheus.CounterVec // target_lease
 	KickDropped        *prometheus.CounterVec // target_lease (R5S-O2)
 	KickQueueDepth     *prometheus.GaugeVec   // target gw:epoch
