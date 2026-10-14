@@ -14,7 +14,7 @@ From the recorded Tier 2 benchmark runs (24-core host, all processes on one mach
 | --- | --- |
 | Connections on one gateway | **600,000**, all logged in within 121 s at 5,000/s, none lost while held |
 | Login latency at 600k | p99 20 ms (max 64 ms); heartbeat round trip p99 2 ms |
-| Gateway CPU at 600k | 1.7 cores while logging in 5,000/s; 0.17 cores holding 600k at a 150 s heartbeat (44 µs per Pong) |
+| Gateway CPU at 600k | 1.7 cores while logging in 5,000/s; 0.17 cores holding 600k at a 150 s heartbeat (44 µs per Pong), measured with periodic Reconcile off |
 | Gateway memory at 600k | ~1.2 KB of live heap per connection, 1.25 GB RSS; Go's default GC ran once per 150 s (0.24 ms pause) |
 | Heartbeat cost at 200k | 0.08 cores at a 150 s heartbeat, 0.15 cores at 60 s |
 | Four gateways | 100,000 connections: login p99 24 ms, heartbeat round trip p99 4 ms |
@@ -100,7 +100,7 @@ This is sub-project 1 (connection and session core) of a larger IM system. Done:
 | --- | --- |
 | 单网关连接数 | **60 万**，以 5,000/s 在 121 s 内全部登录，保持期间无一断开 |
 | 60 万时的登录延迟 | p99 20 ms（最大 64 ms）；心跳往返 p99 2 ms |
-| 60 万时的网关 CPU | 以 5,000/s 登录时 1.7 核；150 s 心跳下保持 60 万连接 0.17 核（每次 Pong 44 µs） |
+| 60 万时的网关 CPU | 以 5,000/s 登录时 1.7 核；150 s 心跳下保持 60 万连接 0.17 核（每次 Pong 44 µs），测量时关闭了周期性 Reconcile |
 | 60 万时的网关内存 | 每连接约 1.2 KB 存活堆内存，RSS 1.25 GB；Go 默认 GC 每 150 s 运行一次（暂停 0.24 ms） |
 | 20 万连接的心跳开销 | 150 s 心跳 0.08 核，60 s 心跳 0.15 核 |
 | 四个网关 | 10 万连接：登录 p99 24 ms，心跳往返 p99 4 ms |
