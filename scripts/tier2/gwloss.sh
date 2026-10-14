@@ -120,12 +120,13 @@ done
 # The memory each phase needs available (#93): b1's loadgen peaked at
 # 10.6-11.5GB with 400k SDK clients (runs 20, 21). b_stress's loadgen peaked
 # at 16.1GB with 600k (run 22): its live heap was 3.25GB, the rest mostly
-# goroutine stacks, which GOMEMLIMIT does not bound. Run 22 started with 22GB
-# available and swapped ~1.1GB out, so b_stress needs about 23GB (with the
-# victim, the survivors, Redis and the kernel's socket memory); 24 leaves a
-# margin (#105). The host has ~24GB available with its other services stopped.
+# goroutine stacks, which GOMEMLIMIT does not bound. Run 22 started with
+# 22GiB available (t2_mem_budget counts GiB) and swapped ~1GiB out, so
+# b_stress needs about 23GiB with the victim, the survivors, Redis and the
+# kernel's socket memory (#105). That is the host's ceiling with a desktop
+# session, so there is no margin here: the swap check is the verdict.
 mem=14
-case " $PHASES " in *" b_stress "*) mem=24 ;; esac
+case " $PHASES " in *" b_stress "*) mem=23 ;; esac
 t2_mem_budget $mem
 t2_nofile 1048576
 
