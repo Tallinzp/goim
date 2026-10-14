@@ -32,7 +32,7 @@ type Config struct {
 	Clients   int           // client i logs in as uid <UIDPrefix>-<i>
 	Rate      float64       // clients started per second
 	UIDPrefix string        // distinct per loadgen run, so runs never replace each other's sessions
-	Sources   int           // source addresses; 0: one per 20,000 connections per gateway, with one gateway gone
+	Sources   int           // source addresses; 0: one per 5,000 connections per gateway, with one gateway gone
 	PingEvery time.Duration // light: the Ping interval (cmd/loadgen: 150s, the gateway's default heartbeat)
 	Timeout   time.Duration // light: dial + handshake + Login (cmd/loadgen: 10s)
 	windows   sdk.Windows   // tests only: the SDK's built-in reconnect windows

@@ -7,6 +7,7 @@ import (
 	"os"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/Tallinzp/goim/internal/clientconn"
@@ -126,4 +127,37 @@ func TestPingerShardsPingEveryClient(t *testing.T) {
 	})
 	cancel()
 	<-done
+}
+
+// A light client whose every dial fails gives up after lightAttempts: one
+// failure counted per attempt, "gave-up" once, never online, and a 0.5-1.5s
+// wait between attempts (6a2b minor 3). The waits run on synctest's clock;
+// the dials are real and refused at once.
+func TestLightGivesUpAfterItsAttempts(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := ln.Addr().String()
+	ln.Close()
+	synctest.Test(t, func(t *testing.T) {
+		r, err := New(Config{Mode: "light", Clients: 1, Rate: 1, UIDPrefix: "u", PingEvery: time.Minute, Timeout: time.Second},
+			Env{GatewayAddrs: []string{closed}, GatewayIDs: []string{"gw-0"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		r.light(t.Context(), &lightConn{i: 0})
+		waited := time.Since(start)
+		c := r.Recorder().Counts()
+		if c.Failed["dial-refused"] != lightAttempts || c.Failed["gave-up"] != 1 || len(c.Failed) != 2 {
+			t.Errorf("failed %v, want %d dial-refused and 1 gave-up", c.Failed, lightAttempts)
+		}
+		if c.Online != 0 || c.Logins != 0 {
+			t.Errorf("online %d, logins %d, want none", c.Online, c.Logins)
+		}
+		if lo, hi := (lightAttempts-1)*500*time.Millisecond, (lightAttempts-1)*1500*time.Millisecond; waited < lo || waited > hi {
+			t.Errorf("gave up after %v of waits, want %v-%v", waited, lo, hi)
+		}
+	})
 }
