@@ -17,7 +17,7 @@ From the recorded Tier 2 benchmark runs (24-core host, all processes on one mach
 | Gateway CPU at 600k | 1.7 cores while logging in 5,000/s; 0.17 cores holding 600k at a 150 s heartbeat (44 µs per Pong) |
 | Gateway memory at 600k | ~1.2 KB of live heap per connection, 1.25 GB RSS; Go's default GC ran once per 150 s (0.24 ms pause) |
 | Heartbeat cost at 200k | 0.08 cores at a 150 s heartbeat, 0.15 cores at 60 s |
-| Four gateways | 100,000 connections: login p99 24 ms, heartbeat round trip p99 11 ms |
+| Four gateways | 100,000 connections: login p99 24 ms, heartbeat round trip p99 4 ms |
 | Recovery after a gateway is killed | every user back online, p99 19.9 s (SLO: 30 s) |
 | Race test suite | 58 fault-injection scenarios against real processes and a real redis-server, plus mutation checks |
 | Tests | 439 Go tests, about half of the ~30k lines of Go |
@@ -103,7 +103,7 @@ This is sub-project 1 (connection and session core) of a larger IM system. Done:
 | 60 万时的网关 CPU | 以 5,000/s 登录时 1.7 核；150 s 心跳下保持 60 万连接 0.17 核（每次 Pong 44 µs） |
 | 60 万时的网关内存 | 每连接约 1.2 KB 存活堆内存，RSS 1.25 GB；Go 默认 GC 每 150 s 运行一次（暂停 0.24 ms） |
 | 20 万连接的心跳开销 | 150 s 心跳 0.08 核，60 s 心跳 0.15 核 |
-| 四个网关 | 10 万连接：登录 p99 24 ms，心跳往返 p99 11 ms |
+| 四个网关 | 10 万连接：登录 p99 24 ms，心跳往返 p99 4 ms |
 | 杀掉一个网关后的恢复 | 所有用户重新上线，p99 19.9 s（SLO：30 s） |
 | 竞态测试集 | 58 个故障注入场景，运行在真实进程和真实 redis-server 上，并带变异测试 |
 | 测试 | 439 个 Go 测试，约占 3 万行 Go 代码的一半 |
