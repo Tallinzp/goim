@@ -12,7 +12,7 @@
 
 **Branch:** `feat/plan6b2a-stress`, from `main` (`74bdafc`, which holds every earlier plan, Plan 6b2a-b1 complete, and the README).
 
-**Size:** 4 tasks, ~97KB. Above the ~80KB guideline because Task 4 gives `gwloss.sh` whole (it is rewritten as a loop over phases). The prototype has already run every block, so execution is copying and checking, and fits one session.
+**Size:** 4 tasks, ~104KB. Above the ~80KB guideline because Task 4 gives `gwloss.sh` whole (it is rewritten as a loop over phases). The prototype has already run every block, so execution is copying and checking, and fits one session.
 
 ## Global Constraints
 
@@ -29,7 +29,7 @@
 
 ## Review Focus
 
-1. **A crash-storm relogin must be counted once by the cross-check, never twice.** Login records it when the old epoch's lease is gone, and the Kicker records it when the first Kick is refused while the lease is still live. If both fire for one relogin, the histogram double counts and `cross_check`'s upper bound (1.1 per relogin) catches it, but only at scale. Test: `TestKickRefusedDeadLeaseNoSecondCrossCheck` (Task 1: lease gone → the refused Kick records nothing). Retries are not recorded: they come 10s after the relogin, and the code checks `j.attempt == 0`.
+1. **A crash-storm relogin must be counted once by the cross-check, and twice only at the lease's expiry.** Login records it when the old epoch's lease is gone, and the Kicker records it when the first Kick is refused while the lease is still live. If both fire for one relogin, the histogram double counts and `cross_check`'s upper bound (1.1 per relogin) catches it, but only at scale. One double count is possible and accepted (review M3): Login queues the Kick before its own cross-check reads the lease, so a relogin whose Kicker read sees the lease live and whose Login read, milliseconds later, sees it expired is recorded by both. Only relogins inside that window around the TTL's end can be counted twice, far below the 1.1 bound. Test: `TestKickRefusedDeadLeaseNoSecondCrossCheck` (Task 1: lease gone → the refused Kick records nothing). Retries are not recorded: they come 10s after the relogin, and the code checks `j.attempt == 0`.
 2. **`-down` must leave at least one gateway up, and must not name an unknown gateway.** A typo such as `gw-3` on a 3-gateway stack would otherwise ramp every client over all three gateways, and b_stress's victim would hold a third of the clients. Test: `TestNewSizesSourcesForTheGatewaysUp` (Task 2: `gw-9` and "every gateway" refused), `TestRunRefusesBadFlags` (`-down gw-9`). The scenario's `b_stress_online` also requires all 600k on `gw-0`.
 3. **Sources sized for the ramp, not for the survivors.** With 2 of 3 gateways down, the default would give 60 sources (sized for 300k on each of two survivors), which puts 10,000 connections on each (source, victim) pair. That is 35% of the port range, where runs 14–16 slowed the ramp. Test: `TestNewSizesSourcesForTheGatewaysUp` (`gw-1,gw-2` down → 120).
 4. **A gateway that dropped a Logout fails the phase boundary at once, not after its wait.** A dropped Logout never settles, so `stack_wait_idle` would otherwise burn its full wait (600s in b_stress). Test: `idle: a dropped Logout fails at once` (Task 3).
@@ -39,10 +39,10 @@
 
 Proposed 2026-10-14 with this plan, for the user's review. R1-O7 option (a) was decided in the 6b2a-b1 interface review (P6b2a-b1I-7); #101 records how it is implemented.
 
-98. **The `gwloss` scenario's `b_stress` phase** (#93). A fresh stack with 3 gateways sharing the gateway CPU set (4 `GOMAXPROCS` each, #79), each with `-max-conns 650000` (the victim's 600k plus clients in flight), and Go's default GC. Loadgen runs with `GOMEMLIMIT=16GiB` (`GWLOSS_STRESS_LG_MEMLIMIT`) and `-down gw-1,gw-2`. It ramps 600k SDK clients at 5,000/s (~120s, uid prefix `b_stress`) onto `gw-0` from 120 sources, then sends `POST /up` for `gw-1` and `gw-2`, then SIGKILLs `gw-0` (`/kill`, mark `death`). The storm window runs from the kill until the sweeper reports the dead epoch `done`, at most `GWLOSS_STRESS_SWEEP_WAIT` (300s: 60s stale plus 60s for 600k uids, with room for slower relogins). Every victim must be back within `GWLOSS_STRESS_BACK_WAIT` (300s). The survivors drain within 600s after loadgen stops. **Checks** (12): `b_stress_stack`; `b_stress_online` (all 600k on `gw-0`, and both `POST /up` calls answered); `b_stress_back` (every victim back within the wait, the survivors rejected none at capacity, and the kill succeeded; no SLO); `b_stress_kicks` and `b_stress_cross_check` (as b1's); `b_stress_lease` (each survivor); `b_stress_swept`; `no_swap_in_b_stress`; `no_lo_drops_in_b_stress`; `b_stress_loadgen_headroom`; `b_stress_idle`; `b_stress_processes`. `pinning` and `artifacts` are checked once for the run. **Recorded:** the SLO distribution from the mark and from detection (`slo-death.json`, a record, not a verdict), the backoff count, Redis per-command latency for the ramp and the storm, the survivors' `handshake_rate` rejects, the per-process cores, RSS and peak RSS, Kick drops, sweep uids and deleted fields, and login latency. **Memory check:** `t2_mem_budget` 21GB when b_stress runs (loadgen's 17.2GB limit plus the victim ~1.4GB, the survivors ~0.7GB each and Redis ~0.4GB), 14GB for b1 alone. **`not_covered`:** per-shard Redis numbers (6c), and survivors that carry load of their own through the 600k storm, since they start empty (#93). The `gwloss` scenario becomes a loop over `GWLOSS_PHASES`, each phase on a fresh stack. A phase whose ramp fails stops that phase and goes on to the next. **Changed for b1:** a new `b1_cross_check` check (b1 has 12 checks of its own, plus `pinning` and `artifacts` for the run); `pinning` now names every gateway of its phase; the result's single `survivor` becomes a `survivors` map, in `b1_lease` and the `b1` field; `b1_idle` also requires the survivor's Logouts to settle (#100); and the `b1` field gains `redis_latency`, `backoff` and the survivor's `rejects_handshake_rate`. Rejected: running b_stress's survivors at a share of the load (#93 fixed the memory budget at one 600k population).
-99. **Loadgen: `-down`, `POST /up`, the backoff count.** `Config.Down` (`-down gw-1,gw-2`) names gateways out of the balancer from the start, until `POST /up?gateway=`. An unknown id is refused, and so is a list that covers every gateway. Default sources are sized for the busiest gateway: `min(N − 1, gateways up at the start)`, at least 1. `Runner.Up` and `Balancer.SetUp` put a gateway back. The SDK client counts `EventWaiting` with `Wait.Kind` `WaitBackoff` or `WaitFailure` as backoff (P6a2bI-2). `Counts` gains `backoff_clients`, each client counted once in the run, and `backoff_waits` by kind. `POST /up` is not refused for a killed gateway: a scenario that restarts one needs it, and the scenario owns the order.
+98. **The `gwloss` scenario's `b_stress` phase** (#93). A fresh stack with 3 gateways sharing the gateway CPU set (4 `GOMAXPROCS` each, #79), each with `-max-conns 650000` (the victim's 600k plus clients in flight), and Go's default GC. Loadgen runs with `GOMEMLIMIT=16GiB` (`GWLOSS_STRESS_LG_MEMLIMIT`) and `-down gw-1,gw-2`. It ramps 600k SDK clients at 5,000/s (~120s, uid prefix `b_stress`) onto `gw-0` from 120 sources, then sends `POST /up` for `gw-1` and `gw-2`, then SIGKILLs `gw-0` (`/kill`, mark `death`). The storm window runs from the kill until the sweeper reports the dead epoch `done` (at most `GWLOSS_STRESS_SWEEP_WAIT`, 300s: 60s stale plus 60s for 600k uids, with room for a slow Redis) and every victim is back. Every victim must be back within `GWLOSS_STRESS_BACK_WAIT` (600s, amended in review (I3): a client refused at the survivors' handshake limit (2 concurrent handshakes each at 4 `GOMAXPROCS`) more than 10 times in a row steps through the SDK's doubling backoff, up to 5 min, so a slow tail can pass 300s while still converging). The sweep is watched in the background from the kill, alongside the relogins, so a storm slower than `GWLOSS_STRESS_SWEEP_WAIT` neither hides a finished sweep nor delays its `sweep_s` (review I1: in the proposal the sweep wait began after the relogin wait, with both at 300s). The survivors drain within 600s after loadgen stops. **Checks** (12): `b_stress_stack`; `b_stress_online` (all 600k on `gw-0`, and both `POST /up` calls answered); `b_stress_back` (every victim back within the wait, the survivors rejected none at capacity, and the kill succeeded; no SLO); `b_stress_kicks` and `b_stress_cross_check` (as b1's; in both phases the Kick lower bound is 0.9 × (relogins − `sweep_deleted`), amended in review (I2): a victim whose entry the sweep deleted before it came back replaces nothing and Kicks nothing); `b_stress_lease` (each survivor); `b_stress_swept`; `no_swap_in_b_stress`; `no_lo_drops_in_b_stress`; `b_stress_loadgen_headroom`; `b_stress_idle`; `b_stress_processes`. `pinning` and `artifacts` are checked once for the run. **Recorded:** the SLO distribution from the mark and from detection (`slo-death.json`, a record, not a verdict), the backoff count, Redis per-command latency for the ramp and the storm, the survivors' `handshake_rate` rejects, the per-process cores, RSS and peak RSS, loadgen's live heap per client at the ramp's end after a forced GC (`loadgen_heap`, `ramp/loadgen.heap.txt`; review M4, for #93's budget, which estimates it from RSS), Kick drops, sweep uids and deleted fields, and login latency. **Memory check:** `t2_mem_budget` 21GB when b_stress runs (loadgen's 17.2GB limit plus the victim ~1.4GB, the survivors ~0.7GB each and Redis ~0.4GB), 14GB for b1 alone. **`not_covered`:** per-shard Redis numbers (6c), and survivors that carry load of their own through the 600k storm, since they start empty (#93). The `gwloss` scenario becomes a loop over `GWLOSS_PHASES`, each phase on a fresh stack. A phase whose ramp fails stops that phase and goes on to the next. **Changed for b1:** a new `b1_cross_check` check (b1 has 12 checks of its own, plus `pinning` and `artifacts` for the run); `pinning` now names every gateway of its phase; the result's single `survivor` becomes a `survivors` map, in `b1_lease` and the `b1` field; `b1_idle` also requires the survivor's Logouts to settle (#100); and the `b1` field gains `redis_latency`, `backoff` and the survivor's `rejects_handshake_rate`. Rejected: running b_stress's survivors at a share of the load (#93 fixed the memory budget at one 600k population).
+99. **Loadgen: `-down`, `POST /up`, the backoff count.** `Config.Down` (`-down gw-1,gw-2`) names gateways out of the balancer from the start, until `POST /up?gateway=`. A repeated id counts once (review M1). An unknown id is refused, and so is a list that covers every gateway. Default sources are sized for the busiest gateway: `min(N − 1, gateways up at the start)`, at least 1. `Runner.Up` and `Balancer.SetUp` put a gateway back. The SDK client counts `EventWaiting` with `Wait.Kind` `WaitBackoff` or `WaitFailure` as backoff (P6a2bI-2). `Counts` gains `backoff_clients`, each client counted once in the run, and `backoff_waits` by kind. `POST /up` is not refused for a killed gateway: a scenario that restarts one needs it, and the scenario owns the order.
 100. **`stack_wait_idle` settles Logouts per running gateway** (P6b1I-4): from one scrape, `logouts_total{result="done"}` ≥ `logins_total{result="ok"}` and no `dropped`, besides 0 connections and 0 awaiting Logout. In a successful scrape a counter with no sample counts as 0. A dropped Logout fails at once. `capacity.sh`'s `logouts_settled` moves here (same rule, now on every running gateway). **Redis latency:** `stack_redis_resetstat` (`CONFIG RESETSTAT`) at a window's start, and `stack_redis_latency` at its end, which prints `{"CMD": {"calls", "p50_us", "p99_us", "p999_us"}}` from `INFO latencystats` and `commandstats`. Commands that Lua scripts run are listed too (`hset`, `sadd`, …, next to `evalsha`), and the readers' own `info` and `config` are left out. Redis CPU stays `stack_usage_json`'s `redis` cores. **`LG_ENV`**: `VAR=VALUE` entries for loadgen's environment (`env` in `lg_start`).
-101. **R1-O7's cross-check on a refused Kick** (P6b2a-b1I-7, option (a)). When a Kick's **first** attempt is refused (#97) and the target's lease is still **live**, the Kicker observes `now − RenewedMs(target)` in `dead_epoch_relogin_seconds`. A lease already gone means Login's own cross-check recorded that relogin, so each counts once. A retry comes 10s after its relogin and is not recorded. A first attempt dropped by a full queue or timed out records nothing. Both reads go through the `LeaseCache`, so a storm reads Redis about once per cache TTL. **New check in both phases:** `<phase>_cross_check`: samples ≥ 0.9 × (first attempts − first-attempt timeouts) and ≤ 1.1 × relogins, with the mean recorded. The time is the give-up's, not `login_ms`: a refused attempt fails within milliseconds of its dequeue, and the queue holds at most 1,024 attempts. Rejected: carrying `login_ms` through `Kick()`, which would change the `Kicker` interface for a few milliseconds of accuracy against a ±10s spec.
+101. **R1-O7's cross-check on a refused Kick** (P6b2a-b1I-7, option (a)). When a Kick's **first** attempt is refused (#97) and the target's lease is still **live**, the Kicker observes `now − RenewedMs(target)` in `dead_epoch_relogin_seconds`. A lease already gone means Login's own cross-check recorded that relogin, so each counts once, apart from relogins at the lease's expiry (Review Focus 1). A retry comes 10s after its relogin and is not recorded. A first attempt dropped by a full queue or timed out records nothing. Both reads go through the `LeaseCache`, so a storm reads Redis about once per cache TTL. **New check in both phases:** `<phase>_cross_check`: samples ≥ 0.9 × (first attempts − first-attempt timeouts) and ≤ 1.1 × relogins, with the mean recorded. The time is the give-up's, not `login_ms`: a refused attempt fails within milliseconds of its dequeue, and the queue holds at most 1,024 attempts. Rejected: carrying `login_ms` through `Kick()`, which would change the `Kicker` interface for a few milliseconds of accuracy against a ±10s spec.
 
 ## File Structure
 
@@ -448,7 +448,7 @@ index fd958e4..0a80bfd 100644
 +	}
 +}
 diff --git a/internal/loadgen/runner_test.go b/internal/loadgen/runner_test.go
-index bec36bd..a27d835 100644
+index bec36bd..06dccd4 100644
 --- a/internal/loadgen/runner_test.go
 +++ b/internal/loadgen/runner_test.go
 @@ -1,6 +1,9 @@
@@ -462,7 +462,7 @@ index bec36bd..a27d835 100644
  
  // The default source count holds a gateway's share after another gateway
  // is killed: /kill moves its clients onto N−1 gateways (6a2b minor 1).
-@@ -28,3 +31,41 @@ func TestNewSizesSourcesForOneGatewayLess(t *testing.T) {
+@@ -28,3 +31,42 @@ func TestNewSizesSourcesForOneGatewayLess(t *testing.T) {
  		}
  	}
  }
@@ -479,6 +479,7 @@ index bec36bd..a27d835 100644
 +		{nil, 60},                       // 300,000 on each of 2 after a kill
 +		{[]string{"gw-1", "gw-2"}, 120}, // 600,000 on gw-0 alone
 +		{[]string{"gw-2"}, 60},          // 300,000 on each of 2
++		{[]string{"gw-2", "gw-2"}, 60},  // a repeated id is one gateway
 +	} {
 +		r, err := New(Config{Mode: "sdk", Clients: 600_000, Rate: 1, UIDPrefix: "x", Down: tc.down}, env)
 +		if err != nil {
@@ -758,10 +759,18 @@ index 889d679..72974b4 100644
  	return c
  }
 diff --git a/internal/loadgen/runner.go b/internal/loadgen/runner.go
-index 82e78d1..9acfc79 100644
+index 82e78d1..590674b 100644
 --- a/internal/loadgen/runner.go
 +++ b/internal/loadgen/runner.go
-@@ -32,7 +32,8 @@ type Config struct {
+@@ -5,6 +5,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"runtime"
++	"slices"
+ 	"strconv"
+ 	"sync"
+ 	"sync/atomic"
+@@ -32,7 +33,8 @@ type Config struct {
  	Clients   int           // client i logs in as uid <UIDPrefix>-<i>
  	Rate      float64       // clients started per second
  	UIDPrefix string        // distinct per loadgen run, so runs never replace each other's sessions
@@ -771,7 +780,7 @@ index 82e78d1..9acfc79 100644
  	PingEvery time.Duration // light: the Ping interval (cmd/loadgen: 150s, the gateway's default heartbeat)
  	Timeout   time.Duration // light: dial + handshake + Login (cmd/loadgen: 10s)
  	windows   sdk.Windows   // tests only: the SDK's built-in reconnect windows
-@@ -76,8 +77,21 @@ func New(cfg Config, env Env) (*Runner, error) {
+@@ -76,8 +78,23 @@ func New(cfg Config, env Env) (*Runner, error) {
  	case cfg.Mode == "light" && (cfg.PingEvery <= 0 || cfg.Timeout <= 0):
  		return nil, errors.New("loadgen: light mode needs PingEvery and Timeout")
  	}
@@ -781,7 +790,9 @@ index 82e78d1..9acfc79 100644
 +		if gw < 0 {
 +			return nil, fmt.Errorf("loadgen: down: no gateway %q", id)
 +		}
-+		down = append(down, gw)
++		if !slices.Contains(down, gw) { // a repeated id is one gateway
++			down = append(down, gw)
++		}
 +	}
 +	if len(down) >= len(env.GatewayAddrs) {
 +		return nil, errors.New("loadgen: down: every gateway")
@@ -794,7 +805,7 @@ index 82e78d1..9acfc79 100644
  		perGW := (cfg.Clients + gws - 1) / gws
  		cfg.Sources = min(maxSources, (perGW+connsPerSource-1)/connsPerSource)
  	}
-@@ -85,6 +99,9 @@ func New(cfg Config, env Env) (*Runner, error) {
+@@ -85,6 +102,9 @@ func New(cfg Config, env Env) (*Runner, error) {
  	if err != nil {
  		return nil, err
  	}
@@ -804,7 +815,7 @@ index 82e78d1..9acfc79 100644
  	r := &Runner{cfg: cfg, env: env, rec: NewRecorder(cfg.Clients, env.GatewayIDs), bal: bal}
  	if cfg.Mode == "light" {
  		r.pinger = newPingers(runtime.GOMAXPROCS(0), cfg.PingEvery, r.rec)
-@@ -209,6 +226,9 @@ func (r *Runner) Mark(gw int, name string, down bool) (int, error) {
+@@ -209,6 +229,9 @@ func (r *Runner) Mark(gw int, name string, down bool) (int, error) {
  	return n, err
  }
  
@@ -1192,7 +1203,8 @@ git commit -m "feat(scripts): stack_wait_idle settles Logouts per gateway, Redis
 #   per phase with logs, artifacts and loadgen results), plus ONE file to
 #   send back: tier2-results/gwloss-<timestamp>.report.txt
 #   Exit code: 0 if every check passes, 1 if any check fails, 2 if the host is refused.
-#   About 25 minutes (b1 ~8, b_stress ~17).
+#   About 25 minutes (b1 ~8, b_stress ~17; up to ~40 if b_stress's relogins
+#   use their whole wait).
 #
 # Settings:
 #   GWLOSS_PHASES      phases to run, in order (default "b1 b_stress")
@@ -1212,7 +1224,9 @@ git commit -m "feat(scripts): stack_wait_idle settles Logouts per gateway, Redis
 #   GWLOSS_STRESS_SWEEP_WAIT  b_stress: as GWLOSS_SWEEP_WAIT (default 300: 60s
 #                          stale, then 600k uids at 10k/s, and slower relogins)
 #   GWLOSS_STRESS_BACK_WAIT   b_stress: seconds after the kill to wait for every
-#                          victim to log in again (default 300)
+#                          victim to log in again (default 600: the SDK's backoff
+#                          doubles to 5 min, and a client refused at the
+#                          survivors' handshake limit keeps stepping up)
 #   GWLOSS_STRESS_SOURCES  b_stress: loadgen's source addresses (default:
 #                          loadgen's, sized for the victim alone: 120 for 600k)
 #   GWLOSS_STRESS_LG_MEMLIMIT b_stress: loadgen's GOMEMLIMIT (default 16GiB, #93)
@@ -1231,7 +1245,9 @@ git commit -m "feat(scripts): stack_wait_idle settles Logouts per gateway, Redis
 #                      clients logs in again within GWLOSS_STRESS_BACK_WAIT, and
 #                      the survivors rejected none at capacity; no SLO
 #   b1_kicks           Kick first attempts in the storm, sent or dropped by a
-#                      full queue (R5S-O2), are 0.9-1.1 per relogin, and none
+#                      full queue (R5S-O2), are 0.9-1.1 per relogin (at least 0.9
+#                      per relogin whose entry the sweep had not deleted: such a
+#                      relogin replaces nothing, so it Kicks nothing), and none
 #                      gives up as live. A refused Kick is not retried (#97):
 #                      only first attempts that timed out while the victim's
 #                      sockets were torn down are, once each, and refused
@@ -1254,7 +1270,8 @@ git commit -m "feat(scripts): stack_wait_idle settles Logouts per gateway, Redis
 #                      login, none dropped (stack_wait_idle, P6b1I-4)
 #   b1_processes       nothing but the victim died, panicked or stopped uncleanly
 #   artifacts          (once) every phase's storm CPU profiles, metrics before
-#                      and after, the SLO and loadgen's result
+#                      and after, loadgen's heap at the ramp's end, the SLO and
+#                      loadgen's result
 set -uo pipefail
 
 . "$(dirname "$0")/lib.sh"
@@ -1354,7 +1371,7 @@ for name in $PHASES; do
     b_stress)
       export STACK_GATEWAYS=3
       clients=${GWLOSS_STRESS_CLIENTS:-600000} rate=${GWLOSS_STRESS_RATE:-5000} cap=${GWLOSS_STRESS_CAP:-650000}
-      sweep_wait=${GWLOSS_STRESS_SWEEP_WAIT:-300} back_wait=${GWLOSS_STRESS_BACK_WAIT:-300} idle_wait=600
+      sweep_wait=${GWLOSS_STRESS_SWEEP_WAIT:-300} back_wait=${GWLOSS_STRESS_BACK_WAIT:-600} idle_wait=600
       sources=${GWLOSS_STRESS_SOURCES:-}
       victim=gw-0 survivors=(gw-1 gw-2) down=gw-1,gw-2 LG_ENV=(GOMEMLIMIT="${GWLOSS_STRESS_LG_MEMLIMIT:-16GiB}")
       # The victim ramped alone (#93).
@@ -1391,6 +1408,13 @@ for name in $PHASES; do
   t2_cpustat_snap "$STACK_DIR/cpustat-1"
   t2_tcpstat_snap "$STACK_DIR/tcpstat-1"
   by_gateway=$(lg_get /stats 'd["online_by_gateway"]')
+  # Loadgen's live heap per client at the ramp's end, after a forced GC (#93's
+  # memory budget estimates it from RSS, which includes GC headroom).
+  mkdir -p "$STACK_DIR/artifacts/ramp"
+  curl -sf -m 60 "http://$(lg_control)/debug/pprof/heap?gc=1&debug=1" >"$STACK_DIR/artifacts/ramp/loadgen.heap.txt"
+  lg_heap=$(awk -v n="$clients" '/^# HeapAlloc = / { a = $4 } /^# Sys = / { s = $4 }
+    END { if (a == "") print "null"; else printf "{\"live_mb\": %d, \"sys_mb\": %d, \"live_bytes_per_client\": %d}\n", a / 1048576, s / 1048576, a / n }' \
+    "$STACK_DIR/artifacts/ramp/loadgen.heap.txt")
   # b_stress: the survivors back in the balancer before the kill.
   ups=""
   for g in ${down//,/ }; do
@@ -1431,20 +1455,26 @@ for name in $PHASES; do
   dead=$?
   (stack_profile storm 30 & lg_profile storm 30; wait) >/dev/null 2>&1 &
   prof=$!
+  # The dead epoch's sweep (2 x TTL after its last renewal, then its uids at
+  # the sweeper's rate), watched from the kill alongside the relogins: a
+  # storm slower than the sweep must not hide it or delay its time. The
+  # storm's window ends when both are done. A sweep done since the kill, not
+  # before it (P6b2a-b1I-3).
+  done0=$(echo "$logic0" | lg_py - 'd["sweeps_done"] or 0')
+  (
+    while [ $((SECONDS - kill_t)) -lt "$sweep_wait" ]; do
+      d=$(stack_counters logic sweeps_done='goim_logic_sweeps_total:result="done"')
+      [ "$(echo "$d" | lg_true - 'd["sweeps_done"] > '"$done0")" = true ] && { echo "true $((SECONDS - kill_t))"; exit; }
+      sleep 1
+    done
+    echo "false $((SECONDS - kill_t))"
+  ) >"$STACK_DIR/sweep.out" 2>/dev/null &
+  sweeping=$!
   back=$(t2_bool lg_wait_back death "$back_wait")
   back_s=$((SECONDS - kill_t))
   lg_get "/slo?mark=death&within=30s" d >"$STACK_DIR/artifacts/slo-death.json"
-  # The dead epoch's sweep (2 x TTL after its last renewal, then its uids at
-  # the sweeper's rate): the storm's window ends when it is done.
-  # A sweep done since the kill, not before it (P6b2a-b1I-3).
-  swept=false
-  done0=$(echo "$logic0" | lg_py - 'd["sweeps_done"] or 0')
-  while [ $((SECONDS - kill_t)) -lt "$sweep_wait" ]; do
-    d=$(stack_counters logic sweeps_done='goim_logic_sweeps_total:result="done"')
-    [ "$(echo "$d" | lg_true - 'd["sweeps_done"] > '"$done0")" = true ] && { swept=true; break; }
-    sleep 1
-  done
-  sweep_s=$((SECONDS - kill_t))
+  wait "$sweeping"
+  read -r swept sweep_s <"$STACK_DIR/sweep.out" || { swept=false sweep_s=null; }
   wait "$prof"
   storm=$(stack_usage_json)
   redis_storm=$(stack_redis_latency)
@@ -1474,8 +1504,8 @@ for name in $PHASES; do
     [ $dead -eq 0 ] && [ "$rejects" = 0 ] && [ "$back" = true ] && pass=$(lg_true "$slo" 'd["population"] == '"$clients")
     t2_check "${name}_back" "$pass" "\"kill\": ${reply:-null}, \"back_all\": $back, \"back_s\": $back_s, \"wait_s\": $back_wait, \"rejects_at_capacity\": ${rejects:-null}, \"backoff\": $backoff, \"slo\": $(cat "$slo")"
   fi
-  t2_check "${name}_kicks" "$(echo "{\"d\": $logic_d, \"pop\": $pop}" | lg_true - 'd["d"]["kick_retry"] <= d["d"]["kick_first_timeout"] and d["d"]["kick_retry_refused"] == d["d"]["kick_retry"] and d["d"]["kick_giveups_live"] == 0 and 0.9 * d["pop"] <= d["d"]["kick_first"] + (d["d"]["kick_dropped"] or 0) <= 1.1 * d["pop"]')" \
-    "\"relogins\": $pop, \"first\": $(echo "$logic_d" | lg_py - 'd["kick_first"]'), \"retries\": $(echo "$logic_d" | lg_py - 'd["kick_retry"]'), \"first_timeouts\": $(echo "$logic_d" | lg_py - 'd["kick_first_timeout"]'), \"retries_refused\": $(echo "$logic_d" | lg_py - 'd["kick_retry_refused"]'), \"giveups_dead\": $(echo "$logic_d" | lg_py - 'd["kick_giveups_dead"]'), \"giveups_live\": $(echo "$logic_d" | lg_py - 'd["kick_giveups_live"]'), \"dropped\": $(echo "$logic_d" | lg_py - 'd["kick_dropped"]')"
+  t2_check "${name}_kicks" "$(echo "{\"d\": $logic_d, \"pop\": $pop}" | lg_true - 'd["d"]["kick_retry"] <= d["d"]["kick_first_timeout"] and d["d"]["kick_retry_refused"] == d["d"]["kick_retry"] and d["d"]["kick_giveups_live"] == 0 and 0.9 * (d["pop"] - (d["d"]["sweep_deleted"] or 0)) <= d["d"]["kick_first"] + (d["d"]["kick_dropped"] or 0) <= 1.1 * d["pop"]')" \
+    "\"relogins\": $pop, \"swept_first\": $(echo "$logic_d" | lg_py - 'd["sweep_deleted"]'), \"first\": $(echo "$logic_d" | lg_py - 'd["kick_first"]'), \"retries\": $(echo "$logic_d" | lg_py - 'd["kick_retry"]'), \"first_timeouts\": $(echo "$logic_d" | lg_py - 'd["kick_first_timeout"]'), \"retries_refused\": $(echo "$logic_d" | lg_py - 'd["kick_retry_refused"]'), \"giveups_dead\": $(echo "$logic_d" | lg_py - 'd["kick_giveups_dead"]'), \"giveups_live\": $(echo "$logic_d" | lg_py - 'd["kick_giveups_live"]'), \"dropped\": $(echo "$logic_d" | lg_py - 'd["kick_dropped"]')"
   # R1-O7: one sample per relogin whose first Kick was sent and did not time
   # out, by Login (lease gone) or by the refused Kick (lease live).
   t2_check "${name}_cross_check" "$(echo "{\"d\": $logic_d, \"pop\": $pop}" | lg_true - '0.9 * (d["d"]["kick_first"] - d["d"]["kick_first_timeout"]) <= d["d"]["dead_epoch_relogins"] <= 1.1 * d["pop"]')" \
@@ -1512,7 +1542,7 @@ for name in $PHASES; do
 
   cpu_sets="{\"ramp\": $(t2_cpusets_json "$STACK_DIR/cpustat-0" "$STACK_DIR/cpustat-1"), \"storm\": $(t2_cpusets_json "$STACK_DIR/cpustat-2" "$STACK_DIR/cpustat-3")}"
   tcp="{\"ramp\": $(t2_tcpstat_json "$STACK_DIR/tcpstat-0" "$STACK_DIR/tcpstat-1"), \"storm\": $(t2_tcpstat_json "$STACK_DIR/tcpstat-2" "$STACK_DIR/tcpstat-3")}"
-  t2_field "$name" "{\"clients\": $clients, \"victim\": \"$victim\", \"by_gateway_at_kill\": $by_gateway, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"loadgen_env\": $(t2_json_str "${LG_ENV[*]}"), \"ramp_s\": $ramp_s, \"ramp\": $ramp, \"storm\": $storm, \"back_s\": $back_s, \"sweep_s\": $sweep_s, \"logic\": $logic_d, \"survivors\": $sv_d, \"redis_latency\": {\"ramp\": $redis_ramp, \"storm\": $redis_storm}, \"backoff\": $backoff, \"cpu_sets\": $cpu_sets, \"tcp\": $tcp, \"profile_in_storm_s\": 30, \"stop_s\": $stop_s, \"loadgen_exit\": $LG_STATUS, \"login_latency\": $(lg_json 'd["login_latency"]'), \"failed\": $(lg_json 'd["failed"]'), \"lost\": $(lg_json 'd["lost"]'), \"sources\": $(lg_json 'd["sources"]')}"
+  t2_field "$name" "{\"clients\": $clients, \"victim\": \"$victim\", \"by_gateway_at_kill\": $by_gateway, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"loadgen_env\": $(t2_json_str "${LG_ENV[*]}"), \"ramp_s\": $ramp_s, \"ramp\": $ramp, \"loadgen_heap\": $lg_heap, \"storm\": $storm, \"back_s\": $back_s, \"sweep_s\": $sweep_s, \"logic\": $logic_d, \"survivors\": $sv_d, \"redis_latency\": {\"ramp\": $redis_ramp, \"storm\": $redis_storm}, \"backoff\": $backoff, \"cpu_sets\": $cpu_sets, \"tcp\": $tcp, \"profile_in_storm_s\": 30, \"stop_s\": $stop_s, \"loadgen_exit\": $LG_STATUS, \"login_latency\": $(lg_json 'd["login_latency"]'), \"failed\": $(lg_json 'd["failed"]'), \"lost\": $(lg_json 'd["lost"]'), \"sources\": $(lg_json 'd["sources"]')}"
   t2_duration "$name" $((SECONDS - t0))
 
   # Artifacts: metrics before and after the storm, its CPU profiles, the SLO
@@ -1527,6 +1557,7 @@ for name in $PHASES; do
     done
   done
   for f in logic "${survivors[@]}" loadgen; do gzip -t "$a/storm/$f.cpu.pb.gz" 2>/dev/null || missing+=" $name/storm/$f.cpu"; done
+  grep -q '^# HeapAlloc = ' "$a/ramp/loadgen.heap.txt" 2>/dev/null || missing+=" $name/ramp/loadgen.heap.txt"
   [ "$(lg_true "$a/slo-death.json" '"population" in d')" = true ] || missing+=" $name/slo-death.json"
   [ "$(lg_true "$res" '"mode" in d')" = true ] || missing+=" $name/loadgen-$name.json"
 done
@@ -1559,15 +1590,15 @@ GOIM_TEST_TIER=2 T2_CPUS_GATEWAY=1 T2_CPUS_LOGIC=0 T2_CPUS_LOADGEN=0-1 \
 
 The `grep` must show three `. ` lines naming `scripts/`, a `:` line, `t2_mem_budget 0`, the redis path, `if ! true`, and `t2_need` without sudo.
 
-Expected (prototype, ~2.5 min): `result.json` parses (`python3 -m json.tool tier2-results/gwloss-*/result.json >/dev/null`) and has 26 checks. All pass except possibly `no_swap_in_b1` and `no_swap_in_b_stress`, from the dev machine's own swapping (the prototype saw 5 and 3 pages in). The exit code is 1 if a check fails, else 0. Values from the prototype:
+Expected (prototype, ~2.5 min): `result.json` parses (`python3 -m json.tool tier2-results/gwloss-*/result.json >/dev/null`) and has 26 checks. All pass except possibly `no_swap_in_b1` and `no_swap_in_b_stress`, from the dev machine's own swapping (the first prototype run saw 5 and 3 pages in; the run after the plan review passed all 26). The exit code is 1 if a check fails, else 0. Values from the prototype:
 - `b1_online`: `by_gateway` `{"gw-0": 1000, "gw-1": 1000}`; `b_stress_online`: `{"gw-0": 1500, "gw-1": 0, "gw-2": 0}`, `up_failed` `""`.
-- `b1_slo`: `population` 1000, `back_s` ≈ 21; `b_stress_back`: `population` 1500, `back_all` true, `back_s` ≈ 20, `backoff` `{"clients": 0, "waits": {}}`.
-- `b1_kicks`: `first` 1000, `retries` 0, `giveups_dead` 1000, `dropped` null; `b_stress_kicks`: `first` 1500, `retries` 0, `giveups_dead` 1500.
+- `b1_slo`: `population` 1000, `back_s` ≈ 21; `b_stress_back`: `population` 1500, `back_all` true, `back_s` ≈ 20, `wait_s` 600, `backoff` `{"clients": 0, "waits": {}}`.
+- `b1_kicks`: `swept_first` 0, `first` 1000, `retries` 0, `giveups_dead` 1000, `dropped` null; `b_stress_kicks`: `swept_first` 0, `first` 1500, `retries` 0, `giveups_dead` 1500.
 - `b1_cross_check`: `samples` 1000, `mean_s` ≈ 15; `b_stress_cross_check`: `samples` 1500, `mean_s` ≈ 14.
 - `b1_lease`: `survivors` `gw-0` with `lease_live` 6 in a ~61s window; `b_stress_lease`: `gw-1` and `gw-2`, each `lease_live` 6, `logins_ok` 750, `rejects_handshake_rate` 0.
 - `b1_swept` and `b_stress_swept`: `sweep_s` ≈ 61, `uids` 1000 and 1500, `deleted` 0.
 - `b1_idle`: `logouts` `{"gw-0": {"done": 2000, "logins_ok": 2000, "dropped": null}}`; `b_stress_idle`: `gw-1` and `gw-2` each `done` 750 of 750.
-- The `b_stress` field: `redis_latency.storm` lists `sscan` and `unlink` (the dead epoch's `gwconns` sweep) next to `evalsha`, `hset` and the other commands; `by_gateway_at_kill` `{"gw-0": 1500, "gw-1": 0, "gw-2": 0}`; `loadgen_env` `"GOMEMLIMIT=16GiB"`.
+- The `b_stress` field: `redis_latency.storm` lists `sscan` and `unlink` (the dead epoch's `gwconns` sweep) next to `evalsha`, `hset` and the other commands; `by_gateway_at_kill` `{"gw-0": 1500, "gw-1": 0, "gw-2": 0}`; `loadgen_env` `"GOMEMLIMIT=16GiB"`; each phase's `loadgen_heap`, e.g. `{"live_mb": 9, "sys_mb": 50, "live_bytes_per_client": 6916}` (at this scale loadgen's fixed heap is a large share; the host's 600k gives the per-client number).
 
 `b1/artifacts/` and `b_stress/artifacts/` hold `before/` and `after/` metrics, `storm/{logic,<survivors>,loadgen}.cpu.pb.gz`, `slo-death.json` and `loadgen-<phase>.json`. No process is left (`pgrep -f "$PWD/tier2-results/gwloss" || echo none`). An unknown phase is refused: `GWLOSS_PHASES="b1 nope"` prints `gwloss: unknown phase 'nope' (b1, b_stress)` and exits 1 before any stack starts. Afterwards, remove the dry run's `tier2-results/gwloss-*` and `$D`.
 
@@ -1585,10 +1616,10 @@ Expected: all pass. Record the commits and the dry run in this plan's *Execution
 
 - [ ] **Step 5: Tier 2 run 22 (on the host)**
 
-On the Tier 2 host, after `git fetch && git switch feat/plan6b2a-stress`, with the desktop apps closed, the user runs `GOIM_TEST_TIER=2 make test-tier2 SCENARIO=gwloss` (~25 min, both phases), then sends back the `.report.txt`. Logic changed only in the Kick give-up path (one extra cached lease read), which the race suite's Kick tests cover on the dev machine. The race suite at production scale is therefore not rerun, unless the user wants it (`SCENARIO=race`). Expected: `gwloss` 26/26. What to read from the run, for the *Execution Notes*, the roadmap and the README's *Measured results* (both languages):
-- **(b-stress):** `back_s` and the SLO distribution from the mark and from detection; `backoff.clients` (the share of the 600k that reached backoff, and why: `backoff.waits`, `failed`); the survivors' `rejects_handshake_rate`; Kick first attempts, drops and retries; `sweep_s` with `uids` and `deleted` (the 600k `gwconns` `SSCAN` + `UNLINK`); `redis_latency.storm` (`evalsha` p99, and the `sscan`/`unlink` rows); the survivors' lease calls.
+On the Tier 2 host, after `git fetch && git switch feat/plan6b2a-stress`, with the desktop apps closed, the user runs `GOIM_TEST_TIER=2 make test-tier2 SCENARIO=gwloss` (~25 min, both phases; up to ~40 if b_stress's relogins use their whole wait), then sends back the `.report.txt`. Logic changed only in the Kick give-up path (one extra cached lease read), which the race suite's Kick tests cover on the dev machine. The race suite at production scale is therefore not rerun, unless the user wants it (`SCENARIO=race`). Expected: `gwloss` 26/26. What to read from the run, for the *Execution Notes*, the roadmap and the README's *Measured results* (both languages):
+- **(b-stress):** `back_s` and the SLO distribution from the mark and from detection; `backoff.clients` (the share of the 600k that reached backoff, and why: `backoff.waits`, `failed`); the survivors' `rejects_handshake_rate`; Kick first attempts, drops and retries; `sweep_s` with `uids` and `deleted` (victims swept before they came back, `b_stress_kicks`' `swept_first`; the 600k `gwconns` `SSCAN` + `UNLINK`); `redis_latency.storm` (`evalsha` p99, and the `sscan`/`unlink` rows); the survivors' lease calls.
 - **Storm cost:** Logic, Redis and survivor cores in the storm against the ramp, with the storm CPU profiles (`b_stress/artifacts/storm/`).
-- **Memory (#93):** loadgen's `rss_peak_mb` at 600k under `GOMEMLIMIT`, and whether loadgen's GC showed in its cores (`b_stress_loadgen_headroom`, `storm/loadgen.cpu.pb.gz`); the victim's peak at 600k with 4 `GOMAXPROCS`.
+- **Memory (#93):** loadgen's `rss_peak_mb` at 600k under `GOMEMLIMIT` against `loadgen_heap.live_bytes_per_client` (the live heap, for the next memory budget), and whether loadgen's GC showed in its cores (`b_stress_loadgen_headroom`, `storm/loadgen.cpu.pb.gz`); the victim's peak at 600k with 4 `GOMAXPROCS`.
 - **(b1) again:** `b1_cross_check` (`samples` close to the relogins, `mean_s` around 10–20s: 0–10s since the last renewal, plus ~1.6s detection and the 0–20s jitter), and the rest as run 21.
 - If a check fails: `b_stress_online` → `failed` (pre-handshake closes at 5,000/s on 4 `GOMAXPROCS`: lower `GWLOSS_STRESS_RATE`); `b_stress_back` → `backoff` and `slo.missing`, and raise `GWLOSS_STRESS_BACK_WAIT` if clients are still in backoff steps; `b_stress_loadgen_headroom` → loadgen's GC under `GOMEMLIMIT` (its CPU profile), then raise `GWLOSS_STRESS_LG_MEMLIMIT` if `MemAvailable` allows; `<phase>_cross_check` → `samples` against `first − first_timeouts`, and Logic's `kick:` log lines; `<phase>_idle` → the error names the gateway and its Logouts.
 
@@ -1610,4 +1641,12 @@ On the Tier 2 host, after `git fetch && git switch feat/plan6b2a-stress`, with t
   1. `INFO latencystats` counts the commands that Lua scripts run (`hset`, `hmget`, `sadd`, …) as well as `evalsha` itself, so the per-command rows show where a script's time goes. `CONFIG RESETSTAT` clears both `latencystats` and `commandstats` (checked on 7.4.11), so each window starts at zero.
   2. With both cross-check paths, the dry runs saw exactly one sample per relogin (1,000 of 1,000 and 1,500 of 1,500). Nearly all came from the refused Kick, because the 0–20s jitter lands inside the dead lease's 30s TTL.
 - **Self-review (2026-10-14):** Review Focus 5 claimed a test for "a gateway that does not answer reads busy", but none existed. `idle: a silent gateway keeps it busy` and `idle: names the silent gateway` were added to Task 3 (with the old code the second fails), the prototype's Task 3 commit was amended, and the plan was rendered and replayed again.
-- **Open for the plan review:** #98–#101 as proposed above; whether the 21GB memory check and the 16GiB `GOMEMLIMIT` fit the host as it is now (run 20b swapped with desktop apps open, at 11.5GB of loadgen); and whether `b_stress_back`'s 300s wait should be a check at all for a test the spec calls "measured, no SLO" (proposed: yes, because a victim never back means a stuck client, not a slow storm).
+- **Plan review (2026-10-14, Claude; decided by the user, "apply all"):** #98 amended (I1–I3, M4), #99 amended (M1), #100 and #101 as proposed (#101's wording and Review Focus 1 per M3). The 21GB memory check and `GOMEMLIMIT=16GiB` stay. `b_stress_back` stays a check, with a 600s wait.
+  - **I1 (fixed):** the sweep wait started only after `lg_wait_back` returned, but counted from the kill. With both at 300s in b_stress, relogins that took the whole wait left the sweep loop no iteration (`swept` false although the sweep finished at ~120s), and `sweep_s` read as the relogin time whenever the relogins were slower. The sweep is now watched by a background subshell from the kill, which writes `swept` and `sweep_s` to `sweep.out`. A stub run (sweep done at 2s, relogins 6s, sweep wait 4s) gave `swept=true sweep_s=2`; the old loop gives false.
+  - **I2 (fixed):** the sweeper deletes the entries of victims not back yet (from ~50–60s after the kill). Such a victim's relogin replaces nothing and queues no Kick, but still counted in `b_stress_kicks`' lower bound of 0.9 × relogins. With more than ~10% of the 600k in backoff at their turn in the sweep, the check would fail on a healthy storm. The lower bound is now 0.9 × (relogins − `sweep_deleted`), in both phases (`swept_first` in the check's detail). `cross_check` was already right: its lower bound counts Kicks.
+  - **I3 (fixed):** `GWLOSS_STRESS_BACK_WAIT` defaults to 600s, not 300s. Each survivor admits `(4+1)/2 = 2` concurrent handshakes at 4 `GOMAXPROCS` (b1's survivor had 3 for 200k and refused 186k handshakes). A client refused more than 10 times in a row then steps through the SDK's doubling backoff (2.5–5s up to 5 min), so six unlucky steps add up to ~315s. The wait still catches a stuck client.
+  - **M1 (fixed):** a repeated `-down` id counted twice: `-down gw-1,gw-1` was refused as "every gateway" on 2 gateways and sized 120 sources instead of 60 on 3. `New` now skips repeats; `TestNewSizesSourcesForTheGatewaysUp` has the case (`gw-2,gw-2` → 60), which fails without the fix (`120 sources, want 60`).
+  - **M2 (noted, no change):** b_stress's ramp sends 5,000/s to one gateway with 2 handshake slots, about 4× b1's ramp rate per slot, so handshake rejects in the ramp are expected; Step 5's fallback (lower `GWLOSS_STRESS_RATE`) covers a failed ramp.
+  - **M3 (wording):** Review Focus 1 and #101 now say that a relogin at the lease's expiry can be counted twice: Login queues the Kick before its own cross-check reads the lease. The window is milliseconds, far below the 1.1 bound.
+  - **M4 (added):** at the ramp's end each phase saves loadgen's `/debug/pprof/heap?gc=1&debug=1` (`ramp/loadgen.heap.txt`, checked by `artifacts`) and records `loadgen_heap` (`live_mb`, `sys_mb`, `live_bytes_per_client`) from its `HeapAlloc` after the forced GC. #93 sized the budget from RSS, which includes GC headroom; this gives the live heap per SDK client. The forced GC runs after the ramp's CPU window and before the storm's.
+  - The prototype's Task 2 and Task 4 commits were amended (`1b502ce`, `0876f07` on `proto-6b2a-stress`), `go test -race ./internal/loadgen/ ./cmd/loadgen/` is green, and the dry run (Task 4 Step 2) gave 26 of 26 (no swap this time): `sweep_s` 60 and 61 from the watcher, `swept_first` 0, `b_stress_back` `wait_s` 600, `loadgen_heap` 6.6–6.9KB live per client at 1,000–2,000 clients. The plan was rendered again and replayed on a clean `74bdafc` (6 patches with `git apply`, `gwloss.sh` whole): the tree is byte for byte the prototype's.
