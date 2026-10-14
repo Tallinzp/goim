@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -273,6 +274,40 @@ func TestKickRefusedRecordsDeadEpochCrossCheck(t *testing.T) {
 	}
 	if s := sampleSum(t, h); s < 0 || s > float64(time.Now().UnixMilli()-res.RedisNowMs)/1000+0.01 {
 		t.Fatalf("cross-check %vs", s)
+	}
+}
+
+// The cross-check's time is the relogin's Kick() call, not the attempt: a
+// refused attempt that waited in the target's queue must not add that wait.
+// One worker, and a dial that is refused after 200ms, so the second Kick
+// waits ~200ms behind the first.
+func TestKickRefusedCrossCheckExcludesQueueWait(t *testing.T) {
+	gw := testredis.Gateway()
+	cfg := testConfig().Kick
+	cfg.Workers = 1
+	env := newKickEnv(t, cfg, nil)
+	env.k.dial = func(string) (*grpc.ClientConn, error) {
+		return grpc.NewClient("passthrough:///refused", grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+				time.Sleep(200 * time.Millisecond)
+				return nil, &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}
+			}))
+	}
+	ref := store.EpochRef{Gateway: gw, Epoch: 15}
+	res, err := env.st.RenewLease(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued := time.Now().UnixMilli()
+	env.k.Kick(ref, 1, pb.KickReason_KICK_REASON_REPLACED)
+	env.k.Kick(ref, 2, pb.KickReason_KICK_REASON_REPLACED)
+	waitFor(t, "give-ups", func() bool { return counter(env.m.KickGiveUps.WithLabelValues("dead")) == 2 })
+	h := env.m.DeadEpochRelogin
+	if n := sampleCount(t, h); n != 2 {
+		t.Fatalf("cross-check samples %d, want 2", n)
+	}
+	if s, max := sampleSum(t, h), 2*float64(queued+5-res.RedisNowMs)/1000; s > max {
+		t.Fatalf("cross-check sum %.3fs > %.3fs: the queue wait was counted", s, max)
 	}
 }
 

@@ -65,7 +65,8 @@ const maxLoggedKickErrs = 8
 type kickJob struct {
 	connID  uint64
 	reason  pb.KickReason
-	attempt int // 0 = first
+	attempt int   // 0 = first
+	kickMs  int64 // the relogin's Kick() call, for the dead-epoch cross-check
 }
 
 // NewKicker returns a Kicker; Close stops it.
@@ -77,7 +78,7 @@ func NewKicker(cfg KickConfig, leases *LeaseCache, m *Metrics, dial DialFunc) *K
 // Kick queues the first attempt and returns at once. The first attempt is
 // always queued, whatever the target's lease looks like (R2-O6).
 func (k *Kicker) Kick(ref store.EpochRef, connID uint64, reason pb.KickReason) {
-	k.enqueue(ref, kickJob{connID: connID, reason: reason})
+	k.enqueue(ref, kickJob{connID: connID, reason: reason, kickMs: time.Now().UnixMilli()})
 }
 
 func (k *Kicker) enqueue(ref store.EpochRef, j kickJob) {
@@ -196,7 +197,7 @@ func (k *Kicker) attempt(t *kickTarget, j kickJob) {
 		// crash must not raise the live give-up alert once per relogin. The
 		// cross-check is recorded first, so a counted give-up has its sample.
 		if j.attempt == 0 {
-			k.crossCheck(t.ref)
+			k.crossCheck(t.ref, j.kickMs)
 		}
 		k.m.KickGiveUps.WithLabelValues("dead").Inc()
 		return
@@ -215,7 +216,8 @@ func (k *Kicker) attempt(t *kickTarget, j kickJob) {
 }
 
 // crossCheck records R1-O7's dead-epoch cross-check for a first attempt
-// refused while the target's lease is still live: now − the epoch's last
+// refused while the target's lease is still live: kickMs (the relogin's
+// Kick() call, so the job's queue wait is left out) − the epoch's last
 // renewal, the time from gateway death to relogin within the renewal
 // interval (P6b2a-b1I-7). A crashed gateway's lease stays live for up to its
 // TTL, so Login's cross-check, which needs the lease gone, misses the
@@ -223,7 +225,7 @@ func (k *Kicker) attempt(t *kickTarget, j kickJob) {
 // already gone means Login recorded that relogin, so each counts once. A
 // retry comes RetrySpacing after the relogin and is not recorded. It may
 // read Redis: call it from a worker only.
-func (k *Kicker) crossCheck(ref store.EpochRef) {
+func (k *Kicker) crossCheck(ref store.EpochRef, kickMs int64) {
 	ctx, cancel := context.WithTimeout(context.Background(), k.cfg.Deadline)
 	defer cancel()
 	if live, err := k.leases.LiveOne(ctx, ref); err != nil || !live {
@@ -233,7 +235,7 @@ func (k *Kicker) crossCheck(ref store.EpochRef) {
 	if err != nil || !ok || renewed == 0 {
 		return
 	}
-	k.m.DeadEpochRelogin.Observe(float64(time.Now().UnixMilli()-renewed) / 1000)
+	k.m.DeadEpochRelogin.Observe(float64(kickMs-renewed) / 1000)
 }
 
 // logErr logs each distinct error once per target (at most

@@ -13,7 +13,7 @@ type Metrics struct {
 	Logins           *prometheus.CounterVec // result
 	ConnSeqRegressed prometheus.Counter
 	Undecodable      *prometheus.CounterVec // op: stored entries that did not decode (PI-3)
-	DeadEpochRelogin prometheus.Histogram   // login_ms (or a refused Kick) − dead epoch's last renewal (R1-O7)
+	DeadEpochRelogin prometheus.Histogram   // login_ms (or a refused Kick's Kick() call) − dead epoch's last renewal (R1-O7)
 	StoreSeconds     *prometheus.HistogramVec
 	RPCSeconds       *prometheus.HistogramVec // method, code
 	Logouts          *prometheus.CounterVec   // result
@@ -89,7 +89,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		Logins:           cv("logins_total", "Logins by result.", "result"),
 		ConnSeqRegressed: c("conn_seq_regressed_total", "Logins accepted as a device counter regression."),
 		Undecodable:      cv("undecodable_entries_total", "Stored sess values that did not decode, by operation.", "op"),
-		DeadEpochRelogin: h("dead_epoch_relogin_seconds", "Relogin login_ms, or the give-up of its refused Kick while the lease was live, minus the dead epoch's last lease renewal.",
+		DeadEpochRelogin: h("dead_epoch_relogin_seconds", "Relogin login_ms, or the Kick() call of its first Kick refused while the lease was live, minus the dead epoch's last lease renewal.",
 			prometheus.LinearBuckets(0, 5, 24)),
 		StoreSeconds:     hv("store_seconds", "Session store call latency.", lat, "op"),
 		RPCSeconds:       hv("rpc_seconds", "gRPC handler latency.", lat, "method", "code"),
