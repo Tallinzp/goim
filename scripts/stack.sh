@@ -15,7 +15,9 @@
 #   stack_metrics NAME          # NAME's /metrics once; stack_metric_in BODY METRIC [MATCH] reads it
 #   stack_wait_idle SECONDS     # phase boundary: every gateway at 0 connections and 0 awaiting Logout
 #   stack_usage_start [N=PID..] # start a CPU window over the stack's processes (and N=PID extras)
-#   stack_usage_json            # {"window_s", NAME: {"cpu_s", "cores", "rss_mb"}...} since the start
+#   stack_usage_json            # {"window_s", NAME: {"cpu_s", "cores", "rss_mb", "rss_peak_mb"}...} since the start
+#   stack_counters NAME KEY=METRIC[:MATCH]...  # {"KEY": sum, ...} from one scrape of NAME (null: no answer)
+#   stack_counters_delta A B    # {"KEY": B - A, ...} of two stack_counters readings
 #   stack_down                  # gateways, then Logic, devtoken, Redis (#78); call it from the exit trap
 #   stack_health                # one line per problem: dead process, unclean stop, panic in a log
 #
@@ -326,8 +328,11 @@ stack_usage_start() {
   STACK_USAGE_T0=$(date +%s%N)
 }
 
-# stack_usage_json: {"window_s": W, NAME: {"cpu_s", "cores", "rss_mb"}, ...}
-# since stack_usage_start (cores = cpu_s / W); a process gone since is null.
+# stack_usage_json: {"window_s": W, NAME: {"cpu_s", "cores", "rss_mb",
+# "rss_peak_mb"}, ...} since stack_usage_start (cores = cpu_s / W); a process
+# gone since is null. rss_peak_mb is the process's peak resident memory since
+# it started (VmHWM, P6b1I-3), not the window's: the memory budget of a run
+# (#93) is its peak, which a reading at the window's end can miss.
 stack_usage_json() {
   local hz e name pid t1 out
   hz=$(getconf CLK_TCK)
@@ -336,12 +341,51 @@ stack_usage_json() {
   for e in "${STACK_USAGE_PIDS[@]}"; do
     name=${e%%=*} pid=${e#*=}
     out+=", \"$name\": $(awk -v t0="${STACK_USAGE0[$name]:-}" -v t1="$(stack_ticks "$pid")" -v hz="$hz" \
-      -v w=$((t1 - STACK_USAGE_T0)) -v rss="$(awk '/^VmRSS:/ { print $2 }' "/proc/$pid/status" 2>/dev/null)" '
-      BEGIN { if (t0 == "" || t1 == "" || rss == "") { print "null"; exit }
+      -v w=$((t1 - STACK_USAGE_T0)) -v mem="$(awk '/^Vm(RSS|HWM):/ { printf "%s ", $2 }' "/proc/$pid/status" 2>/dev/null)" '
+      BEGIN { if (t0 == "" || t1 == "" || split(mem, m, " ") != 2) { print "null"; exit }
               c = (t1 - t0) / hz
-              printf "{\"cpu_s\": %.2f, \"cores\": %.3f, \"rss_mb\": %d}", c, c / (w / 1e9), rss / 1024 }')"
+              printf "{\"cpu_s\": %.2f, \"cores\": %.3f, \"rss_mb\": %d, \"rss_peak_mb\": %d}", c, c / (w / 1e9), m[2] / 1024, m[1] / 1024 }')"
   done
   echo "{$out}"
+}
+
+# stack_counters NAME KEY=METRIC[:MATCH]...: one scrape of NAME's /metrics
+# as {"KEY": the sum of METRIC's samples containing MATCH, ...}, for counters
+# read before and after an event (Plan 6b2a: the storm's Kicks, lease
+# renewals and sweeps). Prints null if NAME does not answer. A KEY is null
+# when the scrape has no sample of METRIC at all (a mistyped name must not
+# read as 0), and 0 when METRIC has samples but none contains MATCH: a
+# labelled counter has no sample for a label value until its first
+# increment, e.g. kick_attempts_total{attempt="retry"} while no Kick was
+# retried.
+stack_counters() {
+  local name=$1 body
+  shift
+  body=$(stack_metrics "$name") || { echo null; return; }
+  awk -v specs="$*" '
+    BEGIN { n = split(specs, sp, " ")
+            for (i = 1; i <= n; i++) {
+              e = index(sp[i], "="); key[i] = substr(sp[i], 1, e - 1); rest = substr(sp[i], e + 1)
+              c = index(rest, ":"); met[i] = c ? substr(rest, 1, c - 1) : rest; want[i] = c ? substr(rest, c + 1) : "" } }
+    { for (i = 1; i <= n; i++)
+        if ($1 == met[i] || index($1, met[i] "{") == 1) { seen[i] = 1; if (want[i] == "" || index($0, want[i])) s[i] += $NF } }
+    END { out = ""
+          for (i = 1; i <= n; i++)
+            out = out (i > 1 ? ", " : "") "\"" key[i] "\": " (!seen[i] ? "null" : (s[i] == int(s[i]) ? sprintf("%.0f", s[i]) : sprintf("%.6g", s[i])))
+          print "{" out "}" }' <<<"$body"
+}
+
+# stack_counters_delta A B: {"KEY": B - A, ...} over two stack_counters
+# readings of the same process. A KEY null in A counts as 0 there (the
+# counter had no sample yet; a failed scrape makes all of A null instead),
+# and is null in the delta when B lacks it or either reading is null.
+stack_counters_delta() {
+  python3 -c 'import json, sys
+a, b = (json.loads(x) for x in sys.argv[1:3])
+if a is None or b is None:
+    print("null")
+else:
+    print(json.dumps({k: None if v is None else round(v - (a.get(k) or 0), 6) for k, v in b.items()}))' "$1" "$2" 2>/dev/null || echo null
 }
 
 # stack_pinned NAME CPUS: the process's affinity is exactly CPUS.

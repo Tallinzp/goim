@@ -140,6 +140,19 @@ expect "metrics: a label filter" "$(stack_metric_in 'goim_x{r="done"} 5
 goim_x{r="dropped"} 2' goim_x 'r="done"')" 5
 stack_metrics gw-9 >/dev/null && bad "metrics: no such process must fail" || ok "metrics: no such process fails"
 
+# stack_counters: several counters from one scrape, as JSON (Plan 6b2a). A
+# metric with no sample is null (a typo must not read 0); a label value
+# with no sample of a metric that has others is 0 (a retry counter before
+# the first retry); a process that does not answer is null.
+c=$(stack_counters gw-0 conns=goim_gateway_connections first='goim_gateway_lease_calls_total:result="first"' \
+  never='goim_gateway_lease_calls_total:result="never"' typo=goim_gateway_lease_calls_totl)
+expect "counters: one scrape as JSON" "$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(sorted(d), d["conns"], d["first"], d["never"], d["typo"])' "$c")" \
+  "['conns', 'first', 'never', 'typo'] 0 1 0 None"
+expect "counters: no such process" "$(stack_counters gw-9 conns=goim_gateway_connections)" null
+expect "counters: delta, an absent sample before is 0" \
+  "$(stack_counters_delta '{"a": 1, "b": null, "c": 2, "d": 0.5}' '{"a": 4, "b": 3, "c": null, "d": 0.75}')" '{"a": 3, "b": 3, "c": null, "d": 0.25}'
+expect "counters: delta of a failed scrape" "$(stack_counters_delta null '{"a": 1}')" null
+
 # The phase boundary (P6a2bI-3): idle at once on an idle stack; a socket open
 # on gw-0 keeps it busy, named, until the socket closes.
 stack_wait_idle 5 && ok "idle: an idle stack" || bad "idle: an idle stack"
@@ -161,6 +174,8 @@ kill $extra; wait $extra 2>/dev/null
 usage=$(stack_usage_json)
 expect "usage: every process, the extras, and the window" "$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(sorted(d), 0.9 < d["window_s"] < 3, d["gw-0"]["rss_mb"] > 0, d["gw-0"]["cpu_s"] >= 0, d["gone"], d["extra"])' "$usage")" \
   "['devtoken', 'extra', 'gone', 'gw-0', 'gw-1', 'logic', 'redis', 'window_s'] True True True None None"
+# The peak (VmHWM, P6b1I-3) is at least the current RSS.
+expect "usage: peak RSS" "$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(all(d[n]["rss_peak_mb"] >= d[n]["rss_mb"] > 0 for n in ("gw-0", "logic", "redis")))' "$usage")" True
 
 stack_profile cpu 1
 # A failed profile fails stack_profile, even when it is not the last one
