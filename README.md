@@ -8,17 +8,19 @@ Gateways hold long-lived, encrypted TCP connections. A stateless Logic tier chec
 
 ## Measured results
 
-From the recorded Tier 2 benchmark runs (24-core host, all processes on one machine):
+From the recorded Tier 2 benchmark runs (24-core host, all processes on one machine; one gateway gets 6 cores / 12 threads):
 
 | What | Result |
 | --- | --- |
-| Concurrent connections | 100,000 across 4 gateways (25k each), ramped at 5,000/s |
-| Login latency | p99 24 ms (max 52 ms) |
-| Heartbeat round trip | p99 11 ms, 718k Pongs, none missing |
-| Gateway memory | ~3.5 KB per connection |
+| Connections on one gateway | **600,000**, all logged in within 121 s at 5,000/s, none lost while held |
+| Login latency at 600k | p99 20 ms (max 64 ms); heartbeat round trip p99 2 ms |
+| Gateway CPU at 600k | 1.7 cores while logging in 5,000/s; 0.17 cores holding 600k at a 150 s heartbeat (44 µs per Pong) |
+| Gateway memory at 600k | ~1.2 KB of live heap per connection, 1.25 GB RSS; Go's default GC ran once per 150 s (0.24 ms pause) |
+| Heartbeat cost at 200k | 0.08 cores at a 150 s heartbeat, 0.15 cores at 60 s |
+| Four gateways | 100,000 connections: login p99 24 ms, heartbeat round trip p99 11 ms |
 | Recovery after a gateway is killed | every user back online, p99 19.9 s (SLO: 30 s) |
 | Race test suite | 58 fault-injection scenarios against real processes and a real redis-server, plus mutation checks |
-| Tests | 435 Go tests, about half of the ~30k lines of Go |
+| Tests | 439 Go tests, about half of the ~30k lines of Go |
 
 ## Architecture
 
@@ -78,7 +80,7 @@ GOIM_TEST_TIER=2 make test-tier2 SCENARIO=smoke
 
 ## Status
 
-This is sub-project 1 (connection and session core) of a larger IM system. Done: gateway, Logic, session store, TCP transport, client SDK, race suite, load generator and the Tier 2 benchmark foundation. Next: the full Tier 2 load scenarios (600k connections on one gateway, reconnect storms, floods). Messaging, push and the WebSocket transport are later sub-projects.
+This is sub-project 1 (connection and session core) of a larger IM system. Done: gateway, Logic, session store, TCP transport, client SDK, race suite, load generator, the Tier 2 benchmark foundation, and the single-gateway capacity and heartbeat-cost benchmarks (600k connections). Next: gateway loss and reconnect storms with SDK clients, floods, Redis Cluster failover, and Kubernetes rolling restarts. Messaging, push and the WebSocket transport are later sub-projects.
 
 ---
 
@@ -92,17 +94,19 @@ This is sub-project 1 (connection and session core) of a larger IM system. Done:
 
 ### 实测结果
 
-来自已记录的 Tier 2 压测（24 核主机，所有进程在同一台机器上）：
+来自已记录的 Tier 2 压测（24 核主机，所有进程在同一台机器上；单个网关分配 6 核 / 12 线程）：
 
 | 项目 | 结果 |
 | --- | --- |
-| 并发连接 | 4 个网关共 100,000 连接（每个 25k），以 5,000/s 爬坡 |
-| 登录延迟 | p99 24 ms（最大 52 ms） |
-| 心跳往返 | p99 11 ms，71.8 万次 Pong，无一丢失 |
-| 网关内存 | 每连接约 3.5 KB |
+| 单网关连接数 | **60 万**，以 5,000/s 在 121 s 内全部登录，保持期间无一断开 |
+| 60 万时的登录延迟 | p99 20 ms（最大 64 ms）；心跳往返 p99 2 ms |
+| 60 万时的网关 CPU | 以 5,000/s 登录时 1.7 核；150 s 心跳下保持 60 万连接 0.17 核（每次 Pong 44 µs） |
+| 60 万时的网关内存 | 每连接约 1.2 KB 存活堆内存，RSS 1.25 GB；Go 默认 GC 每 150 s 运行一次（暂停 0.24 ms） |
+| 20 万连接的心跳开销 | 150 s 心跳 0.08 核，60 s 心跳 0.15 核 |
+| 四个网关 | 10 万连接：登录 p99 24 ms，心跳往返 p99 11 ms |
 | 杀掉一个网关后的恢复 | 所有用户重新上线，p99 19.9 s（SLO：30 s） |
 | 竞态测试集 | 58 个故障注入场景，运行在真实进程和真实 redis-server 上，并带变异测试 |
-| 测试 | 435 个 Go 测试，约占 3 万行 Go 代码的一半 |
+| 测试 | 439 个 Go 测试，约占 3 万行 Go 代码的一半 |
 
 ### 架构
 
@@ -162,6 +166,6 @@ GOIM_TEST_TIER=2 make test-tier2 SCENARIO=smoke
 
 ### 当前状态
 
-这是一个更大 IM 系统中的子项目 1（连接与会话核心）。已完成：网关、Logic、会话存储、TCP 传输、客户端 SDK、竞态测试集、压测工具和 Tier 2 压测基础设施。下一步：完整的 Tier 2 压测场景（单网关 60 万连接、重连风暴、洪泛）。消息、推送和 WebSocket 传输属于后续子项目。
+这是一个更大 IM 系统中的子项目 1（连接与会话核心）。已完成：网关、Logic、会话存储、TCP 传输、客户端 SDK、竞态测试集、压测工具、Tier 2 压测基础设施，以及单网关容量和心跳开销压测（60 万连接）。下一步：使用 SDK 客户端的网关故障与重连风暴、洪泛、Redis Cluster 故障转移，以及 Kubernetes 滚动重启。消息、推送和 WebSocket 传输属于后续子项目。
 
 [回到 English](#goim)
