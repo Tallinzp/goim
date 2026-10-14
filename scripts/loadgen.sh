@@ -71,20 +71,22 @@ lg_get() { curl -sf -m "${LG_CURL_TIMEOUT:-10}" "http://$(lg_control)$1" | lg_py
 
 lg_post() { curl -sf -X POST "http://$(lg_control)$1"; }
 
+# The waits poll every 0.5s until a wall-clock deadline, not for a count of
+# polls: a poll over 600k clients takes its own time (#103, run 22).
 lg_wait_online() {
-  local i
-  for i in $(seq $(($2 * 2))); do
+  local end=$((SECONDS + $2))
+  while [ $SECONDS -lt $end ]; do
     [ "$(lg_get /stats 'd["ramp_done"] and d["online"] >= '"$1")" = true ] && return 0
     kill -0 "$LG_PID" 2>/dev/null || { echo "loadgen exited" >&2; return 1; }
     sleep 0.5
   done
-  echo "loadgen: $(lg_get /stats 'd["online"]') of $1 online after $2s; failed: $(lg_get /stats 'd["failed"]')" >&2
+  echo "loadgen: online and failed after $2s (want $1 online): $(lg_get /stats '[d["online"], d["failed"]]')" >&2
   return 1
 }
 
 lg_wait_back() {
-  local i
-  for i in $(seq $(($2 * 2))); do
+  local end=$((SECONDS + $2))
+  while [ $SECONDS -lt $end ]; do
     [ "$(lg_get "/slo?mark=$1&within=30s" 'd["back"] == d["population"]')" = true ] && return 0
     sleep 0.5
   done
