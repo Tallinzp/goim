@@ -113,13 +113,13 @@ gc_mark_cpu_pct() {
     END { if (ok) printf "%.1f\n", s; else print "null" }'
 }
 
-# usage_ok JSON: loadgen used under 3/4 of its CPU set.
 # lo_dropped: packets loopback dropped on input since boot (host-wide).
 lo_dropped() { cat /sys/class/net/lo/statistics/rx_dropped 2>/dev/null || echo null; }
 
 # lo_drops_between A B: B - A, null if either is unread.
 lo_drops_between() { [ "$1" = null ] || [ "$2" = null ] && echo null || echo $(($2 - $1)); }
 
+# usage_ok JSON: loadgen used under 3/4 of its CPU set.
 usage_ok() { [ "$(echo "$1" | lg_true - 'd["loadgen"]["cores"] < '"$LG_CPUS"' * 0.75')" = true ]; }
 
 t=$SECONDS

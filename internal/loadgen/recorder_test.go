@@ -153,3 +153,31 @@ func TestRecorderCountsBackoffClients(t *testing.T) {
 		t.Fatalf("backoff: clients %d, waits %v", c.BackoffClients, c.BackoffWaits)
 	}
 }
+
+// The backoff since the latest mark (P6b2a-stressI-1): b_stress's ramp can
+// put clients in backoff before the kill, and the run's own count would mix
+// them into the storm's. Each mark restarts it: a client counts once per mark.
+func TestRecorderCountsBackoffSinceMark(t *testing.T) {
+	r := NewRecorder(3, []string{"gw-0"})
+	r.Backoff(0, "backoff") // the ramp
+	if c := r.Counts(); c.BackoffSinceMark.Mark != "" || c.BackoffSinceMark.Clients != 1 {
+		t.Fatalf("before a mark: %+v", c.BackoffSinceMark)
+	}
+	if _, err := r.Mark("death", 0, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if c := r.Counts(); c.BackoffSinceMark.Clients != 0 || len(c.BackoffSinceMark.Waits) != 0 {
+		t.Fatalf("at the mark: %+v", c.BackoffSinceMark)
+	}
+	r.Backoff(0, "failure") // backed off in the ramp, and again in the storm
+	r.Backoff(0, "backoff")
+	r.Backoff(1, "backoff")
+	c := r.Counts()
+	s := c.BackoffSinceMark
+	if s.Mark != "death" || s.Clients != 2 || s.Waits["backoff"] != 2 || s.Waits["failure"] != 1 || len(s.Waits) != 2 {
+		t.Fatalf("since the mark: %+v", s)
+	}
+	if c.BackoffClients != 2 || c.BackoffWaits["backoff"] != 3 {
+		t.Fatalf("the run: clients %d, waits %v", c.BackoffClients, c.BackoffWaits)
+	}
+}

@@ -23,6 +23,7 @@ type Recorder struct {
 	failed         map[string]int64
 	backoff        map[string]int64 // waits by kind
 	backoffClients int64
+	since          BackoffCount // since the latest mark (P6b2a-stressI-1)
 	pongs          int64
 	missing        int64
 	gapMax         time.Duration
@@ -32,9 +33,12 @@ type Recorder struct {
 }
 
 // clientState: gw is the gateway it is logged in on (-1: none); mark and
-// pos place it in its latest mark (-1: none); backoff: it has reached backoff.
+// pos place it in its latest mark (-1: none); backoff: it has reached backoff;
+// backoffMarks: the mark count + 1 when it was last counted in
+// Recorder.since (0: never).
 type clientState struct {
 	gw, mark, pos int32
+	backoffMarks  int32
 	backoff       bool
 }
 
@@ -53,7 +57,8 @@ type mark struct {
 // NewRecorder records clients 0..n-1 over gateways ids.
 func NewRecorder(n int, ids []string) *Recorder {
 	r := &Recorder{ids: ids, clients: make([]clientState, n), online: make([]int, len(ids)),
-		login: newHist(), pongRTT: newHist(), lost: map[string]int64{}, failed: map[string]int64{}, backoff: map[string]int64{}, byName: map[string]*mark{}}
+		login: newHist(), pongRTT: newHist(), lost: map[string]int64{}, failed: map[string]int64{}, backoff: map[string]int64{},
+		since: BackoffCount{Waits: map[string]int64{}}, byName: map[string]*mark{}}
 	for i := range r.clients {
 		r.clients[i] = clientState{gw: -1, mark: -1}
 	}
@@ -114,9 +119,15 @@ func (r *Recorder) Backoff(i int, kind string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.backoff[kind]++
-	if c := &r.clients[i]; !c.backoff {
+	r.since.Waits[kind]++
+	c := &r.clients[i]
+	if !c.backoff {
 		c.backoff = true
 		r.backoffClients++
+	}
+	if e := int32(len(r.marks)) + 1; c.backoffMarks != e {
+		c.backoffMarks = e
+		r.since.Clients++
 	}
 }
 
@@ -168,6 +179,7 @@ func (r *Recorder) Mark(name string, gw int, now time.Time) (int, error) {
 	m.lost, m.back = make([]int64, len(m.members)), make([]int64, len(m.members))
 	r.marks = append(r.marks, m)
 	r.byName[name] = m
+	r.since = BackoffCount{Mark: name, Waits: map[string]int64{}}
 	return len(m.members), nil
 }
 
@@ -238,18 +250,28 @@ func (r *Recorder) Marks() []string {
 
 // Counts are the run's counters now.
 type Counts struct {
-	Online          int              `json:"online"`
-	OnlineByGateway map[string]int   `json:"online_by_gateway"`
-	Logins          int64            `json:"logins"`
-	Lost            map[string]int64 `json:"lost"`
-	Failed          map[string]int64 `json:"failed"`
-	BackoffClients  int64            `json:"backoff_clients"` // clients that reached backoff, each once
-	BackoffWaits    map[string]int64 `json:"backoff_waits"`   // backoff waits by kind
-	LoginLatency    Dist             `json:"login_latency"`
-	Pongs           int64            `json:"pongs"`
-	PongMissing     int64            `json:"pong_missing"`
-	PingGapMaxMs    int64            `json:"ping_gap_max_ms"`
-	PongRTT         Dist             `json:"pong_rtt"`
+	Online           int              `json:"online"`
+	OnlineByGateway  map[string]int   `json:"online_by_gateway"`
+	Logins           int64            `json:"logins"`
+	Lost             map[string]int64 `json:"lost"`
+	Failed           map[string]int64 `json:"failed"`
+	BackoffClients   int64            `json:"backoff_clients"` // clients that reached backoff, each once
+	BackoffWaits     map[string]int64 `json:"backoff_waits"`   // backoff waits by kind
+	BackoffSinceMark BackoffCount     `json:"backoff_since_mark"`
+	LoginLatency     Dist             `json:"login_latency"`
+	Pongs            int64            `json:"pongs"`
+	PongMissing      int64            `json:"pong_missing"`
+	PingGapMaxMs     int64            `json:"ping_gap_max_ms"`
+	PongRTT          Dist             `json:"pong_rtt"`
+}
+
+// BackoffCount is the backoff since mark Mark ("": the run's start, before
+// any mark): each client once, every wait by kind. A storm's own count, apart
+// from the clients that backed off in the ramp before it (P6b2a-stressI-1).
+type BackoffCount struct {
+	Mark    string           `json:"mark"`
+	Clients int64            `json:"clients"`
+	Waits   map[string]int64 `json:"waits"`
 }
 
 // Counts returns a snapshot of the counters.
@@ -258,7 +280,8 @@ func (r *Recorder) Counts() Counts {
 	defer r.mu.Unlock()
 	c := Counts{OnlineByGateway: map[string]int{}, Logins: r.logins, Lost: map[string]int64{}, Failed: map[string]int64{},
 		BackoffClients: r.backoffClients, BackoffWaits: map[string]int64{},
-		LoginLatency: r.login.dist(r.login.n), Pongs: r.pongs, PongMissing: r.missing, PingGapMaxMs: r.gapMax.Milliseconds(), PongRTT: r.pongRTT.dist(r.pongRTT.n)}
+		BackoffSinceMark: BackoffCount{Mark: r.since.Mark, Clients: r.since.Clients, Waits: map[string]int64{}},
+		LoginLatency:     r.login.dist(r.login.n), Pongs: r.pongs, PongMissing: r.missing, PingGapMaxMs: r.gapMax.Milliseconds(), PongRTT: r.pongRTT.dist(r.pongRTT.n)}
 	for i, n := range r.online {
 		c.Online += n
 		c.OnlineByGateway[r.ids[i]] = n
@@ -271,6 +294,9 @@ func (r *Recorder) Counts() Counts {
 	}
 	for k, v := range r.backoff {
 		c.BackoffWaits[k] = v
+	}
+	for k, v := range r.since.Waits {
+		c.BackoffSinceMark.Waits[k] = v
 	}
 	return c
 }

@@ -268,6 +268,9 @@ for name in $PHASES; do
 
   # The storm: counters before, SIGKILL, CPU profiles of its first 30s.
   stack_snapshot before
+  # The ramp's backoff (no mark yet: since loadgen started), apart from the
+  # storm's, which counts since the death mark (P6b2a-stressI-1).
+  backoff_ramp=$(lg_get /stats 'd["backoff_since_mark"]')
   logic0=$(stack_counters logic "${LOGIC_COUNTERS[@]}")
   declare -A sv0=() sv1=()
   for g in "${survivors[@]}"; do sv0[$g]=$(stack_counters "$g" "${GW_COUNTERS[@]}"); done
@@ -317,7 +320,7 @@ for name in $PHASES; do
   for g in "${survivors[@]}"; do sv_d+="${sv_d:+, }\"$g\": $(stack_counters_delta "${sv0[$g]}" "${sv1[$g]}")"; done
   sv_d="{$sv_d}"
   window_s=$(echo "$storm" | lg_py - 'd["window_s"]')
-  backoff=$(lg_get /stats '{"clients": d["backoff_clients"], "waits": d["backoff_waits"]}')
+  backoff="{\"ramp\": $backoff_ramp, \"storm\": $(lg_get /stats 'd["backoff_since_mark"]'), \"run\": $(lg_get /stats '{"clients": d["backoff_clients"], "waits": d["backoff_waits"]}')}"
 
   slo=$STACK_DIR/artifacts/slo-death.json
   pop=$(lg_py "$slo" 'd["population"]')
