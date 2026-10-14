@@ -38,7 +38,10 @@
 #   CAPACITY_RECONCILE_CYCLE the gateway's -reconcile-cycle (default 24h: the
 #                      production 10m cycle starts its first pass at a random
 #                      point, which would land in some windows and not others;
-#                      reconcile_entries records any that did)
+#                      reconcile_entries records any that did). Set (e.g. 2m)
+#                      to measure 600k with Reconcile on and check P_reconcile_end
+#   CAPACITY_RECONCILE_WAIT seconds to wait after the window for a full-size
+#                      ReconcileEnd (default 600)
 #
 # Checks, for each phase P:
 #   P_stack            redis, devtoken, Logic and gw-0 become Ready
@@ -59,6 +62,10 @@
 #                      awaiting Logout within 300s; then, from one scrape, a
 #                      Logout done for every Login that succeeded (more for
 #                      Logins with an unknown outcome) and none dropped
+#   P_reconcile_end    only with CAPACITY_RECONCILE_CYCLE set: after the window,
+#                      a ReconcileEnd listing at least every client succeeds
+#                      (4.8MB at 600k, over gRPC's 4MB default; P6b1I-1) and
+#                      none is dropped
 #   P_processes        nothing died, panicked or stopped uncleanly
 # and once: pinning (in the first phase), artifacts.
 set -uo pipefail
@@ -75,7 +82,7 @@ t2_nofile 1048576
 PHASES=${CAPACITY_PHASES:-a_default:600000:150:default a_tuned:600000:150:tuned c200_150:200000:150:tuned c200_60:200000:60:tuned}
 TUNED=(GOGC=${CAPACITY_GOGC:-off} GOMEMLIMIT=${CAPACITY_GOMEMLIMIT:-4GiB})
 CAP=${CAPACITY_CAP:-650000} RATE=${CAPACITY_RATE:-5000}
-RECONCILE=${CAPACITY_RECONCILE_CYCLE:-24h}
+RECONCILE=${CAPACITY_RECONCILE_CYCLE:-24h} RECONCILE_WAIT=${CAPACITY_RECONCILE_WAIT:-600}
 SOURCES=${CAPACITY_SOURCES:-}
 export STACK_GATEWAYS=1 STACK_PIN=1
 STACK_PORT_BASE=${STACK_PORT_BASE:-17000}
@@ -214,7 +221,7 @@ for phase in $PHASES; do
   tcp="{\"ramp\": $(t2_tcpstat_json "$STACK_DIR/tcpstat-0" "$STACK_DIR/tcpstat-1"), \"window\": $(t2_tcpstat_json "$STACK_DIR/tcpstat-2" "$STACK_DIR/tcpstat-3")}"
   lo2=$(lo_dropped)
   lo_ramp=$(lo_drops_between "$lo0" "$lo1") lo_window=$(lo_drops_between "$lo1" "$lo2")
-  t2_check "no_lo_drops_in_$name" "$(t2_bool [ "$lo_ramp" = 0 ] && [ "$lo_window" = 0 ])" \
+  t2_check "no_lo_drops_in_$name" "$([ "$lo_ramp" = 0 ] && [ "$lo_window" = 0 ] && echo true || echo false)" \
     "\"ramp\": $lo_ramp, \"settle_and_window\": $lo_window, \"netdev_max_backlog\": $(cat /proc/sys/net/core/netdev_max_backlog 2>/dev/null || echo null)"
   # Reconcile entries in the window (no sample until the first entry, so
   # null at both ends is 0; null at one end only is unknown).
@@ -256,6 +263,24 @@ print(json.dumps({"gc_cycles_before_window": gc0,
 w, p = json.loads(sys.argv[1]), int(sys.argv[2])
 print(round(w["gw-0"]["cpu_s"] / p * 1e6, 1) if p > 0 and w.get("gw-0") else "null")' "$win" "$pings" 2>/dev/null || echo null)
 
+  # With Reconcile on (P6b1I-1): wait for a ReconcileEnd that lists every
+  # client (the gauge is set only when one succeeds), then read its counters.
+  if [ "$RECONCILE" != 24h ]; then
+    t=$SECONDS
+    while :; do
+      end_tracked=$(stack_metric gw-0 goim_gateway_reconcile_end_tracked)
+      [ "$end_tracked" != null ] && [ "$end_tracked" -ge "$clients" ] && break
+      [ $((SECONDS - t)) -ge "$RECONCILE_WAIT" ] && break
+      sleep 5
+    done
+    body=$(stack_metrics gw-0) || body=""
+    ends_ok=$(stack_metric_in "$body" goim_gateway_reconcile_end_total 'result="ok"')
+    ends_retried=$(stack_metric_in "$body" goim_gateway_reconcile_end_total 'result="retried"')
+    ends_dropped=$(stack_metric_in "$body" goim_gateway_reconcile_end_total 'result="dropped"')
+    t2_check "${name}_reconcile_end" \
+      "$([ "$end_tracked" != null ] && [ "$end_tracked" -ge "$clients" ] && [ "$ends_dropped" = null ] && echo true || echo false)" \
+      "\"tracked\": $end_tracked, \"want\": $clients, \"waited_s\": $((SECONDS - t)), \"ok\": $ends_ok, \"retried\": $ends_retried, \"dropped\": $ends_dropped"
+  fi
   # The phase boundary (P6a2bI-3): the result is written before any client
   # stops (#84), then the stop is timed until gw-0 is idle.
   lg_stop

@@ -15,8 +15,10 @@ import (
 	"github.com/Tallinzp/goim/internal/testredis"
 	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 func httpStatus(t *testing.T, url string) int {
@@ -107,6 +109,14 @@ func TestServerEndToEnd(t *testing.T) {
 	}
 	if _, err := stream.Recv(); err != io.EOF {
 		t.Fatalf("stream end: %v", err)
+	}
+
+	// P6b1I-1: a ReconcileEnd at the 600k benchmark (4.8MB) is over gRPC's
+	// 4MB default receive limit; Logic raises it to pb.MaxMsgBytes.
+	_, err = pb.NewLogicClient(grpcConn(t, grpcAddr)).ReconcileEnd(ctx, &pb.ReconcileEndRequest{Gw: gw,
+		AsOfMs: time.Now().UnixMilli(), TrackedConnIds: make([]uint64, 600_000)})
+	if status.Code(err) == codes.ResourceExhausted {
+		t.Fatalf("ReconcileEnd of 600k conn_ids: %v", err)
 	}
 
 	resp, err := http.Get("http://" + adminAddr + "/metrics")

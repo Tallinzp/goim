@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"time"
 
+	pb "github.com/Tallinzp/goim/api/internalpb"
 	"github.com/Tallinzp/goim/internal/session"
 )
 
@@ -179,6 +180,12 @@ func (c Config) Validate() error {
 		if v <= 0 {
 			bad("%s %d must be positive", name, v)
 		}
+	}
+	// A ReconcileEnd lists every tracked conn_id: open, or closed and
+	// awaiting its Logout (P6b1I-1).
+	if c.MaxConns+c.LogoutQueue > pb.MaxTrackedConnIDs {
+		bad("MaxConns %d + LogoutQueue %d above %d: a ReconcileEnd would exceed Logic's %dMB message limit",
+			c.MaxConns, c.LogoutQueue, pb.MaxTrackedConnIDs, pb.MaxMsgBytes>>20)
 	}
 	if c.Reconcile.MaxRequeues < 0 {
 		bad("Reconcile.MaxRequeues %d must not be negative", c.Reconcile.MaxRequeues)

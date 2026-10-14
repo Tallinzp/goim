@@ -74,6 +74,9 @@ func TestValidateRefuses(t *testing.T) {
 		{"jitter of half a cycle", func(c *Config) { c.Reconcile.Jitter = 5 * time.Minute }, "Jitter"},
 		{"empty Busy window", func(c *Config) { c.BusyRetry = Window{3 * time.Second, time.Second} }, "BusyRetry"},
 		{"inverted LoginResp window", func(c *Config) { c.Windows.Retryable = Window{2 * time.Second, time.Second} }, "Retryable"},
+		// P6b1I-1: a ReconcileEnd lists every tracked conn_id, open or
+		// awaiting its Logout, and must fit Logic's message limit.
+		{"ReconcileEnd above Logic's limit", func(c *Config) { c.MaxConns, c.LogoutQueue = 1_100_000, 1_100_000 }, "ReconcileEnd"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := testConfig()

@@ -122,6 +122,8 @@ func NewServer(cfg Config, sc ServerConfig, d Deps) (*Server, error) {
 		grpc.ChainUnaryInterceptor(unary...),
 		grpc.ChainStreamInterceptor(s.streamObserve),
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{MinTime: 10 * time.Second, PermitWithoutStream: true}),
+		// A ReconcileEnd at 600k is 4.8MB, over gRPC's 4MB default (P6b1I-1).
+		grpc.MaxRecvMsgSize(pb.MaxMsgBytes),
 	}
 	s.main = grpc.NewServer(append(opts, grpc.KeepaliveParams(keepalive.ServerParameters{
 		MaxConnectionAge: sc.MaxConnectionAge, MaxConnectionAgeGrace: sc.MaxConnectionAgeGrace}))...)
