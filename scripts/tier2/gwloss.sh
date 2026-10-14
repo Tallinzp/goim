@@ -40,9 +40,11 @@
 #                      rejected none at capacity (SDK clients retry a reject
 #                      without counting it, P6b2a-b1I-2)
 #   b1_kicks           Kick first attempts in the storm, sent or dropped by a
-#                      full queue (R5S-O2), are 0.9-1.1 per relogin, none is
-#                      retried and none gives up as live: a refused Kick is
-#                      not retried (R2-O6, #97)
+#                      full queue (R5S-O2), are 0.9-1.1 per relogin, and none
+#                      gives up as live. A refused Kick is not retried (#97):
+#                      only first attempts that timed out while the victim's
+#                      sockets were torn down are, once each, and refused
+#                      (R2-O6; #97 amended, run 20)
 #   b1_lease           the survivor gw-0 renews its lease every interval from
 #                      the kill to the sweep: no call failed or found the
 #                      lease missing, and Logic saw no renewal error
@@ -82,6 +84,8 @@ LOGIC_COUNTERS=(
   logins_replaced='goim_logic_logins_total:result="replaced"'
   kick_first='goim_logic_kick_attempts_total:attempt="first"'
   kick_retry='goim_logic_kick_attempts_total:attempt="retry"'
+  kick_first_timeout='goim_logic_kick_attempts_total:attempt="first",result="timeout"'
+  kick_retry_refused='goim_logic_kick_attempts_total:attempt="retry",result="refused"'
   kick_giveups_dead='goim_logic_kick_giveups_total:target_lease="dead"'
   kick_giveups_live='goim_logic_kick_giveups_total:target_lease="live"'
   kick_dropped=goim_logic_kick_dropped_total
@@ -213,8 +217,8 @@ pass=false
 rejects=$(echo "$gw_d" | lg_py - 'd["rejects_at_capacity"]')
 [ $dead -eq 0 ] && [ "$rejects" = 0 ] && pass=$(lg_true "$slo" 'd["pass_from_mark"] and d["population"] >= '"$CLIENTS"' * 0.45')
 t2_check "${name}_slo" "$pass" "\"kill\": ${reply:-null}, \"back_all\": $back, \"back_s\": $back_s, \"rejects_at_capacity\": ${rejects:-null}, \"slo\": $(cat "$slo")"
-t2_check "${name}_kicks" "$(echo "{\"d\": $logic_d, \"pop\": $pop}" | lg_true - 'd["d"]["kick_retry"] == 0 and d["d"]["kick_giveups_live"] == 0 and 0.9 * d["pop"] <= d["d"]["kick_first"] + (d["d"]["kick_dropped"] or 0) <= 1.1 * d["pop"]')" \
-  "\"relogins\": $pop, \"first\": $(echo "$logic_d" | lg_py - 'd["kick_first"]'), \"retries\": $(echo "$logic_d" | lg_py - 'd["kick_retry"]'), \"giveups_dead\": $(echo "$logic_d" | lg_py - 'd["kick_giveups_dead"]'), \"giveups_live\": $(echo "$logic_d" | lg_py - 'd["kick_giveups_live"]'), \"dropped\": $(echo "$logic_d" | lg_py - 'd["kick_dropped"]')"
+t2_check "${name}_kicks" "$(echo "{\"d\": $logic_d, \"pop\": $pop}" | lg_true - 'd["d"]["kick_retry"] <= d["d"]["kick_first_timeout"] and d["d"]["kick_retry_refused"] == d["d"]["kick_retry"] and d["d"]["kick_giveups_live"] == 0 and 0.9 * d["pop"] <= d["d"]["kick_first"] + (d["d"]["kick_dropped"] or 0) <= 1.1 * d["pop"]')" \
+  "\"relogins\": $pop, \"first\": $(echo "$logic_d" | lg_py - 'd["kick_first"]'), \"retries\": $(echo "$logic_d" | lg_py - 'd["kick_retry"]'), \"first_timeouts\": $(echo "$logic_d" | lg_py - 'd["kick_first_timeout"]'), \"retries_refused\": $(echo "$logic_d" | lg_py - 'd["kick_retry_refused"]'), \"giveups_dead\": $(echo "$logic_d" | lg_py - 'd["kick_giveups_dead"]'), \"giveups_live\": $(echo "$logic_d" | lg_py - 'd["kick_giveups_live"]'), \"dropped\": $(echo "$logic_d" | lg_py - 'd["kick_dropped"]')"
 # One renewal per 10s interval (the gateway's -lease-interval default): the
 # window holds at least window_s / 10 - 1 whole intervals.
 t2_check "${name}_lease" "$(echo "{\"g\": $gw_d, \"l\": $logic_d, \"w\": $window_s}" | lg_true - 'd["g"]["lease_error"] == 0 and d["g"]["lease_missing"] == 0 and d["g"]["lease_live"] >= d["w"] // 10 - 1 and d["l"]["lease_error"] == 0')" \
