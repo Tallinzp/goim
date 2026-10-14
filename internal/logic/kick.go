@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	pb "github.com/Tallinzp/goim/api/internalpb"
@@ -179,6 +181,16 @@ func (k *Kicker) attempt(t *kickTarget, j kickJob) {
 		return
 	}
 	k.m.KickAttempts.WithLabelValues(kind, "error").Inc()
+	if refused(err) {
+		// Nothing listens at the target's address: its process is gone, and
+		// with it the connection this Kick targets. A starved but alive
+		// gateway still completes TCP connects in its kernel and times out
+		// instead, so it keeps its retries (#97, R2-O6). Its lease stays live
+		// for up to a TTL after a crash, so the give-up counts as dead: a
+		// crash must not raise the live give-up alert once per relogin.
+		k.m.KickGiveUps.WithLabelValues("dead").Inc()
+		return
+	}
 	if c := status.Code(err); (c != codes.Unavailable && c != codes.DeadlineExceeded) || j.attempt >= k.cfg.Retries {
 		k.m.KickGiveUps.WithLabelValues(k.leaseLabel(t.ref)).Inc()
 		return
@@ -190,6 +202,14 @@ func (k *Kicker) attempt(t *kickTarget, j kickJob) {
 	}
 	j.attempt++
 	time.AfterFunc(k.cfg.RetrySpacing, func() { k.enqueue(t.ref, j) })
+}
+
+// refused reports whether a failed Kick never reached a listener: its dial
+// got ECONNREFUSED. gRPC carries the dial error only as text in the
+// UNAVAILABLE status ("connect: connection refused"), also on the fail-fast
+// RPCs that follow while the connection stays in TRANSIENT_FAILURE.
+func refused(err error) bool {
+	return status.Code(err) == codes.Unavailable && strings.Contains(status.Convert(err).Message(), syscall.ECONNREFUSED.Error())
 }
 
 // leaseLabel is the target_lease label: live, dead, or unknown if the lease

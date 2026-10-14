@@ -189,6 +189,36 @@ func TestKickRetriesOnlyWhileLeaseLive(t *testing.T) {
 	}
 }
 
+// #97: a Kick refused at connect (nothing listens: a crashed gateway on a
+// live node) gives up at once, even while the target's lease is live, which
+// it stays for up to a TTL after the crash. Without this every relogin of a
+// crash storm is retried until the lease expires (Tier 2 b1 prototype: ~2
+// retries per relogin). The give-up counts as dead, so a crash does not
+// raise the live give-up alert once per relogin.
+func TestKickRefusedDoesNotRetry(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := lis.Addr().String()
+	lis.Close() // nothing listens: connects are refused
+	gw := testredis.Gateway()
+	env := newKickEnv(t, testConfig().Kick, map[string]string{gw: addr})
+	ref := store.EpochRef{Gateway: gw, Epoch: 11}
+	if _, err := env.st.RenewLease(ctx, ref); err != nil {
+		t.Fatal(err)
+	}
+	env.k.Kick(ref, 1, pb.KickReason_KICK_REASON_REPLACED)
+	waitFor(t, "give-up", func() bool { return counter(env.m.KickGiveUps.WithLabelValues("dead")) == 1 })
+	time.Sleep(3 * env.cfg.RetrySpacing)
+	if n := counter(env.m.KickAttempts.WithLabelValues("retry", "error")); n != 0 {
+		t.Fatalf("%v retries to a refused address with a live lease", n)
+	}
+	if n := counter(env.m.KickGiveUps.WithLabelValues("live")); n != 0 {
+		t.Fatalf("%v live give-ups for a refused address", n)
+	}
+}
+
 // R5S-O2: a full per-target queue drops and counts instead of growing.
 func TestKickQueueFullDrops(t *testing.T) {
 	gw := testredis.Gateway()
