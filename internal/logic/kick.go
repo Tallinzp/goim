@@ -55,8 +55,12 @@ type kickTarget struct {
 	q       chan kickJob
 	cc      *grpc.ClientConn // this epoch's own connection
 	client  pb.GatewayClient
-	workers int // running workers; guarded by Kicker.mu
+	workers int             // running workers; guarded by Kicker.mu
+	errs    map[string]bool // error messages already logged; guarded by Kicker.mu
 }
+
+// maxLoggedKickErrs bounds the distinct errors logged per target.
+const maxLoggedKickErrs = 8
 
 type kickJob struct {
 	connID  uint64
@@ -181,6 +185,7 @@ func (k *Kicker) attempt(t *kickTarget, j kickJob) {
 		return
 	}
 	k.m.KickAttempts.WithLabelValues(kind, "error").Inc()
+	k.logErr(t, kind, err)
 	if refused(err) {
 		// Nothing listens at the target's address: its process is gone, and
 		// with it the connection this Kick targets. A starved but alive
@@ -202,6 +207,25 @@ func (k *Kicker) attempt(t *kickTarget, j kickJob) {
 	}
 	j.attempt++
 	time.AfterFunc(k.cfg.RetrySpacing, func() { k.enqueue(t.ref, j) })
+}
+
+// logErr logs each distinct error once per target (at most
+// maxLoggedKickErrs): a storm fails thousands of attempts the same way, and
+// the metrics carry no error text.
+func (k *Kicker) logErr(t *kickTarget, kind string, err error) {
+	msg := status.Code(err).String() + ": " + status.Convert(err).Message()
+	k.mu.Lock()
+	if t.errs == nil {
+		t.errs = map[string]bool{}
+	}
+	first := !t.errs[msg] && len(t.errs) < maxLoggedKickErrs
+	if first {
+		t.errs[msg] = true
+	}
+	k.mu.Unlock()
+	if first {
+		slog.Warn("kick: attempt failed", "gw", t.ref.Gateway, "epoch", t.ref.Epoch, "attempt", kind, "err", msg)
+	}
 }
 
 // refused reports whether a failed Kick never reached a listener: its dial
