@@ -32,9 +32,9 @@
 #   CAPACITY_WINDOW    measured window in seconds (default: whole heartbeats,
 #                      at least 120s: 150s at 150s, 120s at 60s)
 #   CAPACITY_SOURCES   loadgen's source addresses, 1-253 (default: loadgen's, one
-#                      per 20,000 connections; more sources leave each fewer
-#                      ports to the gateway, so connect() searches less: run 16
-#                      spent a third of loadgen's ramp CPU in the kernel)
+#                      per 5,000 connections, 120 at 600k; at one per 20,000,
+#                      connect()'s source-port search kept 600k near 505k in
+#                      runs 14-16, and 120 sources passed in run 17)
 #   CAPACITY_RECONCILE_CYCLE the gateway's -reconcile-cycle (default 24h: the
 #                      production 10m cycle starts its first pass at a random
 #                      point, which would land in some windows and not others;

@@ -19,10 +19,12 @@ import (
 const AppID = "im"
 
 // connsPerSource is the default number of connections per (source,
-// gateway) pair, well inside the 28,232-port ephemeral range (#69), sized
-// for one gateway less than the stack has: after /kill its clients log in
-// again on the others.
-const connsPerSource = 20_000
+// gateway) pair, sized for one gateway less than the stack has: after /kill
+// its clients log in again on the others. 5,000 is ~18% of the 28,232-port
+// ephemeral range (#69): at 20,000 (71%) connect() spent loadgen's ramp in
+// the kernel's source-port search and 600k topped out near 505k (Tier 2
+// runs 14-16); at 5,000, 600k logged in in 121s (run 17).
+const connsPerSource = 5_000
 
 // Config configures a run.
 type Config struct {
@@ -77,7 +79,7 @@ func New(cfg Config, env Env) (*Runner, error) {
 	if cfg.Sources == 0 {
 		gws := max(1, len(env.GatewayAddrs)-1)
 		perGW := (cfg.Clients + gws - 1) / gws
-		cfg.Sources = (perGW + connsPerSource - 1) / connsPerSource
+		cfg.Sources = min(maxSources, (perGW+connsPerSource-1)/connsPerSource)
 	}
 	bal, err := NewBalancer(env.GatewayAddrs, cfg.Sources)
 	if err != nil {

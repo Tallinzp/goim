@@ -32,11 +32,14 @@ type Balancer struct {
 	next []int
 }
 
+// maxSources: 127.0.0.2 to 127.0.0.254.
+const maxSources = 253
+
 // Sources are loadgen's source addresses 127.0.0.2, 127.0.0.3, … (choice
 // #69): Linux answers on all of 127/8 with no setup.
 func Sources(n int) ([]net.IP, error) {
-	if n < 1 || n > 253 {
-		return nil, fmt.Errorf("loadgen: %d sources, want 1–253", n)
+	if n < 1 || n > maxSources {
+		return nil, fmt.Errorf("loadgen: %d sources, want 1–%d", n, maxSources)
 	}
 	ips := make([]net.IP, n)
 	for i := range ips {

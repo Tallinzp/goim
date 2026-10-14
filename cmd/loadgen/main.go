@@ -48,7 +48,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	fs.IntVar(&cfg.Clients, "clients", 1000, "clients; client i logs in as <uid-prefix>-<i>")
 	fs.Float64Var(&cfg.Rate, "rate", 1000, "clients started per second")
 	fs.StringVar(&cfg.UIDPrefix, "uid-prefix", "lg", "uid prefix, distinct per run")
-	fs.IntVar(&cfg.Sources, "sources", 0, "source addresses 127.0.0.2…; 0: one per 20,000 connections per gateway")
+	fs.IntVar(&cfg.Sources, "sources", 0, "source addresses 127.0.0.2…; 0: one per 5,000 connections per gateway")
 	fs.DurationVar(&cfg.PingEvery, "ping-every", 150*time.Second, "light: Ping interval (the gateway's -heartbeat)")
 	fs.DurationVar(&cfg.Timeout, "timeout", 10*time.Second, "light: dial + handshake + Login per attempt")
 	control := fs.String("control", "", "control API listen address (none if empty)")

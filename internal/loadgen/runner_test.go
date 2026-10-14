@@ -6,11 +6,13 @@ import "testing"
 // is killed: /kill moves its clients onto N−1 gateways (6a2b minor 1).
 func TestNewSizesSourcesForOneGatewayLess(t *testing.T) {
 	for _, tc := range []struct{ gateways, clients, want int }{
-		{1, 20_000, 1},
-		{1, 20_001, 2},
-		{2, 40_000, 2},  // 20,000 per gateway, 40,000 on the survivor
-		{4, 100_000, 2}, // 25,000 per gateway, 33,334 on each of 3
-		{2, 200_000, 10},
+		{1, 5_000, 1},
+		{1, 5_001, 2},
+		{2, 40_000, 8},  // 20,000 per gateway, 40,000 on the survivor
+		{4, 100_000, 7}, // 25,000 per gateway, 33,334 on each of 3
+		{2, 200_000, 40},
+		{1, 600_000, 120},   // run 17: 600k online in 121s; 30 sources topped out near 505k
+		{1, 2_000_000, 253}, // capped at the 253 source addresses
 	} {
 		env := Env{}
 		for i := range tc.gateways {
