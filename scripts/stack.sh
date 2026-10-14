@@ -328,7 +328,7 @@ stack_metric_in() {
 # (stack_expect_dead). Fails, naming what is left, after SECONDS, or at once
 # on a dropped Logout, which never settles.
 stack_wait_idle() {
-  local end=$((SECONDS + $1)) name admin busy body c a done logins dropped
+  local end=$((SECONDS + $1)) name admin busy body c a ldone logins dropped
   while :; do
     busy=""
     while read -r name admin; do
@@ -336,18 +336,18 @@ stack_wait_idle() {
       body=$(stack_metrics "$name") || { busy+=" $name: no answer;"; continue; }
       c=$(stack_metric_in "$body" goim_gateway_connections)
       a=$(stack_metric_in "$body" goim_gateway_awaiting_logout)
-      done=$(stack_metric_in "$body" goim_gateway_logouts_total 'result="done"')
+      ldone=$(stack_metric_in "$body" goim_gateway_logouts_total 'result="done"')
       logins=$(stack_metric_in "$body" goim_gateway_logins_total 'result="ok"')
       dropped=$(stack_metric_in "$body" goim_gateway_logouts_total 'result="dropped"')
-      [ "$done" = null ] && done=0
+      [ "$ldone" = null ] && ldone=0
       [ "$logins" = null ] && logins=0
       [ "$dropped" = null ] && dropped=0
       if [ "$dropped" != 0 ]; then
-        echo "stack: $name dropped $dropped Logouts: they never settle (logouts done $done of $logins logins, dropped $dropped)" >&2
+        echo "stack: $name dropped $dropped Logouts: they never settle (logouts done $ldone of $logins logins, dropped $dropped)" >&2
         return 1
       fi
-      [ "$c" = 0 ] && [ "$a" = 0 ] && [ "$done" -ge "$logins" ] ||
-        busy+=" $name: connections $c, awaiting_logout $a, logouts done $done of $logins logins;"
+      [ "$c" = 0 ] && [ "$a" = 0 ] && [ "$ldone" -ge "$logins" ] ||
+        busy+=" $name: connections $c, awaiting_logout $a, logouts done $ldone of $logins logins;"
     done < <(stack_admins)
     [ -z "$busy" ] && return 0
     if [ $SECONDS -ge $end ]; then

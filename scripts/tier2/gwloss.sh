@@ -94,6 +94,11 @@
 #   artifacts          (once) every phase's storm CPU profiles, metrics before
 #                      and after, loadgen's heap at the ramp's end, the SLO and
 #                      loadgen's result
+# The phase field's redis_latency.ramp and .storm are Redis's per-command
+# latency since a CONFIG RESETSTAT at each window's start; .reset says
+# whether that reset succeeded (false: the window also holds the commands
+# before it). The reset clears commandstats too, so after/'s redis INFO
+# covers the storm only.
 set -uo pipefail
 
 . "$(dirname "$0")/lib.sh"
@@ -217,7 +222,7 @@ for name in $PHASES; do
   lo0=$(lo_dropped)
   t2_cpustat_snap "$STACK_DIR/cpustat-0"
   t2_tcpstat_snap "$STACK_DIR/tcpstat-0"
-  stack_redis_resetstat
+  reset_ramp=true; stack_redis_resetstat || reset_ramp=false
   lg_start "$name" -mode sdk -clients "$clients" -rate "$rate" -uid-prefix "$name" ${sources:+-sources "$sources"} ${down:+-down "$down"}
   stack_usage_start loadgen="$LG_PID"
   t=$SECONDS
@@ -266,7 +271,7 @@ for name in $PHASES; do
   logic0=$(stack_counters logic "${LOGIC_COUNTERS[@]}")
   declare -A sv0=() sv1=()
   for g in "${survivors[@]}"; do sv0[$g]=$(stack_counters "$g" "${GW_COUNTERS[@]}"); done
-  stack_redis_resetstat
+  reset_storm=true; stack_redis_resetstat || reset_storm=false
   t2_record_start "$name"
   t2_cpustat_snap "$STACK_DIR/cpustat-2"
   t2_tcpstat_snap "$STACK_DIR/tcpstat-2"
@@ -364,7 +369,7 @@ for name in $PHASES; do
 
   cpu_sets="{\"ramp\": $(t2_cpusets_json "$STACK_DIR/cpustat-0" "$STACK_DIR/cpustat-1"), \"storm\": $(t2_cpusets_json "$STACK_DIR/cpustat-2" "$STACK_DIR/cpustat-3")}"
   tcp="{\"ramp\": $(t2_tcpstat_json "$STACK_DIR/tcpstat-0" "$STACK_DIR/tcpstat-1"), \"storm\": $(t2_tcpstat_json "$STACK_DIR/tcpstat-2" "$STACK_DIR/tcpstat-3")}"
-  t2_field "$name" "{\"clients\": $clients, \"victim\": \"$victim\", \"by_gateway_at_kill\": $by_gateway, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"loadgen_env\": $(t2_json_str "${LG_ENV[*]}"), \"ramp_s\": $ramp_s, \"ramp\": $ramp, \"loadgen_heap\": $lg_heap, \"storm\": $storm, \"back_s\": $back_s, \"sweep_s\": $sweep_s, \"logic\": $logic_d, \"survivors\": $sv_d, \"redis_latency\": {\"ramp\": $redis_ramp, \"storm\": $redis_storm}, \"backoff\": $backoff, \"cpu_sets\": $cpu_sets, \"tcp\": $tcp, \"profile_in_storm_s\": 30, \"stop_s\": $stop_s, \"loadgen_exit\": $LG_STATUS, \"login_latency\": $(lg_json 'd["login_latency"]'), \"failed\": $(lg_json 'd["failed"]'), \"lost\": $(lg_json 'd["lost"]'), \"sources\": $(lg_json 'd["sources"]')}"
+  t2_field "$name" "{\"clients\": $clients, \"victim\": \"$victim\", \"by_gateway_at_kill\": $by_gateway, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"loadgen_env\": $(t2_json_str "${LG_ENV[*]}"), \"ramp_s\": $ramp_s, \"ramp\": $ramp, \"loadgen_heap\": $lg_heap, \"storm\": $storm, \"back_s\": $back_s, \"sweep_s\": $sweep_s, \"logic\": $logic_d, \"survivors\": $sv_d, \"redis_latency\": {\"ramp\": $redis_ramp, \"storm\": $redis_storm, \"reset\": {\"ramp\": $reset_ramp, \"storm\": $reset_storm}}, \"backoff\": $backoff, \"cpu_sets\": $cpu_sets, \"tcp\": $tcp, \"profile_in_storm_s\": 30, \"stop_s\": $stop_s, \"loadgen_exit\": $LG_STATUS, \"login_latency\": $(lg_json 'd["login_latency"]'), \"failed\": $(lg_json 'd["failed"]'), \"lost\": $(lg_json 'd["lost"]'), \"sources\": $(lg_json 'd["sources"]')}"
   t2_duration "$name" $((SECONDS - t0))
 
   # Artifacts: metrics before and after the storm, its CPU profiles, the SLO
