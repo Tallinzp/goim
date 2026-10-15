@@ -163,8 +163,9 @@ func loginReply(f clientconn.Frame) (resp *clientpb.LoginResp, e end, done bool)
 // PongTimeout of a Ping (spec: Dead-server detection). Kick and Reconnect
 // end it; the client closes on Reconnect (R4H-O3). A LogoutResp ends it
 // only after the client sent Logout; any other one is reported as a note and
-// ignored.
-func (a *attempt) serve(ctx context.Context, cfg *Config, resp *clientpb.LoginResp, report func(attemptMsg) bool) end {
+// ignored. A cancel of the attempt's context reaches serve through login's
+// context.AfterFunc, which closes the socket: Recv fails and serve returns.
+func (a *attempt) serve(_ context.Context, cfg *Config, resp *clientpb.LoginResp, report func(attemptMsg) bool) end {
 	hb, _ := cfg.Heartbeat.Of(resp)
 	start := time.Now()
 	var lastRecv atomic.Int64 // ns since start of the last frame received
