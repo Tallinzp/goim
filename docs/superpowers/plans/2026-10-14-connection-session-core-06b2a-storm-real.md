@@ -5,9 +5,9 @@
 **Goal:** Make `gwloss`'s storms the spec's storms, not loadgen's. After the kill, every victim's first attempt must reach a survivor when the SDK's timing says it should. The run proves it with a measured check, and fails when the check does not hold. Today b_stress is recorded as `loadgen_bound` (#102): in Tier 2 runs 22–24 loadgen's 8 CPUs spent the storm on X25519 for handshakes that timed out (~3.2M `handshake_timeout` per survivor against ~342k handshakes ok), so the relogin times (p99 ~441s) measured loadgen. The user wants a real storm, and rejected throttling loadgen's attempts: a throttle makes the storm gentler than the real one (2026-10-14).
 
 **Architecture:** Three parts.
-1. **Precompute what a phone already holds (#106).** A phone whose connection drops already has a cached token, and its own CPU makes its handshake message. Loadgen pays for both on 8 shared CPUs at the worst moment. With `-precompute`, loadgen prepares each logged-in SDK client's next token and Noise first message (the ephemeral key and `es`, the two X25519 operations of the client's three) in background workers during the ramp, and stops at the first mark. The survivors receive the same bytes at the same moments. The SDK gets `Config.Initiate`, the hook that hands an attempt its first message; production leaves it nil. `wire` and `clientconn` get `ClientHandshakeWith` and `HandshakeWith`, which take a first message made earlier.
-2. **Measure how late each attempt is (#107).** Loadgen records, for every attempt that follows a wait, the time from the wait's end to the attempt's first write (its handshake frame): `attempt_lag`, since the latest mark. A new check `<phase>_storm_real` passes only if every logged-in client was prepared at the kill and the storm's attempt lag p99 is at most `GWLOSS_LAG_P99_MS` (100ms). An invalid storm fails the run; it is not recorded as a pass.
-3. **Give loadgen the idle CPUs in b_stress (#108).** In runs 22–24 the gateway set was 92–93% idle in the storm and the Logic set 96%. b_stress moves loadgen to `0-5,12-17` (12 CPUs) and the gateways to `6-9,18-21` (8 CPUs, `GOMAXPROCS` 4 each as before: the victim alone in the ramp, the two survivors after the kill). b1 keeps #71's sets.
+1. **Precompute what a phone already holds (#106).** A phone whose connection drops already has a cached token, and its own CPU makes its handshake message. Loadgen pays for both on 8 shared CPUs at the worst moment. Each SDK client now keeps its last token and reuses it until a `refresh`, as the spec's SDK rules say (amended in review (M2): loadgen used to sign a new one per attempt). With `-precompute`, loadgen also prepares each logged-in SDK client's Noise first message (the ephemeral key and `es`, the two X25519 operations of the client's three) in background workers during the ramp, and stops at the first mark. The survivors receive the same bytes at the same moments. The SDK gets `Config.Initiate`, the hook that hands an attempt its first message; production leaves it nil. `wire` and `clientconn` get `ClientHandshakeWith` and `HandshakeWith`, which take a first message made earlier.
+2. **Measure how late loadgen is (#107).** Loadgen records two lags since the latest mark, both on its own side only (amended in review (I1, I2)): `attempt_lag`, for every attempt that follows a wait, from the wait's end to the attempt's start (`EventConnecting`, on the client's run loop: no TCP connect and no server in it); and `reply_lag`, for every handshake, from the read that completed the server's reply to the Login frame's write (`Finish` and the Login's seal, loadgen's CPU). A new check `<phase>_storm_real` passes only if every logged-in client was prepared at the kill and both lags' p99 are at most `GWLOSS_LAG_P99_MS` (100ms). An invalid storm fails the run; it is not recorded as a pass. The survivors' connect path (listen overflows in `tcp`) and `auth_timeout` rejects stay recorded as data: they can be the gateways', not loadgen's.
+3. **Give loadgen the idle CPUs in b_stress (#108).** In runs 22–24 the gateway set was 92–93% idle in the storm and the Logic set 96%. b_stress gets its own CPU sets for loadgen (12 CPUs), the gateways and Logic + Redis (`GOMAXPROCS` 4 per gateway as before: the victim alone in the ramp, the two survivors after the kill). The sets are chosen from the host's `lscpu -e` before Task 3 (the user, 2026-10-14). b1 keeps #71's sets.
 
 **Tech Stack:** Go 1.27.1, `github.com/flynn/noise` v1.1.0, bash 5.2, python3 (reads JSON only).
 
@@ -15,7 +15,7 @@
 
 **Branch:** `feat/plan6b2a-stress` (head `ef3ace4`, runs 23 and 24 recorded).
 
-**Size:** 3 tasks, ~44KB. Tasks 1–2 were prototyped in a throwaway worktree from `ef3ace4` by applying this plan's code blocks: `go vet` clean, and `go test -race` passes for `wire`, `clientconn`, `sdk`, `loadgen` and `cmd/loadgen`, with the new tests stable over 3 repetitions (`TestSDKStormUsesPrecomputedHandshakes` ~3s). The fixes the prototype needed are in the steps (an import, gofmt alignment, the `Initiate` field's place). Task 3 (shell) is not prototyped: its dry run is part of execution. The per-handshake numbers were measured on the dev machine.
+**Size:** 3 tasks, ~44KB. Tasks 1–2 were prototyped in a throwaway worktree from `ef3ace4` by applying this plan's code blocks: `go vet` clean, and `go test -race` passes for `wire`, `clientconn`, `sdk`, `loadgen` and `cmd/loadgen`, with the new tests stable over 3 repetitions (`TestSDKStormUsesPrecomputedHandshakes` ~3s). The fixes the prototype needed are in the steps (an import, gofmt alignment, the `Initiate` field's place). The review's amendments to Task 2 (I1, I2, M2: `sdkclient.go`, the recorder's `reply_lag`, `precompute.go` without a token) were written after the prototype and are not prototyped. Task 3 (shell) is not prototyped: its dry run is part of execution. The per-handshake numbers were measured on the dev machine.
 
 ## Global Constraints
 
@@ -25,24 +25,28 @@
 - Scripts: bash with `set -uo pipefail`; JSON without jq; python3 only reads JSON. The host's awk is mawk.
 - CPU sets: b1 keeps #71 (gateways `4-9,16-21`, Logic + Redis `10,11,22,23`, loadgen `0-3,12-15`). b_stress per #108. The host's SMT siblings are CPU n and n+12 (the sets above already assume it).
 - SDK timing is the spec's and is not changed: storm wait 0–20s uniform, pre-handshake retry 0.5–1.5s, other retryable rejects 1–3s, backoff 2.5–5s doubling to 5 min.
-- Memory: a prepared client costs ~679 bytes of live heap for the handshake state and frame (measured: 100,000 `wire.Initiate` results) plus its token string (~300 bytes), ~0.6GB at 600k. `t2_mem_budget` stays 23GiB (#105 amended). Swap during a measured window fails it (#70).
+- Memory: a prepared client costs ~679 bytes of live heap for the handshake state and frame (measured: 100,000 `wire.Initiate` results), and every client now keeps its token string (~300 bytes, M2), ~0.6GB at 600k, held through the storm's first 20s, its peak. Run 24 already swapped in b_stress (61 pages in) with loadgen at 16.1–16.2GB of its 16GiB `GOMEMLIMIT`, so run 25 may fail `no_swap_in_b_stress` for this host's memory. The user decided (review I3, 2026-10-14): no host change for run 25 (BIOS UMA stays), `t2_mem_budget` stays 23GiB (#105 amended), and swap during a measured window still fails the run (#70); memory is dealt with after run 25's result.
 - New behaviour cites its choice number (#106–#108).
 
 ## Review Focus
 
 1. **A prepared handshake must be used once.** A Noise `HandshakeState` used twice would send the same ephemeral key twice; the server would answer, and the client's `Finish` would fail on the second. `sdkClient.pre` is taken with `Swap(nil)`, so an attempt either takes it or makes its own. Test: `TestSDKStormUsesPrecomputedHandshakes` (Task 2: `handshakes_precomputed` is exactly the victims' 15, and the survivor's 15 still hold theirs).
 2. **No preparing after the kill.** Preparing during the storm would spend loadgen's CPU exactly where the plan frees it. `Runner.Mark` stops the precomputer before the recorder takes the mark, and clients that log in again after it are not queued. Test: the same e2e test (`ready` is 15 after the storm, not 30).
-3. **An attempt without a wait has no lag.** The first `Connect` and a local trigger start an attempt with no wait; counting them would put the ramp's attempts (lag from no due time) into the storm's numbers. `sdkClient.due` is set only on `EventWaiting` and taken with `Swap(0)` at the first write. Test: `TestRecorderCountsTheStormSinceMark` (Task 2) and the e2e test (`attempt_lag.n` ≥ 15, all after the mark).
-4. **The lag clock is wall time.** `due` and the first write both use `time.Now().UnixNano()`; a clock step backwards would give a negative lag. `Recorder.AttemptLag` counts a negative lag as 0. Test: `TestRecorderCountsTheStormSinceMark`.
-5. **`<phase>_storm_real` fails on a partial precompute.** If the workers have not prepared every logged-in client by the kill (the wait gives up after 120s), the storm's first attempts partly compute inline and its lag is not the spec's storm. The check requires `ready == online` at the kill, as well as the lag. Test: Task 3's dry run with `GWLOSS_DRY_NO_PRECOMPUTE=1` fails both phases' `storm_real` checks.
+3. **An attempt without a wait has no lag.** The first `Connect` and a local trigger start an attempt with no wait; counting them would put the ramp's attempts (lag from no due time) into the storm's numbers. `sdkClient.due` is set only on `EventWaiting` and cleared at the next `EventConnecting`, both on the client's run loop. Test: `TestRecorderCountsTheStormSinceMark` (Task 2) and the e2e test (`attempt_lag.n` ≥ 15, all after the mark).
+4. **The lags measure loadgen only.** `attempt_lag` ends at `EventConnecting`, before the token, the dial and the handshake; `reply_lag` runs from the reply's last read to the Login frame's write, with no network wait in it (review I1, I2). `attempt_lag` uses `time.Time` (monotonic); `reply_lag` uses unix ns across goroutines, and `Recorder` counts a negative lag (a wall-clock step) as 0. Test: `TestRecorderCountsTheStormSinceMark`.
+5. **`<phase>_storm_real` fails on a partial precompute.** If the workers have not prepared every logged-in client by the kill (the wait gives up after 120s), the storm's first attempts partly compute inline and its lag is not the spec's storm. The check requires `ready == online` at the kill, as well as the lags. Test: Task 3's dry run with `GWLOSS_DRY_NO_PRECOMPUTE=1` fails both phases' `storm_real` checks.
+6. **A token is reused until a refresh (M2).** `Config.Token` returns the client's last token unless `refresh` is set; a refresh signs a new one and keeps it. Logic refuses a token only below a revocation marker (`reconcile.go`, rule 1), so reuse is the spec's phone. Test: the existing loadgen e2e tests (relogins with the cached token).
 
 ## Implementation choices this plan makes
 
-Proposed 2026-10-14 with this plan, for the user's review. #106 was decided in principle by the user on 2026-10-14 (a real storm, never a throttle).
+Proposed 2026-10-14 with this plan, for the user's review. #106 was decided in principle by the user on 2026-10-14 (a real storm, never a throttle). Reviewed 2026-10-14: I1 (attempt lag at `EventConnecting`), I2 (`reply_lag`), M2 (token reuse) amended below; I3 (memory: no host change, swap stays fatal) and I4 (b_stress's sets chosen from `lscpu`) decided by the user; M1 (29 checks) and M3 (run 25's CPU-set numbers not comparable with runs 22–24) fixed in Task 3.
 
-106. **Loadgen prepares what a phone already holds** (`-precompute`, sdk mode only). When an SDK client logs in, it is queued (a channel sized to `Clients`, so `OnEvent` never blocks) for one of `max(1, GOMAXPROCS/2)` workers, which signs its next token (`Runner.token`, as today) and runs `wire.Initiate` for the pinned key. The client takes both at its next attempt: `Config.Token` returns the prepared token unless `refresh` is set, and `Config.Initiate` swaps the prepared first message out, or computes one inline when there is none. Preparing stops at the first mark (`Runner.Mark`, which `/kill` also calls). Retries after the storm's first attempt compute inline (counted). Per attempt this moves the ephemeral key, `es` and the token's Ed25519 signature off the storm: on the dev machine `wire.Initiate` costs 281µs and `Finish` 153µs, so the storm's client-side handshake cost falls to about a third. The server sees the same bytes. **SDK:** `Config.Initiate func(keyID uint16, serverPub []byte) (*wire.Initiator, []byte, error)`, nil by default; `wire.ClientHandshakeWith` and `clientconn.Conn.HandshakeWith` run a handshake from a first message made earlier. Rejected: an in-flight handshake cap (a throttle: the user's decision); precomputing only the ephemeral key (`noise.Config.EphemeralKeypair`), which saves one X25519 of three; a shared pool refilled during the storm (spends the storm's CPU).
-107. **Attempt lag and `<phase>_storm_real`.** The SDK client stores `due = now + Wait.D` (unix ns) on every `EventWaiting`. Loadgen's `Dial` wraps the connection; its first `Write` (the handshake frame) records `now − due` in the recorder's `attempt_lag` and clears `due`. The recorder keeps `attempt_lag` and the handshake counts (`handshakes_precomputed`, `handshakes_inline`) since the latest mark, like `backoff_since_mark`: `/stats`' `storm_since_mark` `{mark, attempt_lag, handshakes_precomputed, handshakes_inline}`. `gwloss.sh` waits up to 120s (wall clock, #103) before the kill until `precompute.pending` is 0 and `precompute.ready` equals `online`, and records `precompute_at_kill`. **New check in both phases:** `<phase>_storm_real`: `ready == online` at the kill, `attempt_lag.n` ≥ the population, `attempt_lag.p99_ms` ≤ `GWLOSS_LAG_P99_MS` (default 100). `b_stress_back` keeps its rule (every victim back within the wait, no rejects at capacity); its relogin distribution is the measurement (b-stress has no SLO) once `b_stress_storm_real` passes. `loadgen_bound` stays recorded (loadgen's CPU in the storm's first 30s) as data, no longer the run's verdict. Detection (mark → loss noticed) is recorded as now and not gated: it includes the dying gateway's own socket teardown, which production has too.
-108. **b_stress's CPU sets.** `GWLOSS_STRESS_CPUS_LOADGEN` (default `0-5,12-17`, 12 CPUs) and `GWLOSS_STRESS_CPUS_GATEWAY` (default `6-9,18-21`, 8 CPUs), with `STACK_GATEWAY_PROCS=4` so each gateway keeps 4 `GOMAXPROCS` (without it #79 would give 8 / 3 = 2). Logic and Redis keep `10,11,22,23`. b1 keeps #71's sets. The `pinning` check runs in every phase, renamed `<phase>_pinning`, because b_stress's sets differ. 4 + 4 survivor procs fit the 8 gateway CPUs exactly; the victim runs alone in the ramp (1.7 cores in run 24). If the user's `lscpu -e` shows the fast cores elsewhere, the defaults change before the run, not the mechanism.
+106. **Loadgen prepares what a phone already holds** (`-precompute`, sdk mode only). Every SDK client keeps its last token and reuses it until a `refresh` (with or without `-precompute`; amended in review (M2): `Runner.token` used to sign one per attempt, which a phone does not, and which cost ~1 core at the storm's retry rate). When an SDK client logs in, it is queued (a channel sized to `Clients`, so `OnEvent` never blocks) for one of `max(1, GOMAXPROCS/2)` workers, which runs `wire.Initiate` for the pinned key. The client's next attempt takes it: `Config.Initiate` swaps the prepared first message out, or computes one inline when there is none. Preparing stops at the first mark (`Runner.Mark`, which `/kill` also calls). Retries after the storm's first attempt compute inline (counted): expect more inline handshakes than precomputed ones in b_stress, since the survivors' handshake limit refuses much of a 30k/s storm (run 21: 180k `handshake_rate` refusals for b1's 200k victims at ~10k/s), so the saving below holds for first attempts only (review I2). Per first attempt this moves the ephemeral key and `es` off the storm: on the dev machine `wire.Initiate` costs 281µs and `Finish` 153µs, so the storm's client-side handshake cost falls to about a third. The server sees the same bytes. **SDK:** `Config.Initiate func(keyID uint16, serverPub []byte) (*wire.Initiator, []byte, error)`, nil by default; `wire.ClientHandshakeWith` and `clientconn.Conn.HandshakeWith` run a handshake from a first message made earlier. Rejected: an in-flight handshake cap (a throttle: the user's decision); precomputing only the ephemeral key (`noise.Config.EphemeralKeypair`), which saves one X25519 of three; a shared pool refilled during the storm (spends the storm's CPU).
+107. **Loadgen's lags and `<phase>_storm_real`.** Both lags are loadgen's own (amended in review (I1, I2): the proposal took the attempt lag at the first write, after the TCP connect, so a survivor's full accept queue (a SYN resent after 1s) would have marked the storm invalid and pointed at loadgen; and it stopped at the first message, missing `Finish` and the Login's seal, which a late loadgen turns into the survivors' `auth_timeout`). **`attempt_lag`:** the SDK client stores `due = now + Wait.D` on every `EventWaiting`; the next `EventConnecting` (same run loop, when the wait's timer fires and the attempt starts) records `now − due` and clears `due`. **`reply_lag`:** loadgen's `Dial` wraps the connection; it stamps every `Read`'s return, and its second `Write` (the Login frame, after the handshake frame) records `now − last read`. The recorder keeps both and the handshake counts (`handshakes_precomputed`, `handshakes_inline`) since the latest mark, like `backoff_since_mark`: `/stats`' `storm_since_mark` `{mark, attempt_lag, reply_lag, handshakes_precomputed, handshakes_inline}`. `gwloss.sh` waits up to 120s (wall clock, #103) before the kill until `precompute.pending` is 0 and `precompute.ready` equals `online`, and records `precompute_at_kill`. **New check in both phases:** `<phase>_storm_real`: `ready == online` at the kill, `attempt_lag.n` and `reply_lag.n` ≥ the population, and both `p99_ms` ≤ `GWLOSS_LAG_P99_MS` (default 100). The survivors' `auth_timeout` and `handshake_timeout` rejects and listen overflows stay recorded (they can be the gateways'). `b_stress_back` keeps its rule (every victim back within the wait, no rejects at capacity); its relogin distribution is the measurement (b-stress has no SLO) once `b_stress_storm_real` passes. `loadgen_bound` stays recorded (loadgen's CPU in the storm's first 30s) as data, no longer the run's verdict. Detection (mark → loss noticed) is recorded as now and not gated: it includes the dying gateway's own socket teardown, which production has too.
+108. **b_stress's CPU sets.** `GWLOSS_STRESS_CPUS_LOADGEN` (12 CPUs), `GWLOSS_STRESS_CPUS_GATEWAY` and `GWLOSS_STRESS_CPUS_LOGIC` (Logic + Redis), with `STACK_GATEWAY_PROCS=4` so each gateway keeps 4 `GOMAXPROCS` (#79 would otherwise divide the set by 3). b1 keeps #71's sets. The `pinning` check runs in every phase, renamed `<phase>_pinning`, because b_stress's sets differ. The victim runs alone in the ramp (1.7 cores in run 24). **The defaults are chosen before Task 3 from the host's `lscpu -e=CPU,CORE,MAXMHZ`** (the user, review I4, 2026-10-14: the host may mix fast and compact cores). The candidates:
+     - **A** (the proposal): loadgen `0-5,12-17`, gateways `6-9,18-21` (8 CPUs: each survivor's 4 procs on 2 physical cores, a third less than runs 22–24's 3), Logic + Redis `10,11,22,23`.
+     - **B** (review I4): loadgen `0-5,12-17`, gateways `6-10,18-22` (10 CPUs), Logic + Redis `11,23` (one core: they used 0.10 + 0.03 cores in run 22's b_stress storm and ~0.45 + 0.07 in b1's ramp at 5,000 logins/s).
+     Task 3 Step 1's code carries A's sets as placeholders; the executor replaces them, and #108's text, with the chosen sets before running it.
 
 If `<phase>_storm_real` fails on the host after this plan, the next step is a second machine for loadgen, or 6d's cloud target, not a throttle (the user, 2026-10-14).
 
@@ -57,8 +61,8 @@ If `<phase>_storm_real` fails on the host after this plan, the next step is a se
 | `internal/sdk/attempt.go` | `login` calls `cfg.Initiate`, then `HandshakeWith` |
 | `internal/sdk/client_test.go` | `TestInitiateMakesTheAttemptsHandshakeFrame` |
 | `internal/loadgen/precompute.go` (new) | `precomputer`, `prepared`, `Runner.prepare` |
-| `internal/loadgen/sdkclient.go` | prepared token and frame, `due`, `lagConn` |
-| `internal/loadgen/recorder.go` | `AttemptLag`, `Handshake`, `StormCount`, `Counts.StormSinceMark` |
+| `internal/loadgen/sdkclient.go` | cached token, prepared frame, `due`, `replyConn` |
+| `internal/loadgen/recorder.go` | `AttemptLag`, `ReplyLag`, `Handshake`, `StormCount`, `Counts.StormSinceMark` |
 | `internal/loadgen/runner.go` | `Config.Precompute`, `Stats.Precompute`, workers in `Run`, stop in `Mark` |
 | `internal/loadgen/recorder_test.go`, `runner_test.go`, `e2e_test.go` | tests |
 | `cmd/loadgen/main.go`, `main_test.go` | `-precompute` |
@@ -324,29 +328,31 @@ git commit -m "feat(sdk): Config.Initiate hands an attempt a first handshake mes
 
 **Interfaces:**
 - Consumes: Task 1's `sdk.Config.Initiate`, `wire.Initiate`.
-- Produces: `Config.Precompute bool`; `Stats.Precompute *PrecomputeStats` (`/stats`' `precompute` `{pending, ready, stopped}`, absent without `-precompute`); `Counts.StormSinceMark StormCount` (`/stats`' `storm_since_mark` `{mark, attempt_lag, handshakes_precomputed, handshakes_inline}`, `attempt_lag` a `Dist` in ms); `-precompute` flag.
+- Produces: `Config.Precompute bool`; `Stats.Precompute *PrecomputeStats` (`/stats`' `precompute` `{pending, ready, stopped}`, absent without `-precompute`); `Counts.StormSinceMark StormCount` (`/stats`' `storm_since_mark` `{mark, attempt_lag, reply_lag, handshakes_precomputed, handshakes_inline}`, the lags `Dist`s in ms); `-precompute` flag.
 
 - [ ] **Step 1: Write the failing recorder test**
 
 Append to `internal/loadgen/recorder_test.go`:
 
 ```go
-// #107: the storm's attempt lag and handshake counts restart at each mark;
-// a negative lag (a wall-clock step) counts as 0.
+// #107: the storm's lags and handshake counts restart at each mark; a
+// negative lag (a wall-clock step) counts as 0.
 func TestRecorderCountsTheStormSinceMark(t *testing.T) {
 	r := NewRecorder(2, []string{"gw-0"})
 	r.AttemptLag(5 * time.Second) // the ramp's: before any mark
+	r.ReplyLag(5 * time.Second)
 	r.Handshake(false)
 	if _, err := r.Mark("death", 0, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	r.AttemptLag(120 * time.Millisecond)
 	r.AttemptLag(-time.Millisecond)
+	r.ReplyLag(3 * time.Millisecond)
 	r.Handshake(true)
 	r.Handshake(false)
 	r.Handshake(false)
 	s := r.Counts().StormSinceMark
-	if s.Mark != "death" || s.AttemptLag.N != 2 || s.AttemptLag.Max != 120 ||
+	if s.Mark != "death" || s.AttemptLag.N != 2 || s.AttemptLag.Max != 120 || s.ReplyLag.N != 1 || s.ReplyLag.Max != 3 ||
 		s.HandshakesPrecomputed != 1 || s.HandshakesInline != 2 {
 		t.Fatalf("storm since mark %+v", s)
 	}
@@ -366,25 +372,34 @@ Add to `Recorder`, after `since`:
 
 ```go
 	lag            *hist      // attempt lag since the latest mark, ms (#107)
-	storm          StormCount // since the latest mark; AttemptLag filled by Counts
+	reply          *hist      // reply lag since the latest mark, ms (#107)
+	storm          StormCount // since the latest mark; the lags filled by Counts
 ```
 
-In `NewRecorder`, add `lag: newHist(),` to the literal.
+In `NewRecorder`, add `lag: newHist(), reply: newHist(),` to the literal.
 
 In `Mark`, after `r.since = BackoffCount{Mark: name, Waits: map[string]int64{}}`:
 
 ```go
-	r.lag, r.storm = newHist(), StormCount{Mark: name}
+	r.lag, r.reply, r.storm = newHist(), newHist(), StormCount{Mark: name}
 ```
 
 After `Backoff`:
 
 ```go
-// AttemptLag: an attempt wrote its handshake frame lag after its wait's end
-// (#107). A negative lag, from a wall-clock step, counts as 0.
+// AttemptLag: an attempt started lag after its wait's end (#107). A
+// negative lag counts as 0.
 func (r *Recorder) AttemptLag(lag time.Duration) {
 	r.mu.Lock()
 	r.lag.add(max(lag, 0).Milliseconds())
+	r.mu.Unlock()
+}
+
+// ReplyLag: a client wrote its Login frame lag after reading the server's
+// handshake reply (#107). A negative lag, from a wall-clock step, counts as 0.
+func (r *Recorder) ReplyLag(lag time.Duration) {
+	r.mu.Lock()
+	r.reply.add(max(lag, 0).Milliseconds())
 	r.mu.Unlock()
 }
 
@@ -411,12 +426,14 @@ After `BackoffCount`:
 
 ```go
 // StormCount is the attempts since mark Mark ("": the run's start): how late
-// each wrote its handshake frame after its wait's end (AttemptLag, ms; an
-// attempt with no wait, such as the first, is not in it), and whether that
-// frame was made ahead of time or when it dialed (#106, #107).
+// each started after its wait's end (AttemptLag, ms; an attempt with no wait,
+// such as the first, is not in it), how long each handshake took from the
+// server's reply to the Login frame (ReplyLag, ms), and whether its first
+// message was made ahead of time or when it dialed (#106, #107).
 type StormCount struct {
 	Mark                  string `json:"mark"`
 	AttemptLag            Dist   `json:"attempt_lag"`
+	ReplyLag              Dist   `json:"reply_lag"`
 	HandshakesPrecomputed int64  `json:"handshakes_precomputed"`
 	HandshakesInline      int64  `json:"handshakes_inline"`
 }
@@ -426,6 +443,7 @@ In `Counts()`, add `StormSinceMark: r.storm,` to the literal, and before `return
 
 ```go
 	c.StormSinceMark.AttemptLag = r.lag.dist(r.lag.n)
+	c.StormSinceMark.ReplyLag = r.reply.dist(r.reply.n)
 ```
 
 - [ ] **Step 4: Run the recorder tests**
@@ -454,10 +472,10 @@ Add `time` to `runner_test.go`'s imports (it imports only `strings` and `testing
 Append to `internal/loadgen/e2e_test.go`:
 
 ```go
-// #106, #107: with Precompute every logged-in client holds its next token
-// and handshake frame before the mark; each victim's first attempt after it
-// uses its own once, nobody prepares after the mark, and every attempt after
-// a wait records its lag.
+// #106, #107: with Precompute every logged-in client holds its next
+// handshake frame before the mark; each victim's first attempt after it uses
+// its own once, nobody prepares after the mark, every attempt after a wait
+// records its lag and every handshake its reply lag.
 func TestSDKStormUsesPrecomputedHandshakes(t *testing.T) {
 	env, stopGW := startStack(t, 2)
 	r, err := New(Config{Mode: "sdk", Clients: 30, Rate: 300, UIDPrefix: "pre", Precompute: true}, env)
@@ -480,7 +498,8 @@ func TestSDKStormUsesPrecomputedHandshakes(t *testing.T) {
 	waitFor(t, "all back", 10*time.Second, func() bool { s, _ := r.Recorder().SLO("death", time.Second); return s.Back == 15 })
 	st := r.Stats()
 	s := st.StormSinceMark
-	if s.Mark != "death" || s.HandshakesPrecomputed != 15 || s.AttemptLag.N < 15 || s.AttemptLag.Max > 1000 {
+	if s.Mark != "death" || s.HandshakesPrecomputed != 15 || s.AttemptLag.N < 15 || s.AttemptLag.Max > 1000 ||
+		s.ReplyLag.N < 15 || s.ReplyLag.Max > 1000 {
 		t.Fatalf("storm since mark %+v", s)
 	}
 	if !st.Precompute.Stopped || st.Precompute.Ready != 15 {
@@ -517,11 +536,10 @@ import (
 	"github.com/Tallinzp/goim/internal/wire"
 )
 
-// prepared is what a phone already holds when its connection drops: a token
-// from its cache and, made by its own CPU, the first handshake message
-// (#106). One serves one attempt.
+// prepared is what a phone's own CPU has made when its connection drops:
+// the first handshake message (#106; its token is the client's cached one).
+// One serves one attempt.
 type prepared struct {
-	tok   string
 	in    *wire.Initiator
 	frame []byte
 }
@@ -541,7 +559,7 @@ type precomputer struct {
 // PrecomputeStats is /stats' precompute (#106).
 type PrecomputeStats struct {
 	Pending int64 `json:"pending"` // logged-in clients queued or being prepared
-	Ready   int64 `json:"ready"`   // clients holding a prepared token and handshake
+	Ready   int64 `json:"ready"`   // clients holding a prepared handshake
 	Stopped bool  `json:"stopped"` // a mark was taken: no more are prepared
 }
 
@@ -568,7 +586,7 @@ func (p *precomputer) run(ctx context.Context) {
 		case sc := <-p.q:
 			sc.queued.Store(false)
 			if !p.stopped.Load() && sc.pre.Load() == nil {
-				if pr, err := p.r.prepare(sc.i); err == nil && sc.pre.CompareAndSwap(nil, pr) {
+				if pr, err := p.r.prepare(); err == nil && sc.pre.CompareAndSwap(nil, pr) {
 					p.ready.Add(1)
 				}
 			}
@@ -590,21 +608,17 @@ func (p *precomputer) stats() *PrecomputeStats {
 	return &PrecomputeStats{Pending: p.pending.Load(), Ready: p.ready.Load(), Stopped: p.stopped.Load()}
 }
 
-// prepare signs client i's next token and makes its first handshake message.
-func (r *Runner) prepare(i int) (*prepared, error) {
-	tok, err := r.token(i)
-	if err != nil {
-		return nil, err
-	}
+// prepare makes a client's next first handshake message.
+func (r *Runner) prepare() (*prepared, error) {
 	in, frame, err := wire.Initiate(r.env.NoiseKeyID, r.env.NoisePublic, uint16(clientpb.Cmd_CMD_HANDSHAKE))
 	if err != nil {
 		return nil, err
 	}
-	return &prepared{tok: tok, in: in, frame: frame}, nil
+	return &prepared{in: in, frame: frame}, nil
 }
 ```
 
-- [ ] **Step 8: The SDK client: prepared attempts, `due`, `lagConn`**
+- [ ] **Step 8: The SDK client: cached token, prepared attempts, `due`, `replyConn`**
 
 Replace `internal/loadgen/sdkclient.go` with:
 
@@ -627,12 +641,13 @@ import (
 type sdkClient struct {
 	r      *Runner
 	i      int
-	gw     atomic.Int32               // gateway of the last dial
-	due    atomic.Int64               // unix ns the next attempt is due (its wait's end); 0: no wait (#107)
-	pre    atomic.Pointer[prepared]   // the next attempt's token and first message (#106)
-	queued atomic.Bool                // waiting for a precompute worker
-	start  time.Time                  // the current attempt's start; run loop only
-	online bool                       // run loop only
+	gw     atomic.Int32             // gateway of the last dial
+	tok    atomic.Pointer[string]   // the last token, reused until a refresh (spec: Client SDK rules)
+	pre    atomic.Pointer[prepared] // the next attempt's first message (#106)
+	queued atomic.Bool              // waiting for a precompute worker
+	due    time.Time                // the next attempt's due time (its wait's end), zero: no wait (#107); run loop only
+	start  time.Time                // the current attempt's start; run loop only
+	online bool                     // run loop only
 }
 
 func (r *Runner) newSDK(i int) (*sdk.Client, error) {
@@ -640,10 +655,14 @@ func (r *Runner) newSDK(i int) (*sdk.Client, error) {
 	return sdk.New(sdk.Config{Addrs: []string{"balancer"}, KeyID: r.env.NoiseKeyID, ServerKey: r.env.NoisePublic,
 		AppID: AppID, Platform: clientpb.Platform_PLATFORM_MOBILE,
 		Token: func(_ context.Context, refresh bool) (string, error) {
-			if pr := sc.pre.Load(); pr != nil && !refresh {
-				return pr.tok, nil // a phone's cached token (#106)
+			if t := sc.tok.Load(); t != nil && !refresh {
+				return *t, nil // a phone's cached token
 			}
-			return r.token(i)
+			t, err := r.token(i)
+			if err == nil {
+				sc.tok.Store(&t)
+			}
+			return t, err
 		},
 		Store: &sdk.MemStore{}, OnEvent: sc.event, Windows: r.cfg.windows,
 		Dial: func(ctx context.Context, _ string) (net.Conn, error) {
@@ -652,7 +671,7 @@ func (r *Runner) newSDK(i int) (*sdk.Client, error) {
 				return nil, err
 			}
 			sc.gw.Store(int32(gw))
-			return &lagConn{Conn: nc, sc: sc}, nil
+			return &replyConn{Conn: nc, rec: r.rec}, nil
 		},
 		Initiate: func(keyID uint16, pub []byte) (*wire.Initiator, []byte, error) {
 			if r.pre != nil {
@@ -672,12 +691,13 @@ func (sc *sdkClient) event(e sdk.Event) {
 	if e.Kind == sdk.EventWaiting && (e.Wait.Kind == sdk.WaitBackoff || e.Wait.Kind == sdk.WaitFailure) {
 		sc.r.rec.Backoff(sc.i, e.Wait.Kind.String())
 	}
-	if e.Kind == sdk.EventWaiting {
-		sc.due.Store(now.Add(e.Wait.D).UnixNano())
-	}
 	switch e.Kind {
 	case sdk.EventConnecting:
 		sc.start = now
+		if !sc.due.IsZero() { // how late loadgen starts the attempt (#107)
+			sc.r.rec.AttemptLag(now.Sub(sc.due))
+			sc.due = time.Time{}
+		}
 	case sdk.EventOnline:
 		sc.online = true
 		sc.r.rec.Online(sc.i, int(sc.gw.Load()), sc.start, now)
@@ -685,6 +705,9 @@ func (sc *sdkClient) event(e sdk.Event) {
 			sc.r.pre.enqueue(sc)
 		}
 	case sdk.EventWaiting, sdk.EventIdle, sdk.EventLoginRequired:
+		if e.Kind == sdk.EventWaiting {
+			sc.due = now.Add(e.Wait.D)
+		}
 		switch {
 		case sc.online:
 			sc.online = false
@@ -695,18 +718,26 @@ func (sc *sdkClient) event(e sdk.Event) {
 	}
 }
 
-// lagConn records, at an attempt's first write (its handshake frame), how
-// late the attempt is against its wait's end (#107).
-type lagConn struct {
+// replyConn records how long the client took from the read that completed
+// the server's handshake reply to its Login frame, its second write: Finish
+// and the Login's seal, on loadgen's CPU (#107).
+type replyConn struct {
 	net.Conn
-	sc    *sdkClient
-	wrote atomic.Bool
+	rec    *Recorder
+	read   atomic.Int64 // unix ns the latest Read returned
+	writes atomic.Int32
 }
 
-func (c *lagConn) Write(b []byte) (int, error) {
-	if c.wrote.CompareAndSwap(false, true) {
-		if due := c.sc.due.Swap(0); due != 0 {
-			c.sc.r.rec.AttemptLag(time.Duration(time.Now().UnixNano() - due))
+func (c *replyConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	c.read.Store(time.Now().UnixNano())
+	return n, err
+}
+
+func (c *replyConn) Write(b []byte) (int, error) {
+	if c.writes.Add(1) == 2 {
+		if at := c.read.Load(); at != 0 {
+			c.rec.ReplyLag(time.Duration(time.Now().UnixNano() - at))
 		}
 	}
 	return c.Conn.Write(b)
@@ -720,7 +751,7 @@ In `internal/loadgen/runner.go`:
 Add to `Config` after `Down`:
 
 ```go
-	Precompute bool         // sdk: prepare each logged-in client's next token and handshake until the first mark (#106)
+	Precompute bool         // sdk: prepare each logged-in client's next handshake until the first mark (#106)
 ```
 
 Add to `Stats` after `ElapsedS`:
@@ -779,7 +810,7 @@ In `Stats`, before `return s`:
 In `cmd/loadgen/main.go`, after the `-down` flag:
 
 ```go
-	fs.BoolVar(&cfg.Precompute, "precompute", false, "sdk: prepare each logged-in client's next token and handshake until the first mark (#106)")
+	fs.BoolVar(&cfg.Precompute, "precompute", false, "sdk: prepare each logged-in client's next handshake until the first mark (#106)")
 ```
 
 - [ ] **Step 10: Run the tests**
@@ -810,7 +841,11 @@ git commit -m "feat(loadgen): -precompute prepares what a phone holds before the
 
 **Interfaces:**
 - Consumes: Task 2's `-precompute`, `/stats`' `precompute` and `storm_since_mark`.
-- Produces: checks `<phase>_storm_real` and `<phase>_pinning` (replaces `pinning`); the phase field's `precompute_at_kill` and `storm`; knobs `GWLOSS_LAG_P99_MS`, `GWLOSS_STRESS_CPUS_LOADGEN`, `GWLOSS_STRESS_CPUS_GATEWAY`; 28 checks in all.
+- Produces: checks `<phase>_storm_real` and `<phase>_pinning` (replaces `pinning`); the phase field's `precompute_at_kill` and `storm`; knobs `GWLOSS_LAG_P99_MS`, `GWLOSS_STRESS_CPUS_LOADGEN`, `GWLOSS_STRESS_CPUS_GATEWAY`, `GWLOSS_STRESS_CPUS_LOGIC`; 29 checks in all (today's 26 are 12 per phase, `pinning` and `artifacts`; this adds two `<phase>_storm_real` and makes `pinning` one per phase, review M1).
+
+- [ ] **Step 0: Choose b_stress's CPU sets (#108, the user)**
+
+Ask the user for the Tier 2 host's `lscpu -e=CPU,CORE,MAXMHZ` and which of #108's candidates (A, B, or another) to use. Put the chosen sets into Step 1's `b_stress)` defaults, Step 5's header, #108's text and Step 6's expectations in place of candidate A's placeholders.
 
 - [ ] **Step 1: Per-phase CPU sets**
 
@@ -819,7 +854,7 @@ Before the phase loop (`for name in $PHASES; do`), add:
 ```bash
 # b1 keeps #71's CPU sets; b_stress gives loadgen the CPUs its storm left
 # idle (#108).
-cpus_gateway=$T2_CPUS_GATEWAY cpus_loadgen=$T2_CPUS_LOADGEN
+cpus_gateway=$T2_CPUS_GATEWAY cpus_loadgen=$T2_CPUS_LOADGEN cpus_logic=$T2_CPUS_LOGIC
 lag_max=${GWLOSS_LAG_P99_MS:-100}
 ```
 
@@ -828,16 +863,18 @@ Delete the global `LG_CPUS=$(t2_cpulist_expand "$T2_CPUS_LOADGEN" | wc -w)` line
 In the `b1)` case, add after `export STACK_GATEWAYS=2`:
 
 ```bash
-      export T2_CPUS_GATEWAY=$cpus_gateway T2_CPUS_LOADGEN=$cpus_loadgen
+      export T2_CPUS_GATEWAY=$cpus_gateway T2_CPUS_LOADGEN=$cpus_loadgen T2_CPUS_LOGIC=$cpus_logic
       unset STACK_GATEWAY_PROCS
 ```
 
 In the `b_stress)` case, add after `export STACK_GATEWAYS=3`:
 
 ```bash
-      # #108: loadgen 12 CPUs; the gateways 8, at 4 GOMAXPROCS each as before
+      # #108: loadgen 12 CPUs; the gateways at 4 GOMAXPROCS each as before
       # (the victim alone in the ramp, the two survivors after the kill).
+      # Defaults: candidate A's placeholders until Step 0's choice.
       export T2_CPUS_GATEWAY=${GWLOSS_STRESS_CPUS_GATEWAY:-6-9,18-21} T2_CPUS_LOADGEN=${GWLOSS_STRESS_CPUS_LOADGEN:-0-5,12-17}
+      export T2_CPUS_LOGIC=${GWLOSS_STRESS_CPUS_LOGIC:-10,11,22,23}
       export STACK_GATEWAY_PROCS=4
 ```
 
@@ -863,7 +900,7 @@ Replace the pinning block (`if [ -n "$first" ]; then` … `fi`, ~lines 276–284
   for n in logic redis; do stack_pinned "$n" "$T2_CPUS_LOGIC" || wrong+=" $n"; done
   have=$(taskset -pc "$LG_PID" 2>/dev/null)
   [ "$(t2_cpulist_expand "${have##*: }")" = "$(t2_cpulist_expand "$T2_CPUS_LOADGEN")" ] || wrong+=" loadgen"
-  t2_check "${name}_pinning" "$(t2_bool [ -z "$wrong" ])" "\"gateway_cpus\": $(t2_json_str "$T2_CPUS_GATEWAY"), \"loadgen_cpus\": $(t2_json_str "$T2_CPUS_LOADGEN"), \"gateway_procs\": $(. "$STACK_DIR/stack.env"; echo "$GATEWAY_PROCS"), \"wrong\": $(t2_json_str "${wrong# }")"
+  t2_check "${name}_pinning" "$(t2_bool [ -z "$wrong" ])" "\"gateway_cpus\": $(t2_json_str "$T2_CPUS_GATEWAY"), \"logic_cpus\": $(t2_json_str "$T2_CPUS_LOGIC"), \"loadgen_cpus\": $(t2_json_str "$T2_CPUS_LOADGEN"), \"gateway_procs\": $(. "$STACK_DIR/stack.env"; echo "$GATEWAY_PROCS"), \"wrong\": $(t2_json_str "${wrong# }")"
 ```
 
 `usage_ok` (~line 198) reads `LG_CPUS` when called, so the per-phase value from Step 1 reaches `<phase>_loadgen_headroom` and `loadgen_bound`.
@@ -873,7 +910,7 @@ Replace the pinning block (`if [ -n "$first" ]; then` … `fi`, ~lines 276–284
 Just before `stack_snapshot before` (the storm's start), add the wait below. Without `-precompute` (the dry run's negative case) `/stats` has no `precompute`; the reads use `.get` so they print `null` instead of failing, the wait gives up after 120s, and Step 4's check fails on `ready` null.
 
 ```bash
-  # #107: every logged-in client holds its next token and handshake frame at
+  # #107: every logged-in client holds its next handshake frame at
   # the kill, so the storm's first attempts are the spec's, not loadgen's.
   # Wall clock (#103).
   t=$SECONDS
@@ -890,11 +927,12 @@ After the `<phase>_cross_check` check, add:
 
 ```bash
   # #107: the storm was the spec's: every logged-in client was prepared at
-  # the kill, and the attempts after it wrote their handshake frames within
-  # GWLOSS_LAG_P99_MS of their waits' ends. b-stress has no SLO; its relogin
-  # distribution is the measurement only when this passes.
+  # the kill, and after it loadgen started each attempt and answered each
+  # handshake reply within GWLOSS_LAG_P99_MS (p99; loadgen's own lags only,
+  # review I1/I2). b-stress has no SLO; its relogin distribution is the
+  # measurement only when this passes.
   storm_d=$(lg_get /stats 'd["storm_since_mark"]')
-  t2_check "${name}_storm_real" "$(echo "{\"s\": $storm_d, \"p\": $precompute, \"pop\": $pop}" | lg_true - 'd["p"]["ready"] is not None and d["p"]["ready"] == d["p"]["online"] and d["s"]["attempt_lag"]["n"] >= d["pop"] and d["s"]["attempt_lag"]["p99_ms"] <= '"$lag_max")" \
+  t2_check "${name}_storm_real" "$(echo "{\"s\": $storm_d, \"p\": $precompute, \"pop\": $pop}" | lg_true - 'd["p"]["ready"] is not None and d["p"]["ready"] == d["p"]["online"] and all(d["s"][k]["n"] >= d["pop"] and d["s"][k]["p99_ms"] <= '"$lag_max"' for k in ("attempt_lag", "reply_lag"))')" \
     "\"lag_p99_max_ms\": $lag_max, \"precompute_at_kill\": $precompute, \"storm\": $storm_d"
 ```
 
@@ -913,6 +951,8 @@ In the header's knobs, add:
 #   GWLOSS_STRESS_CPUS_LOADGEN  b_stress: loadgen's CPU set (default 0-5,12-17, #108)
 #   GWLOSS_STRESS_CPUS_GATEWAY  b_stress: the gateways' CPU set (default 6-9,18-21,
 #                      4 GOMAXPROCS each, #108)
+#   GWLOSS_STRESS_CPUS_LOGIC  b_stress: Logic + Redis's CPU set (default
+#                      10,11,22,23, #108)
 ```
 
 Replace the `pinning` line of the checks with:
@@ -933,11 +973,12 @@ Add after `b1_cross_check`'s entry:
 
 ```bash
 #   b1_storm_real      the storm was the spec's, not loadgen's (#106, #107):
-#                      every logged-in client held its next token and
-#                      handshake frame at the kill (loadgen -precompute), and
-#                      the attempts after the kill wrote their handshake
-#                      frames within GWLOSS_LAG_P99_MS of their waits' ends
-#                      (p99), at least one attempt per relogin
+#                      every logged-in client held its next handshake frame
+#                      at the kill (loadgen -precompute); after the kill,
+#                      loadgen started each attempt within GWLOSS_LAG_P99_MS
+#                      of its wait's end and wrote each Login frame within
+#                      GWLOSS_LAG_P99_MS of the handshake reply (both p99,
+#                      at least one per relogin)
 ```
 
 In `b1_loadgen_headroom`'s entry, replace "and records the first 30s as loadgen_bound" with "and records the first 30s as loadgen_bound (data; b_stress_storm_real decides, #107)".
@@ -951,12 +992,12 @@ Dry run on the dev machine as in 6b2a-stress Task 4 Step 2 (the `D=$(mktemp -d)`
 
 ```bash
 GOIM_TEST_TIER=2 T2_CPUS_GATEWAY=1 T2_CPUS_LOGIC=0 T2_CPUS_LOADGEN=0-1 \
-  GWLOSS_STRESS_CPUS_GATEWAY=1 GWLOSS_STRESS_CPUS_LOADGEN=0-1 \
+  GWLOSS_STRESS_CPUS_GATEWAY=1 GWLOSS_STRESS_CPUS_LOADGEN=0-1 GWLOSS_STRESS_CPUS_LOGIC=0 \
   GWLOSS_CLIENTS=2000 GWLOSS_RATE=500 GWLOSS_CAP=5000 \
   GWLOSS_STRESS_CLIENTS=1500 GWLOSS_STRESS_RATE=500 GWLOSS_STRESS_CAP=5000 bash "$D/gwloss.sh"; echo "exit $?"
 ```
 
-Expected: 28 checks; all pass except possibly the two swap checks (the dev machine). `b1_storm_real` and `b_stress_storm_real` show `precompute_at_kill.ready` = `online` (2000, 1500), `storm.handshakes_precomputed` = the population (1000, 1500), `attempt_lag.n` ≥ the population, p99 well under 100ms. `b_stress_pinning` shows `gateway_procs` 4.
+Expected: 29 checks; all pass except possibly the two swap checks (the dev machine). `b1_storm_real` and `b_stress_storm_real` show `precompute_at_kill.ready` = `online` (2000, 1500), `storm.handshakes_precomputed` = the population (1000, 1500), `attempt_lag.n` and `reply_lag.n` ≥ the population, both p99 well under 100ms. `b_stress_pinning` shows `gateway_procs` 4.
 
 Then the negative case, b1 only: `GWLOSS_PHASES=b1 GWLOSS_DRY_NO_PRECOMPUTE=1 … bash "$D/gwloss.sh"`. Expected: `b1_storm_real` fails with `precompute_at_kill.ready` null after `wait_s` ≈ 120. Remove the dry runs' `tier2-results/gwloss-*` and `$D`.
 
@@ -972,10 +1013,10 @@ git push
 
 - [ ] **Step 8: Tier 2 run 25 (the user, on the host)**
 
-Host prep as for run 24 (services stopped, `vm.swappiness=1`, swap emptied, desktop off), then `GOIM_TEST_TIER=2 make test-tier2 SCENARIO=gwloss`. Before it, the user runs `lscpu -e=CPU,CORE,MAXMHZ` once, so the plan's CPU sets can be checked against the host's fast and compact cores (#108). Expected: 28/28. What to read: `b_stress_storm_real` (`attempt_lag` p99, `handshakes_precomputed` vs `handshakes_inline`), `b_stress_back`'s `back_s` and relogin distribution, the survivors' `handshake_rate`, `handshake_timeout` and `pending_mem` rejects (the herd the survivors' guards now meet), loadgen's `storm_first30` cores on 12 CPUs, `no_swap_in_b_stress`. If `b_stress_storm_real` fails, the host cannot make the storm: the next step is a second machine for loadgen (the user's decision, not a throttle).
+Host prep as for run 24 (services stopped, `vm.swappiness=1`, swap emptied, desktop off), then `GOIM_TEST_TIER=2 make test-tier2 SCENARIO=gwloss`. No host change beyond run 24's (review I3: the BIOS UMA reservation stays). Expected: 29/29, though `no_swap_in_b_stress` may fail for the host's memory as in runs 23–24 (it stays fatal; memory is decided after this run). What to read: `b_stress_storm_real` (`attempt_lag` and `reply_lag` p99, `handshakes_precomputed` vs `handshakes_inline`: expect more inline, from the survivors' handshake-limit retries), `b_stress_back`'s `back_s` and relogin distribution, the survivors' `handshake_rate`, `handshake_timeout`, `auth_timeout` and `pending_mem` rejects and the storm's listen overflows (the herd the survivors' guards and accept path now meet), loadgen's `storm_first30` cores on 12 CPUs, loadgen's peak RSS against its 16GiB `GOMEMLIMIT`, `no_swap_in_b_stress`. b_stress's `cpu_sets`, clocks and `loadgen_headroom` now describe #108's sets, so they do not compare with runs 22–24's (review M3). If `b_stress_storm_real` fails, the host cannot make the storm: the next step is a second machine for loadgen (the user's decision, not a throttle).
 
 ## After this plan
 
-6b2a-stress is complete when run 25 passes 28/28; then the README's *Measured results* (both languages) get b-stress's real numbers, and `main` is fast-forwarded. 6b2b (b2 and slowed Logic) follows in a fresh session.
+6b2a-stress is complete when run 25 passes 29/29; then the README's *Measured results* (both languages) get b-stress's real numbers, and `main` is fast-forwarded. 6b2b (b2 and slowed Logic) follows in a fresh session.
 
 ## Execution Notes
