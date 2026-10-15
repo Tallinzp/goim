@@ -95,8 +95,8 @@
 #   b_stress_back      (b_stress only) loadgen SIGKILLs gw-0: every one of its
 #                      clients logs in again within GWLOSS_STRESS_BACK_WAIT, and
 #                      the survivors rejected none at capacity; no SLO.
-#                      Its relogin times are the measurement when
-#                      b_stress_storm_real passes (#107)
+#                      Its relogin times are the gateways' measurement when
+#                      b_stress_storm_real's lags_within is true (#107, #110)
 #   b1_kicks           Kick first attempts in the storm, sent or dropped by a
 #                      full queue (R5S-O2), are 0.9-1.1 per relogin (at least 0.9
 #                      per relogin whose entry the sweep had not deleted: such a
@@ -117,7 +117,10 @@
 #                      of its wait's end, wrote each handshake frame within
 #                      GWLOSS_LAG_P99_MS of its dial and each Login frame
 #                      within GWLOSS_LAG_P99_MS of the handshake reply (all
-#                      p99, at least one per relogin)
+#                      p99, at least one per relogin). b_stress_storm_real
+#                      bounds the lags only when its storm was not
+#                      loadgen_bound (#110: one host's loadgen is the bound in
+#                      the first 30s); lags_within records whether they held
 #   b1_lease           every survivor renews its lease every interval from
 #                      the kill to the sweep: no call failed or found the
 #                      lease missing, and Logic saw no renewal error
@@ -516,9 +519,17 @@ print(json.dumps(out))' "$STACK_DIR/artifacts/ss-storm.jsonl" 2>/dev/null || ech
   # relogin distribution is the measurement only when this passes. Detection (mark → loss noticed on the
   # client's run loop) is recorded beside the lags, not gated: it includes
   # the dying gateway's socket teardown, which production has too.
+  # b_stress's lags are bounded only when its storm was not loadgen-bound
+  # (#110): on one host, 600k SDK clients' first 30s take ~12 of loadgen's 14
+  # cores (the 6b2a-pinger run), so its lags measure loadgen, not the
+  # survivors. Preparation and one sample per relogin are always required;
+  # lags_within says whether the relogin times are the gateways'.
   storm_d=$(lg_get /stats 'd["storm_since_mark"]')
-  t2_check "${name}_storm_real" "$(echo "{\"s\": $storm_d, \"p\": $precompute, \"pop\": $pop}" | lg_true - 'd["p"]["ready"] is not None and d["p"]["ready"] == d["p"]["online"] and all(d["s"][k]["n"] >= d["pop"] and d["s"][k]["p99_ms"] <= '"$lag_max"' for k in ("attempt_lag", "connect_lag", "send_lag", "reply_lag"))')" \
-    "\"lag_p99_max_ms\": $lag_max, \"precompute_at_kill\": $precompute, \"storm\": $storm_d, \"detection\": $(lg_py "$slo" 'd["detection"]')"
+  lags_within=$(echo "{\"s\": $storm_d, \"pop\": $pop}" | lg_true - 'all(d["s"][k]["p99_ms"] <= '"$lag_max"' for k in ("attempt_lag", "connect_lag", "send_lag", "reply_lag"))')
+  real=$(echo "{\"s\": $storm_d, \"p\": $precompute, \"pop\": $pop}" | lg_true - 'd["p"]["ready"] is not None and d["p"]["ready"] == d["p"]["online"] and all(d["s"][k]["n"] >= d["pop"] for k in ("attempt_lag", "connect_lag", "send_lag", "reply_lag"))')
+  { [ "$lags_within" = true ] || { [ "$name" = b_stress ] && [ $loadgen_bound = true ]; }; } || real=false
+  t2_check "${name}_storm_real" "$real" \
+    "\"lag_p99_max_ms\": $lag_max, \"lags_within\": $lags_within, \"loadgen_bound\": $loadgen_bound, \"precompute_at_kill\": $precompute, \"storm\": $storm_d, \"detection\": $(lg_py "$slo" 'd["detection"]')"
   # One renewal per 10s interval (the gateway's -lease-interval default): the
   # window holds at least window_s / 10 - 1 whole intervals.
   t2_check "${name}_lease" "$(echo "{\"g\": $sv_d, \"l\": $logic_d, \"w\": $window_s}" | lg_true - 'all(v["lease_error"] == 0 and v["lease_missing"] == 0 and v["lease_live"] >= d["w"] // 10 - 1 for v in d["g"].values()) and d["l"]["lease_error"] == 0')" \
