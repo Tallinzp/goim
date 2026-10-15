@@ -57,3 +57,9 @@ The b_stress diagnostic run (`8ea8930`, `GWLOSS_SS_EVERY=10`) answers the decisi
 
 **Decision (2026-10-15, the user):** record the run and add `connect_lag` (connect → the dial's return, bounded in `<phase>_storm_real` like the other lags; #107 amended). #109 is decided after a b_stress run with it.
 
+## Follow-up (2026-10-15): the run with `connect_lag`
+
+The b_stress run with `connect_lag` (`0fe01ae`) measured the gap: `connect_lag` p50 8,922ms, p99 9,987ms (cut off at the SDK's 10s `ConnectTimeout`, so longer still), against the survivors' 5s. Loadgen's storm CPU profile shows it saturated (13.6 of 14 cores): X25519 43%, nearly all the inline first message; GC an estimated 20–25%; syscalls 19%. So O1's gate stands on the right premise after all: the survivors' `handshake_timeout` rejects are late frames from a saturated loadgen, the lateness lying in the dial, not in `send_lag`'s span. Details in the plan's *Execution Notes*.
+
+**Recommended (Claude, 2026-10-15), not yet decided:** #109's reuse (Tasks 2–3), then run 27.
+
