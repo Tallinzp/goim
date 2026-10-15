@@ -159,19 +159,21 @@ func loginReply(f clientconn.Frame) (resp *clientpb.LoginResp, e end, done bool)
 }
 
 // serve runs a logged-in connection until it ends: one Ping per heartbeat
-// interval, and a close when no frame arrives within PongTimeout of a Ping
-// (spec: Dead-server detection). Kick and Reconnect end it; the client
-// closes on Reconnect (R4H-O3). A LogoutResp ends it only after the client
-// sent Logout; any other one is reported as a note and ignored.
+// interval from a pinger, and a close when no frame arrives within
+// PongTimeout of a Ping (spec: Dead-server detection). Kick and Reconnect
+// end it; the client closes on Reconnect (R4H-O3). A LogoutResp ends it
+// only after the client sent Logout; any other one is reported as a note and
+// ignored.
 func (a *attempt) serve(ctx context.Context, cfg *Config, resp *clientpb.LoginResp, report func(attemptMsg) bool) end {
 	hb, _ := cfg.Heartbeat.Of(resp)
 	start := time.Now()
 	var lastRecv atomic.Int64 // ns since start of the last frame received
 	var pongTimedOut atomic.Bool
-	pctx, stopPing := context.WithCancel(ctx)
-	defer stopPing()
-	go a.ping(pctx, cfg, hb, start, &lastRecv, &pongTimedOut)
-	defer a.cc.Close()
+	p := startPinger(hb, cfg.PongTimeout, start, &lastRecv,
+		func(reqID uint32) error { return a.cc.Send(clientpb.Cmd_CMD_PING, reqID, nil) },
+		func() { pongTimedOut.Store(true); a.cc.Close() })
+	defer p.stop()
+	defer a.cc.Close() // before stop: a firing still in Send fails at once
 	for {
 		f, err := a.cc.Recv(time.Time{})
 		if err != nil {
@@ -195,47 +197,6 @@ func (a *attempt) serve(ctx context.Context, cfg *Config, resp *clientpb.LoginRe
 				return end{kind: endLogoutResp}
 			}
 			report(attemptMsg{a: a, note: errors.New("sdk: LogoutResp without a Logout")})
-		}
-	}
-}
-
-// ping sends a Ping every hb and closes the connection when no frame has
-// arrived within cfg.PongTimeout of the oldest Ping sent since the last
-// frame.
-func (a *attempt) ping(ctx context.Context, cfg *Config, hb time.Duration, start time.Time, lastRecv *atomic.Int64, timedOut *atomic.Bool) {
-	var reqID uint32 = 1
-	next := hb                      // next Ping, since start
-	unanswered := time.Duration(-1) // send time of the oldest Ping no frame has followed; -1: none
-	for {
-		at := next
-		if unanswered >= 0 {
-			at = min(at, unanswered+cfg.PongTimeout)
-		}
-		t := time.NewTimer(at - time.Since(start))
-		select {
-		case <-ctx.Done():
-			t.Stop()
-			return
-		case <-t.C:
-		}
-		now := time.Since(start)
-		if unanswered >= 0 && lastRecv.Load() >= int64(unanswered) {
-			unanswered = -1
-		}
-		if unanswered >= 0 && now >= unanswered+cfg.PongTimeout {
-			timedOut.Store(true)
-			a.cc.Close()
-			return
-		}
-		if now >= next {
-			reqID++
-			if a.cc.Send(clientpb.Cmd_CMD_PING, reqID, nil) != nil {
-				return // the reader sees the broken connection
-			}
-			if unanswered < 0 {
-				unanswered = now
-			}
-			next = now + hb
 		}
 	}
 }
