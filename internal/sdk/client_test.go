@@ -1,9 +1,11 @@
 package sdk
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
@@ -13,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Tallinzp/goim/api/clientpb"
+	"github.com/Tallinzp/goim/internal/wire"
 )
 
 var (
@@ -1177,4 +1180,53 @@ func TestLogoutAndSwitchAccountResetTheCountersAndTheBackoff(t *testing.T) {
 			})
 		})
 	}
+}
+
+// #106: Config.Initiate makes the attempt's first handshake frame, once per
+// attempt, and the gateway receives exactly its bytes.
+func TestInitiateMakesTheAttemptsHandshakeFrame(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newFake(t, func(_ int, c *fakeConn) {
+			c.online(nil)
+			c.pong()
+		})
+		var mu sync.Mutex
+		var made [][]byte
+		written := make(chan []byte, 1)
+		c, r := testClient(t, f, &MemStore{}, func(cfg *Config) {
+			cfg.Initiate = func(keyID uint16, pub []byte) (*wire.Initiator, []byte, error) {
+				in, fr, err := wire.Initiate(keyID, pub, uint16(clientpb.Cmd_CMD_HANDSHAKE))
+				mu.Lock()
+				made = append(made, fr)
+				mu.Unlock()
+				return in, fr, err
+			}
+			cfg.Dial = func(ctx context.Context, addr string) (net.Conn, error) {
+				nc, err := f.dial(ctx, addr)
+				return &firstWrite{Conn: nc, out: written}, err
+			}
+		})
+		c.Connect()
+		expect(t, r.take(), EventConnecting, EventOnline)
+		mu.Lock()
+		defer mu.Unlock()
+		if len(made) != 1 {
+			t.Fatalf("Initiate called %d times, want 1", len(made))
+		}
+		if w := <-written; !bytes.Equal(w, made[0]) {
+			t.Fatalf("first write %x, want Initiate's frame %x", w, made[0])
+		}
+	})
+}
+
+// firstWrite sends a copy of its first Write to out.
+type firstWrite struct {
+	net.Conn
+	out  chan<- []byte
+	once sync.Once
+}
+
+func (w *firstWrite) Write(b []byte) (int, error) {
+	w.once.Do(func() { w.out <- bytes.Clone(b) })
+	return w.Conn.Write(b)
 }

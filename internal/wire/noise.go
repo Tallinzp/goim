@@ -241,7 +241,14 @@ func ClientHandshake(rw io.ReadWriter, keyID uint16, serverPub []byte, cmd uint1
 	if err != nil {
 		return nil, err
 	}
-	if _, err := rw.Write(f); err != nil {
+	return ClientHandshakeWith(rw, in, f)
+}
+
+// ClientHandshakeWith runs the client side over rw from Initiate's result,
+// which may have been made ahead of time (loadgen's precomputed first
+// message, #106). An Initiator serves one handshake.
+func ClientHandshakeWith(rw io.ReadWriter, in *Initiator, frame []byte) (*Session, error) {
+	if _, err := rw.Write(frame); err != nil {
 		return nil, err
 	}
 	reply := make([]byte, HeaderLen+HandshakeMsgLen)

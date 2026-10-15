@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Tallinzp/goim/api/clientpb"
+	"github.com/Tallinzp/goim/internal/wire"
 )
 
 // Config configures a Client.
@@ -45,6 +46,12 @@ type Config struct {
 
 	Dial func(ctx context.Context, addr string) (net.Conn, error) // nil: TCP
 	Rand *rand.Rand                                               // nil: randomly seeded; one per Client, used without a lock
+
+	// Initiate makes an attempt's first handshake frame for the pinned key
+	// (nil: wire.Initiate for CMD_HANDSHAKE, after the dial). Loadgen hands
+	// over one made ahead of time (#106): the server sees the same bytes,
+	// and a phone's own CPU, not loadgen's, would have made them.
+	Initiate func(keyID uint16, serverPub []byte) (*wire.Initiator, []byte, error)
 }
 
 // DefaultConfig returns the timing defaults; the caller sets the rest. New
@@ -151,6 +158,11 @@ func New(cfg Config) (*Client, error) {
 	}
 	if cfg.Dial == nil {
 		cfg.Dial = tcpDial
+	}
+	if cfg.Initiate == nil {
+		cfg.Initiate = func(keyID uint16, serverPub []byte) (*wire.Initiator, []byte, error) {
+			return wire.Initiate(keyID, serverPub, uint16(clientpb.Cmd_CMD_HANDSHAKE))
+		}
 	}
 	if cfg.Rand == nil {
 		cfg.Rand = rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64()))

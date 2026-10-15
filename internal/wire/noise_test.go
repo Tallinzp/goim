@@ -379,3 +379,52 @@ func TestSessionSendAndReceiveOnTwoGoroutines(t *testing.T) {
 		}
 	}
 }
+
+// #106: a first message made ahead of time completes a handshake later, and
+// the server receives exactly its bytes.
+func TestClientHandshakeWithAPrecomputedInitiator(t *testing.T) {
+	key, err := GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	in, frame, err := Initiate(7, key.Public, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, s := net.Pipe()
+	defer c.Close()
+	defer s.Close()
+	srv := make(chan *Session, 1)
+	go func() {
+		got := make([]byte, HeaderLen+HandshakeLen)
+		if _, err := io.ReadFull(s, got); err != nil || !bytes.Equal(got, frame) {
+			srv <- nil
+			return
+		}
+		sess, reply, err := Respond(key, got, 1)
+		if err != nil {
+			srv <- nil
+			return
+		}
+		if _, err := s.Write(reply); err != nil {
+			srv <- nil
+			return
+		}
+		srv <- sess
+	}()
+	cs, err := ClientHandshakeWith(c, in, frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ss := <-srv
+	if ss == nil {
+		t.Fatal("the server did not receive the precomputed frame, or could not answer it")
+	}
+	sealed, err := cs.Seal(nil, 9, 1, []byte("hi"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, body, _, err := ss.Open(nil, sealed); err != nil || string(body) != "hi" {
+		t.Fatalf("open: %q %v", body, err)
+	}
+}

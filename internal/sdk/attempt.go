@@ -76,7 +76,12 @@ func (a *attempt) login(ctx context.Context, cfg *Config, addr string, req *clie
 	}
 	context.AfterFunc(ctx, func() { nc.Close() }) // cancel aborts any read or write
 	a.cc = clientconn.New(nc)
-	switch err := a.cc.Handshake(cfg.KeyID, cfg.ServerKey, connectBy); {
+	in, frame, err := cfg.Initiate(cfg.KeyID, cfg.ServerKey)
+	if err != nil {
+		nc.Close()
+		return nil, end{kind: EndFailed, err: err}
+	}
+	switch err := a.cc.HandshakeWith(in, frame, connectBy); {
 	case errors.Is(err, clientconn.ErrClosedBeforeReply):
 		nc.Close()
 		return nil, end{kind: EndPreHandshake, err: err}

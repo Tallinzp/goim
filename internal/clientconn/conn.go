@@ -66,10 +66,20 @@ func Dial(addr string, timeout time.Duration) (*Conn, error) {
 // must finish by deadline (zero: none). A close or reset before any reply
 // byte is reported as errors.Is(err, ErrClosedBeforeReply).
 func (c *Conn) Handshake(keyID uint16, serverPub []byte, deadline time.Time) error {
+	in, f, err := wire.Initiate(keyID, serverPub, uint16(clientpb.Cmd_CMD_HANDSHAKE))
+	if err != nil {
+		return err
+	}
+	return c.HandshakeWith(in, f, deadline)
+}
+
+// HandshakeWith is Handshake from wire.Initiate's result for CMD_HANDSHAKE,
+// made ahead of time (loadgen's precomputed first message, #106).
+func (c *Conn) HandshakeWith(in *wire.Initiator, frame []byte, deadline time.Time) error {
 	if err := c.nc.SetDeadline(deadline); err != nil {
 		return err
 	}
-	sess, err := wire.ClientHandshake(c.nc, keyID, serverPub, uint16(clientpb.Cmd_CMD_HANDSHAKE))
+	sess, err := wire.ClientHandshakeWith(c.nc, in, frame)
 	if err != nil {
 		return err
 	}
