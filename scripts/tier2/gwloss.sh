@@ -60,6 +60,14 @@
 #                      4 GOMAXPROCS each, #108)
 #   GWLOSS_STRESS_CPUS_LOGIC  b_stress: Logic + Redis's CPU set (default
 #                      11,23, #108)
+#   GWLOSS_SS_EVERY    seconds between socket samples from the kill until every
+#                      victim is back (default 0: off). A diagnostic (run 26:
+#                      the survivors timed out 3.9M handshakes while idle):
+#                      per survivor, its established sockets and those with
+#                      unread bytes (Recv-Q), loadgen's sockets to it and
+#                      those with unacked bytes (Send-Q), its accept queue,
+#                      and its handshake gauge and counters; on the Logic CPU
+#                      set. The result gets ss_<phase>, the samples in order.
 #
 # Checks (b1; b_stress has the same with its own prefix, unless noted):
 #   b1_stack           redis, devtoken, Logic and the gateways become Ready
@@ -221,6 +229,34 @@ lg_heap() {
     END { if (a == "") print "null"; else printf "{\"live_mb\": %d, \"sys_mb\": %d, \"live_bytes_per_client\": %d}\n", a / 1048576, s / 1048576, a / n }' \
     "$STACK_DIR/artifacts/$1/loadgen.heap.txt"
 }
+# ss_sample T: one GWLOSS_SS_EVERY sample, T seconds after the kill, as a JSON
+# line. Per survivor (its listener 127.0.0.1:PORT): srv_est and srv_recvq_*
+# are its established sockets and those holding bytes it has not read;
+# cli_est and cli_sendq_* are loadgen's sockets to it and those holding bytes
+# its kernel has not acked; accept_q is its listener's queue (backlog: the
+# limit); then its handshake gauge and counters. ss_ms: what ss took.
+ss_sample() {
+  local t=$1 g ports="" t0 ms est lst gw=""
+  for g in "${survivors[@]}"; do ports+=" 127.0.0.1:$((STACK_PORT_BASE + 100 + 10 * ${g#gw-}))"; done
+  t0=$(date +%s%N)
+  est=$(ss -tnH state established 2>/dev/null | awk -v ports="$ports" '
+    BEGIN { n = split(ports, p, " "); for (i = 1; i <= n; i++) want[p[i]] = 1 }
+    $3 in want { se[$3]++; if ($1 > 0) { rn[$3]++; rb[$3] += $1 } ; next }
+    $4 in want { ce[$4]++; if ($2 > 0) { sn[$4]++; sb[$4] += $2 } }
+    END { for (i = 1; i <= n; i++) { q = p[i]
+            printf "%s\"%s\": {\"srv_est\": %d, \"srv_recvq_conns\": %d, \"srv_recvq_bytes\": %d, \"cli_est\": %d, \"cli_sendq_conns\": %d, \"cli_sendq_bytes\": %d}", (i > 1 ? ", " : ""), q, se[q], rn[q], rb[q], ce[q], sn[q], sb[q] } }')
+  lst=$(ss -tnH state listening 2>/dev/null | awk -v ports="$ports" '
+    BEGIN { n = split(ports, p, " "); for (i = 1; i <= n; i++) want[p[i]] = 1 }
+    $3 in want { printf "%s\"%s\": {\"accept_q\": %d, \"backlog\": %d}", (k++ ? ", " : ""), $3, $1, $2 }')
+  ms=$((($(date +%s%N) - t0) / 1000000))
+  for g in "${survivors[@]}"; do
+    gw+="${gw:+, }\"$g\": $(stack_counters "$g" handshake_conns='goim_gateway_connections:state="handshake"' \
+      handshake_timeout='goim_gateway_admission_rejects_total:reason="handshake_timeout"' \
+      pending_mem='goim_gateway_admission_rejects_total:reason="pending_mem"' \
+      handshakes_ok='goim_gateway_handshakes_total:result="ok"' handshakes_no_slot='goim_gateway_handshakes_total:result="no_slot"')"
+  done
+  echo "{\"t\": $t, \"ss_ms\": $ms, \"sockets\": {$est}, \"listeners\": {$lst}, \"gateways\": {$gw}}"
+}
 
 t=$SECONDS
 if ! make redis-server >"$T2_OUT/redis-build.log" 2>&1; then
@@ -356,6 +392,14 @@ for name in $PHASES; do
   # hid it in run 22 (3.2 of 8 cores, 7.9 in the first 30s).
   (stack_profile storm 30 & lg_profile storm 30 & { sleep 30; stack_usage_json >"$STACK_DIR/storm30.json"; }; wait) >/dev/null 2>&1 &
   prof=$!
+  # GWLOSS_SS_EVERY: socket samples from the kill until the victims are back,
+  # on the Logic CPU set (a diagnostic, off by default; run 26).
+  ss_every=${GWLOSS_SS_EVERY:-0} sampler=""
+  if [ "$ss_every" -gt 0 ]; then
+    (while :; do ss_sample $((SECONDS - kill_t)); sleep "$ss_every"; done) >"$STACK_DIR/artifacts/ss-storm.jsonl" 2>/dev/null &
+    sampler=$!
+    taskset -a -p -c "$T2_CPUS_LOGIC" "$sampler" >/dev/null 2>&1
+  fi
   # The dead epoch's sweep (2 x TTL after its last renewal, then its uids at
   # the sweeper's rate), watched from the kill alongside the relogins: a
   # storm slower than the sweep must not hide it or delay its time. The
@@ -373,6 +417,19 @@ for name in $PHASES; do
   sweeping=$!
   back=$(t2_bool lg_wait_back death "$back_wait")
   back_s=$((SECONDS - kill_t))
+  if [ -n "$sampler" ]; then
+    kill "$sampler" 2>/dev/null
+    wait "$sampler" 2>/dev/null
+    # A sample the kill cut short is left out.
+    t2_field "ss_$name" "$(python3 -c 'import json, sys
+out = []
+for l in open(sys.argv[1]):
+    try:
+        out.append(json.loads(l))
+    except ValueError:
+        pass
+print(json.dumps(out))' "$STACK_DIR/artifacts/ss-storm.jsonl" 2>/dev/null || echo null)"
+  fi
   lg_get "/slo?mark=death&within=30s" d >"$STACK_DIR/artifacts/slo-death.json"
   wait "$sweeping"
   read -r swept sweep_s <"$STACK_DIR/sweep.out" || { swept=false sweep_s=null; }

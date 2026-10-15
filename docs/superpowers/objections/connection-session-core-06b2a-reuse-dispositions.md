@@ -40,3 +40,13 @@ Objection record: `connection-session-core-06b2a-reuse.md`. Decided by the user 
 **Decision (2026-10-14): accepted.** Noise NK's reply carries the responder's fresh ephemeral, so the keys would not repeat; the reason is the Initiator's state.
 
 **Plan changes to apply:** #109's rejected alternative reads "reusing an answered handshake (an Initiator serves one handshake: `Finish` uses its handshake state up)".
+
+## Follow-up (2026-10-15): run 26 had already run
+
+O1's evidence was wrong: Tier 2 run 26 (`d4c5b3c`, 2026-10-14) had finished before the review; it was not yet recorded in the repo. Its result does not change O1's decision (#109 waits), but for a different reason than the gate's.
+
+- **The gate's rule fires:** b_stress `send_lag` p99 2,538ms (≥ 1s, P-sendlagI-2).
+- **Its premise does not hold:** the rule assumed the survivors' `handshake_timeout` closes are late frames from loadgen. Loadgen wrote 5.96M handshake frames, p90 57ms after the dial; the survivors handled 1.85M (`handshakes_ok` 0.64M + `handshake_rate` 1.21M) and timed out 3.88M (63% of 6.14M attempts) while their CPU sets were 88% idle. Late frames explain at most a few percent. b1's survivor had none.
+- **Profiles (storm's first 30s):** gw-1 2.0 cores (X25519 57%, syscalls 25%, all under gnet's `Polling`), no sign of starvation; loadgen 13.7 cores (X25519 46%, syscalls 19%, GC ~15%), as in run 25.
+
+**Decision (2026-10-15, the user):** before #109, a diagnostic run: `gwloss` samples sockets during b_stress's storm (`GWLOSS_SS_EVERY`, off by default): per survivor, its sockets with unread bytes (Recv-Q), loadgen's sockets to it with unacked bytes (Send-Q), its accept queue, and its handshake gauge and counters. Frames sitting unread on the survivors → the gateway's read path; frames unacked or absent → loadgen's write path; a long accept queue → the single acceptor. #109 is decided after that run.
