@@ -410,7 +410,7 @@ func TestSDKStormUsesPrecomputedHandshakes(t *testing.T) {
 	st := r.Stats()
 	s := st.StormSinceMark
 	if s.Mark != "death" || s.HandshakesPrecomputed != 15 || s.AttemptLag.N < 15 || s.AttemptLag.Max > 1000 ||
-		s.SendLag.N < 15 || s.SendLag.Max > 1000 || s.ReplyLag.N < 15 || s.ReplyLag.Max > 1000 {
+		s.ConnectLag.N < 15 || s.ConnectLag.Max > 1000 || s.SendLag.N < 15 || s.SendLag.Max > 1000 || s.ReplyLag.N < 15 || s.ReplyLag.Max > 1000 {
 		t.Fatalf("storm since mark %+v", s)
 	}
 	if !st.Precompute.Stopped || st.Precompute.Ready != 15 {

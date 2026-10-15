@@ -7,6 +7,7 @@ import (
 	"net"
 	"sync"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -121,12 +122,13 @@ func (b *Balancer) Dial(ctx context.Context) (net.Conn, int, error) {
 		return nil, -1, err
 	}
 	d := net.Dialer{LocalAddr: &net.TCPAddr{IP: src}, Control: bindNoPort}
+	connecting := time.Now()
 	nc, err := d.DialContext(ctx, "tcp", b.addrs[gw])
 	if err != nil {
 		b.release(gw)
 		return nil, gw, err
 	}
-	return &conn{Conn: nc, release: func() { b.release(gw) }}, gw, nil
+	return &conn{Conn: nc, release: func() { b.release(gw) }, connecting: connecting}, gw, nil
 }
 
 // bindNoPort sets IP_BIND_ADDRESS_NO_PORT: the kernel picks the source port
@@ -146,8 +148,9 @@ func bindNoPort(_, _ string, rc syscall.RawConn) error {
 // conn releases its balancer slot once, on the first Close.
 type conn struct {
 	net.Conn
-	once    sync.Once
-	release func()
+	once       sync.Once
+	release    func()
+	connecting time.Time // when Dial called connect (ConnectLag)
 }
 
 func (c *conn) Close() error {

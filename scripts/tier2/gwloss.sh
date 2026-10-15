@@ -53,7 +53,8 @@
 #                          loadgen's, sized for the victim alone: 120 for 600k)
 #   GWLOSS_STRESS_LG_MEMLIMIT b_stress: loadgen's GOMEMLIMIT (default 16GiB, #93)
 #   GWLOSS_LAG_P99_MS  the storm's p99 bound on loadgen's lags, attempt_lag,
-#                      send_lag and reply_lag, ms (default 100, #107)
+#                      connect_lag, send_lag and reply_lag, ms (default 100,
+#                      #107)
 #   GWLOSS_STRESS_CPUS_LOADGEN  b_stress: loadgen's CPU set (default
 #                      0-5,10,12-17,22, #108)
 #   GWLOSS_STRESS_CPUS_GATEWAY  b_stress: the gateways' CPU set (default 6-9,18-21,
@@ -472,7 +473,9 @@ print(json.dumps(out))' "$STACK_DIR/artifacts/ss-storm.jsonl" 2>/dev/null || ech
   t2_check "${name}_cross_check" "$(echo "{\"d\": $logic_d, \"pop\": $pop}" | lg_true - '0.9 * (d["d"]["kick_first"] - d["d"]["kick_first_timeout"]) <= d["d"]["dead_epoch_relogins"] <= 1.1 * d["pop"]')" \
     "\"relogins\": $pop, \"samples\": $(echo "$logic_d" | lg_py - 'd["dead_epoch_relogins"]'), \"mean_s\": $(echo "$logic_d" | lg_py - 'round(d["dead_epoch_relogin_s"] / d["dead_epoch_relogins"], 1)')"
   # #107: the storm was the spec's: every logged-in client was prepared at
-  # the kill, and after it loadgen started each attempt, sent each handshake
+  # the kill, and after it loadgen started each attempt, got each dial back
+  # after connect (connect_lag: the survivor's handshake timer starts at the
+  # accept, inside it; the b_stress diagnostic run), sent each handshake
   # frame after its dial (send_lag, run 25: a late frame is a survivor's
   # handshake_timeout) and answered each handshake reply within
   # GWLOSS_LAG_P99_MS (p99; loadgen's own lags only, review I1/I2). b-stress has no SLO; its relogin distribution is the
@@ -480,7 +483,7 @@ print(json.dumps(out))' "$STACK_DIR/artifacts/ss-storm.jsonl" 2>/dev/null || ech
   # client's run loop) is recorded beside the lags, not gated: it includes
   # the dying gateway's socket teardown, which production has too.
   storm_d=$(lg_get /stats 'd["storm_since_mark"]')
-  t2_check "${name}_storm_real" "$(echo "{\"s\": $storm_d, \"p\": $precompute, \"pop\": $pop}" | lg_true - 'd["p"]["ready"] is not None and d["p"]["ready"] == d["p"]["online"] and all(d["s"][k]["n"] >= d["pop"] and d["s"][k]["p99_ms"] <= '"$lag_max"' for k in ("attempt_lag", "send_lag", "reply_lag"))')" \
+  t2_check "${name}_storm_real" "$(echo "{\"s\": $storm_d, \"p\": $precompute, \"pop\": $pop}" | lg_true - 'd["p"]["ready"] is not None and d["p"]["ready"] == d["p"]["online"] and all(d["s"][k]["n"] >= d["pop"] and d["s"][k]["p99_ms"] <= '"$lag_max"' for k in ("attempt_lag", "connect_lag", "send_lag", "reply_lag"))')" \
     "\"lag_p99_max_ms\": $lag_max, \"precompute_at_kill\": $precompute, \"storm\": $storm_d, \"detection\": $(lg_py "$slo" 'd["detection"]')"
   # One renewal per 10s interval (the gateway's -lease-interval default): the
   # window holds at least window_s / 10 - 1 whole intervals.

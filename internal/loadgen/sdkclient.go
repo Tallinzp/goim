@@ -46,7 +46,9 @@ func (r *Runner) newSDK(i int) (*sdk.Client, error) {
 				return nil, err
 			}
 			sc.gw.Store(int32(gw))
-			return &replyConn{Conn: nc, rec: r.rec, dialed: time.Now()}, nil
+			dialed := time.Now()
+			r.rec.ConnectLag(dialed.Sub(nc.(*conn).connecting))
+			return &replyConn{Conn: nc, rec: r.rec, dialed: dialed}, nil
 		},
 		// A prepared frame is for the env's key, which is this Config's
 		// KeyID and ServerKey: the SDK pins one key (P6b2a-stormI-3).

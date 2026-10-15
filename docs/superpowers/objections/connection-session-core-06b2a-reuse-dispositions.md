@@ -50,3 +50,10 @@ O1's evidence was wrong: Tier 2 run 26 (`d4c5b3c`, 2026-10-14) had finished befo
 - **Profiles (storm's first 30s):** gw-1 2.0 cores (X25519 57%, syscalls 25%, all under gnet's `Polling`), no sign of starvation; loadgen 13.7 cores (X25519 46%, syscalls 19%, GC ~15%), as in run 25.
 
 **Decision (2026-10-15, the user):** before #109, a diagnostic run: `gwloss` samples sockets during b_stress's storm (`GWLOSS_SS_EVERY`, off by default): per survivor, its sockets with unread bytes (Recv-Q), loadgen's sockets to it with unacked bytes (Send-Q), its accept queue, and its handshake gauge and counters. Frames sitting unread on the survivors → the gateway's read path; frames unacked or absent → loadgen's write path; a long accept queue → the single acceptor. #109 is decided after that run.
+
+## Follow-up (2026-10-15): the diagnostic run
+
+The b_stress diagnostic run (`8ea8930`, `GWLOSS_SS_EVERY=10`) answers the decision above: **the frames were missing on loadgen's side**, not unread on the survivors and not in the accept queue. For ~100s after the kill neither survivor handled a single handshake frame (`handshakes_ok` and `no_slot` frozen on both) while ~3.2M connections timed out, with Recv-Q 0 on the survivors, Send-Q 0 on loadgen, and the accept queue at 0–1 of 65,535. Both survivors stalled and resumed together. `send_lag` (p99 3,540ms) could not show it: it starts when the dial returns, after the survivor's 5s has started at the accept. Details in the plan's *Execution Notes*.
+
+**Decision (2026-10-15, the user):** record the run and add `connect_lag` (connect → the dial's return, bounded in `<phase>_storm_real` like the other lags; #107 amended). #109 is decided after a b_stress run with it.
+
