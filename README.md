@@ -19,8 +19,9 @@ From the recorded Tier 2 benchmark runs (24-core host, all processes on one mach
 | Heartbeat cost at 200k | 0.08 cores at a 150 s heartbeat, 0.15 cores at 60 s |
 | Four gateways | 100,000 connections: login p99 24 ms, heartbeat round trip p99 4 ms |
 | A 200k gateway SIGKILLed | all 200,000 SDK clients back online on the survivor, p99 22.7 s from the kill (SLO: 30 s); the survivor (400k) missed no lease renewal; one Kick per relogin, none retried once the process was gone; the dead epoch swept 82 s after the kill |
+| A 600k gateway SIGKILLed | all 600,000 SDK clients back on two empty survivors in 179 s (from the kill p50 39 s, p99 98 s; no SLO at this size), with no swap; the survivors' handshake limiter turned ~3.9M handshake attempts away and never refused one at capacity; no lease renewal missed; the dead epoch swept 120 s after the kill. These times are an upper bound: on one host the load generator's 600k SDK clients used 12 of its 14 cores in the storm's first 30 s |
 | Race test suite | 58 fault-injection scenarios against real processes and a real redis-server, plus mutation checks |
-| Tests | 443 Go tests, about half of the ~30k lines of Go |
+| Tests | 467 Go tests, about half of the ~32k lines of Go |
 
 ## Architecture
 
@@ -80,7 +81,7 @@ GOIM_TEST_TIER=2 make test-tier2 SCENARIO=smoke
 
 ## Status
 
-This is sub-project 1 (connection and session core) of a larger IM system. Done: gateway, Logic, session store, TCP transport, client SDK, race suite, load generator, the Tier 2 benchmark foundation, the single-gateway capacity and heartbeat-cost benchmarks (600k connections), and gateway loss at 200k with SDK clients. Next: a 600k gateway loss, silent gateway loss, slowed Logic, floods, Redis Cluster failover, and Kubernetes rolling restarts. Messaging, push and the WebSocket transport are later sub-projects.
+This is sub-project 1 (connection and session core) of a larger IM system. Done: gateway, Logic, session store, TCP transport, client SDK, race suite, load generator, the Tier 2 benchmark foundation, the single-gateway capacity and heartbeat-cost benchmarks (600k connections), and gateway loss with SDK clients at 200k and 600k. Next: silent gateway loss, slowed Logic, floods, Redis Cluster failover, and Kubernetes rolling restarts. Messaging, push and the WebSocket transport are later sub-projects.
 
 ---
 
@@ -105,8 +106,9 @@ This is sub-project 1 (connection and session core) of a larger IM system. Done:
 | 20 万连接的心跳开销 | 150 s 心跳 0.08 核，60 s 心跳 0.15 核 |
 | 四个网关 | 10 万连接：登录 p99 24 ms，心跳往返 p99 4 ms |
 | SIGKILL 一个 20 万连接的网关 | 20 万个 SDK 客户端全部在存活网关上重新上线，从 kill 起 p99 22.7 s（SLO：30 s）；存活网关（40 万连接）没有错过任何一次租约续期；每次重新登录一次 Kick，进程消失后不再重试；死亡 epoch 在 kill 后 82 s 清扫完毕 |
+| SIGKILL 一个 60 万连接的网关 | 60 万个 SDK 客户端全部在两个空的存活网关上重新上线，用时 179 s（从 kill 起 p50 39 s、p99 98 s；此规模不设 SLO），无 swap；存活网关的握手限流拒绝了约 390 万次握手尝试，从未因容量满而拒绝；没有错过任何一次租约续期；死亡 epoch 在 kill 后 120 s 清扫完毕。这些时间是上界：在单台主机上，压测工具的 60 万个 SDK 客户端在风暴的前 30 s 用掉了其 14 核中的 12 核 |
 | 竞态测试集 | 58 个故障注入场景，运行在真实进程和真实 redis-server 上，并带变异测试 |
-| 测试 | 443 个 Go 测试，约占 3 万行 Go 代码的一半 |
+| 测试 | 467 个 Go 测试，约占 3.2 万行 Go 代码的一半 |
 
 ### 架构
 
@@ -166,6 +168,6 @@ GOIM_TEST_TIER=2 make test-tier2 SCENARIO=smoke
 
 ### 当前状态
 
-这是一个更大 IM 系统中的子项目 1（连接与会话核心）。已完成：网关、Logic、会话存储、TCP 传输、客户端 SDK、竞态测试集、压测工具、Tier 2 压测基础设施，单网关容量和心跳开销压测（60 万连接），以及使用 SDK 客户端的 20 万连接网关故障。下一步：60 万连接的网关故障、静默的网关故障、变慢的 Logic、洪泛、Redis Cluster 故障转移，以及 Kubernetes 滚动重启。消息、推送和 WebSocket 传输属于后续子项目。
+这是一个更大 IM 系统中的子项目 1（连接与会话核心）。已完成：网关、Logic、会话存储、TCP 传输、客户端 SDK、竞态测试集、压测工具、Tier 2 压测基础设施，单网关容量和心跳开销压测（60 万连接），以及使用 SDK 客户端的 20 万和 60 万连接网关故障。下一步：静默的网关故障、变慢的 Logic、洪泛、Redis Cluster 故障转移，以及 Kubernetes 滚动重启。消息、推送和 WebSocket 传输属于后续子项目。
 
 [回到 English](#goim)
