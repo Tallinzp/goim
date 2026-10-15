@@ -382,3 +382,38 @@ func TestControlAPI(t *testing.T) {
 }
 
 func itoa(n int) string { return strconv.Itoa(n) }
+
+// #106, #107: with Precompute every logged-in client holds its next
+// handshake frame before the mark; each victim's first attempt after it uses
+// its own once, nobody prepares after the mark, every attempt after a wait
+// records its lag and every handshake its reply lag.
+func TestSDKStormUsesPrecomputedHandshakes(t *testing.T) {
+	env, stopGW := startStack(t, 2)
+	r, err := New(Config{Mode: "sdk", Clients: 30, Rate: 300, UIDPrefix: "pre", Precompute: true}, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.cfg.windows = sdk.DefaultWindows()
+	r.cfg.windows.Storm = sdk.Window{Lo: 0, Hi: time.Second}
+	stop := run(r)
+	defer stop()
+	waitFor(t, "30 online and prepared", 10*time.Second, func() bool {
+		s := r.Stats()
+		return s.RampDone && s.Online == 30 && s.Precompute != nil && s.Precompute.Ready == 30 && s.Precompute.Pending == 0
+	})
+	n, err := r.Mark(1, "death", true)
+	if err != nil || n != 15 {
+		t.Fatalf("mark: %d %v", n, err)
+	}
+	stopGW[1]()
+	waitFor(t, "all back", 10*time.Second, func() bool { s, _ := r.Recorder().SLO("death", time.Second); return s.Back == 15 })
+	st := r.Stats()
+	s := st.StormSinceMark
+	if s.Mark != "death" || s.HandshakesPrecomputed != 15 || s.AttemptLag.N < 15 || s.AttemptLag.Max > 1000 ||
+		s.ReplyLag.N < 15 || s.ReplyLag.Max > 1000 {
+		t.Fatalf("storm since mark %+v", s)
+	}
+	if !st.Precompute.Stopped || st.Precompute.Ready != 15 {
+		t.Fatalf("precompute %+v: want stopped, the survivor's 15 still prepared", st.Precompute)
+	}
+}

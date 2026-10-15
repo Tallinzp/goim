@@ -24,6 +24,9 @@ type Recorder struct {
 	backoff        map[string]int64 // waits by kind
 	backoffClients int64
 	since          BackoffCount // since the latest mark (P6b2a-stressI-1)
+	lag            *hist        // attempt lag since the latest mark, ms (#107)
+	reply          *hist        // reply lag since the latest mark, ms (#107)
+	storm          StormCount   // since the latest mark; the lags filled by Counts
 	pongs          int64
 	missing        int64
 	gapMax         time.Duration
@@ -58,7 +61,7 @@ type mark struct {
 func NewRecorder(n int, ids []string) *Recorder {
 	r := &Recorder{ids: ids, clients: make([]clientState, n), online: make([]int, len(ids)),
 		login: newHist(), pongRTT: newHist(), lost: map[string]int64{}, failed: map[string]int64{}, backoff: map[string]int64{},
-		since: BackoffCount{Waits: map[string]int64{}}, byName: map[string]*mark{}}
+		since: BackoffCount{Waits: map[string]int64{}}, lag: newHist(), reply: newHist(), byName: map[string]*mark{}}
 	for i := range r.clients {
 		r.clients[i] = clientState{gw: -1, mark: -1}
 	}
@@ -131,6 +134,34 @@ func (r *Recorder) Backoff(i int, kind string) {
 	}
 }
 
+// AttemptLag: an attempt started lag after its wait's end (#107). A
+// negative lag counts as 0.
+func (r *Recorder) AttemptLag(lag time.Duration) {
+	r.mu.Lock()
+	r.lag.add(max(lag, 0).Milliseconds())
+	r.mu.Unlock()
+}
+
+// ReplyLag: a client wrote its Login frame lag after reading the server's
+// handshake reply (#107). A negative lag, from a wall-clock step, counts as 0.
+func (r *Recorder) ReplyLag(lag time.Duration) {
+	r.mu.Lock()
+	r.reply.add(max(lag, 0).Milliseconds())
+	r.mu.Unlock()
+}
+
+// Handshake: an attempt's first handshake message was made ahead of time
+// (precomputed) or when it dialed (#106).
+func (r *Recorder) Handshake(precomputed bool) {
+	r.mu.Lock()
+	if precomputed {
+		r.storm.HandshakesPrecomputed++
+	} else {
+		r.storm.HandshakesInline++
+	}
+	r.mu.Unlock()
+}
+
 // Pong: a Ping was answered after rtt.
 func (r *Recorder) Pong(rtt time.Duration) {
 	r.mu.Lock()
@@ -180,6 +211,7 @@ func (r *Recorder) Mark(name string, gw int, now time.Time) (int, error) {
 	r.marks = append(r.marks, m)
 	r.byName[name] = m
 	r.since = BackoffCount{Mark: name, Waits: map[string]int64{}}
+	r.lag, r.reply, r.storm = newHist(), newHist(), StormCount{Mark: name}
 	return len(m.members), nil
 }
 
@@ -258,6 +290,7 @@ type Counts struct {
 	BackoffClients   int64            `json:"backoff_clients"` // clients that reached backoff, each once
 	BackoffWaits     map[string]int64 `json:"backoff_waits"`   // backoff waits by kind
 	BackoffSinceMark BackoffCount     `json:"backoff_since_mark"`
+	StormSinceMark   StormCount       `json:"storm_since_mark"`
 	LoginLatency     Dist             `json:"login_latency"`
 	Pongs            int64            `json:"pongs"`
 	PongMissing      int64            `json:"pong_missing"`
@@ -274,6 +307,19 @@ type BackoffCount struct {
 	Waits   map[string]int64 `json:"waits"`
 }
 
+// StormCount is the attempts since mark Mark ("": the run's start): how late
+// each started after its wait's end (AttemptLag, ms; an attempt with no wait,
+// such as the first, is not in it), how long each handshake took from the
+// server's reply to the Login frame (ReplyLag, ms), and whether its first
+// message was made ahead of time or when it dialed (#106, #107).
+type StormCount struct {
+	Mark                  string `json:"mark"`
+	AttemptLag            Dist   `json:"attempt_lag"`
+	ReplyLag              Dist   `json:"reply_lag"`
+	HandshakesPrecomputed int64  `json:"handshakes_precomputed"`
+	HandshakesInline      int64  `json:"handshakes_inline"`
+}
+
 // Counts returns a snapshot of the counters.
 func (r *Recorder) Counts() Counts {
 	r.mu.Lock()
@@ -281,6 +327,7 @@ func (r *Recorder) Counts() Counts {
 	c := Counts{OnlineByGateway: map[string]int{}, Logins: r.logins, Lost: map[string]int64{}, Failed: map[string]int64{},
 		BackoffClients: r.backoffClients, BackoffWaits: map[string]int64{},
 		BackoffSinceMark: BackoffCount{Mark: r.since.Mark, Clients: r.since.Clients, Waits: map[string]int64{}},
+		StormSinceMark:   r.storm,
 		LoginLatency:     r.login.dist(r.login.n), Pongs: r.pongs, PongMissing: r.missing, PingGapMaxMs: r.gapMax.Milliseconds(), PongRTT: r.pongRTT.dist(r.pongRTT.n)}
 	for i, n := range r.online {
 		c.Online += n
@@ -298,5 +345,7 @@ func (r *Recorder) Counts() Counts {
 	for k, v := range r.since.Waits {
 		c.BackoffSinceMark.Waits[k] = v
 	}
+	c.StormSinceMark.AttemptLag = r.lag.dist(r.lag.n)
+	c.StormSinceMark.ReplyLag = r.reply.dist(r.reply.n)
 	return c
 }

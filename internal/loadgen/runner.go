@@ -29,25 +29,27 @@ const connsPerSource = 5_000
 
 // Config configures a run.
 type Config struct {
-	Mode      string        // "light" or "sdk" (choice #80)
-	Clients   int           // client i logs in as uid <UIDPrefix>-<i>
-	Rate      float64       // clients started per second
-	UIDPrefix string        // distinct per loadgen run, so runs never replace each other's sessions
-	Sources   int           // source addresses; 0: one per 5,000 connections per gateway, with one gateway gone or Down
-	Down      []string      // gateway ids out of the balancer from the start, until POST /up (b_stress, #93)
-	PingEvery time.Duration // light: the Ping interval (cmd/loadgen: 150s, the gateway's default heartbeat)
-	Timeout   time.Duration // light: dial + handshake + Login (cmd/loadgen: 10s)
-	windows   sdk.Windows   // tests only: the SDK's built-in reconnect windows
+	Mode       string        // "light" or "sdk" (choice #80)
+	Clients    int           // client i logs in as uid <UIDPrefix>-<i>
+	Rate       float64       // clients started per second
+	UIDPrefix  string        // distinct per loadgen run, so runs never replace each other's sessions
+	Sources    int           // source addresses; 0: one per 5,000 connections per gateway, with one gateway gone or Down
+	Down       []string      // gateway ids out of the balancer from the start, until POST /up (b_stress, #93)
+	Precompute bool          // sdk: prepare each logged-in client's next handshake until the first mark (#106)
+	PingEvery  time.Duration // light: the Ping interval (cmd/loadgen: 150s, the gateway's default heartbeat)
+	Timeout    time.Duration // light: dial + handshake + Login (cmd/loadgen: 10s)
+	windows    sdk.Windows   // tests only: the SDK's built-in reconnect windows
 }
 
 // Stats is the run's state now: GET /stats and the final result.
 type Stats struct {
-	Mode     string  `json:"mode"`
-	Clients  int     `json:"clients"`
-	Sources  int     `json:"sources"`
-	Started  int64   `json:"started"`
-	RampDone bool    `json:"ramp_done"`
-	ElapsedS float64 `json:"elapsed_s"`
+	Mode       string           `json:"mode"`
+	Clients    int              `json:"clients"`
+	Sources    int              `json:"sources"`
+	Started    int64            `json:"started"`
+	RampDone   bool             `json:"ramp_done"`
+	ElapsedS   float64          `json:"elapsed_s"`
+	Precompute *PrecomputeStats `json:"precompute,omitempty"`
 	Counts
 }
 
@@ -58,6 +60,7 @@ type Runner struct {
 	rec      *Recorder
 	bal      *Balancer
 	pinger   pingers
+	pre      *precomputer // nil without Precompute
 	begin    atomic.Int64 // unix ns Run started, 0: not yet
 	started  atomic.Int64
 	rampDone atomic.Bool
@@ -73,6 +76,8 @@ func New(cfg Config, env Env) (*Runner, error) {
 		return nil, fmt.Errorf("loadgen: mode %q, want light or sdk", cfg.Mode)
 	case cfg.Clients < 1 || cfg.Rate <= 0:
 		return nil, errors.New("loadgen: Clients and Rate must be positive")
+	case cfg.Precompute && cfg.Mode != "sdk":
+		return nil, errors.New("loadgen: precompute needs sdk mode")
 	case cfg.UIDPrefix == "":
 		return nil, errors.New("loadgen: UIDPrefix is required")
 	case cfg.Mode == "light" && (cfg.PingEvery <= 0 || cfg.Timeout <= 0):
@@ -109,6 +114,9 @@ func New(cfg Config, env Env) (*Runner, error) {
 	if cfg.Mode == "light" {
 		r.pinger = newPingers(runtime.GOMAXPROCS(0), cfg.PingEvery, r.rec)
 	}
+	if cfg.Precompute {
+		r.pre = newPrecomputer(r, cfg.Clients, runtime.GOMAXPROCS(0)/2)
+	}
 	return r, nil
 }
 
@@ -132,6 +140,11 @@ func (r *Runner) Run(ctx context.Context) {
 	var wg sync.WaitGroup
 	if r.pinger != nil {
 		wg.Go(func() { r.pinger.run(ctx) })
+	}
+	if r.pre != nil {
+		for range r.pre.workers {
+			wg.Go(func() { r.pre.run(ctx) })
+		}
 	}
 	for i := 0; i < r.cfg.Clients && ctx.Err() == nil; i++ {
 		due := begin.Add(time.Duration(float64(i) / r.cfg.Rate * float64(time.Second)))
@@ -222,6 +235,9 @@ func (r *Runner) Kill(gw, pid int, name string) (int, error) {
 // e.g. b2's DROP; down also takes gw out of the balancer, as an LB's
 // health check would, once the mark is taken.
 func (r *Runner) Mark(gw int, name string, down bool) (int, error) {
+	if r.pre != nil {
+		r.pre.stopped.Store(true) // the storm's CPU is the storm's (#106)
+	}
 	n, err := r.rec.Mark(name, gw, time.Now())
 	if err == nil && down && gw >= 0 {
 		r.bal.SetDown(gw)
@@ -241,6 +257,9 @@ func (r *Runner) Stats() Stats {
 		RampDone: r.rampDone.Load(), Counts: r.rec.Counts()}
 	if b := r.begin.Load(); b != 0 {
 		s.ElapsedS = time.Since(time.Unix(0, b)).Seconds()
+	}
+	if r.pre != nil {
+		s.Precompute = r.pre.stats()
 	}
 	return s
 }

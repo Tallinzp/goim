@@ -3,6 +3,7 @@ package loadgen
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // The default source count holds a gateway's share after another gateway
@@ -68,5 +69,15 @@ func TestNewSizesSourcesForTheGatewaysUp(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "down") {
 			t.Errorf("down %v: err %v", down, err)
 		}
+	}
+}
+
+// #106: preparing tokens and handshakes is for SDK clients.
+func TestNewRefusesPrecomputeInLightMode(t *testing.T) {
+	env := Env{GatewayIDs: []string{"gw-0"}, GatewayAddrs: []string{"127.0.0.1:1"}}
+	_, err := New(Config{Mode: "light", Clients: 1, Rate: 1, UIDPrefix: "x", PingEvery: time.Second,
+		Timeout: time.Second, Precompute: true}, env)
+	if err == nil || !strings.Contains(err.Error(), "precompute") {
+		t.Fatalf("err %v, want a precompute error", err)
 	}
 }

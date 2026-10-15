@@ -54,6 +54,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	fs.DurationVar(&cfg.PingEvery, "ping-every", 150*time.Second, "light: Ping interval (the gateway's -heartbeat)")
 	fs.DurationVar(&cfg.Timeout, "timeout", 10*time.Second, "light: dial + handshake + Login per attempt")
 	down := fs.String("down", "", "gateway ids out of the balancer until POST /up, comma-separated")
+	fs.BoolVar(&cfg.Precompute, "precompute", false, "sdk: prepare each logged-in client's next handshake until the first mark (#106)")
 	control := fs.String("control", "", "control API listen address (none if empty)")
 	duration := fs.Duration("duration", 0, "stop after this long (0: at SIGTERM)")
 	within := fs.Duration("within", 30*time.Second, "SLO bound for the result's marks")

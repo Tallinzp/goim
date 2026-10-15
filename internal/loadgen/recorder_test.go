@@ -181,3 +181,26 @@ func TestRecorderCountsBackoffSinceMark(t *testing.T) {
 		t.Fatalf("the run: clients %d, waits %v", c.BackoffClients, c.BackoffWaits)
 	}
 }
+
+// #107: the storm's lags and handshake counts restart at each mark; a
+// negative lag (a wall-clock step) counts as 0.
+func TestRecorderCountsTheStormSinceMark(t *testing.T) {
+	r := NewRecorder(2, []string{"gw-0"})
+	r.AttemptLag(5 * time.Second) // the ramp's: before any mark
+	r.ReplyLag(5 * time.Second)
+	r.Handshake(false)
+	if _, err := r.Mark("death", 0, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	r.AttemptLag(120 * time.Millisecond)
+	r.AttemptLag(-time.Millisecond)
+	r.ReplyLag(3 * time.Millisecond)
+	r.Handshake(true)
+	r.Handshake(false)
+	r.Handshake(false)
+	s := r.Counts().StormSinceMark
+	if s.Mark != "death" || s.AttemptLag.N != 2 || s.AttemptLag.Max != 120 || s.ReplyLag.N != 1 || s.ReplyLag.Max != 3 ||
+		s.HandshakesPrecomputed != 1 || s.HandshakesInline != 2 {
+		t.Fatalf("storm since mark %+v", s)
+	}
+}

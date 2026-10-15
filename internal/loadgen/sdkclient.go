@@ -8,6 +8,7 @@ import (
 
 	"github.com/Tallinzp/goim/api/clientpb"
 	"github.com/Tallinzp/goim/internal/sdk"
+	"github.com/Tallinzp/goim/internal/wire"
 )
 
 // sdkClient is one sdk-mode client (choice #80): the real SDK with its
@@ -15,23 +16,47 @@ import (
 type sdkClient struct {
 	r      *Runner
 	i      int
-	gw     atomic.Int32 // gateway of the last dial
-	start  time.Time    // the current attempt's start; run loop only
-	online bool         // run loop only
+	gw     atomic.Int32             // gateway of the last dial
+	tok    atomic.Pointer[string]   // the last token, reused until a refresh (spec: Client SDK rules)
+	pre    atomic.Pointer[prepared] // the next attempt's first message (#106)
+	queued atomic.Bool              // waiting for a precompute worker
+	due    time.Time                // the next attempt's due time (its wait's end), zero: no wait (#107); run loop only
+	start  time.Time                // the current attempt's start; run loop only
+	online bool                     // run loop only
 }
 
 func (r *Runner) newSDK(i int) (*sdk.Client, error) {
 	sc := &sdkClient{r: r, i: i}
 	return sdk.New(sdk.Config{Addrs: []string{"balancer"}, KeyID: r.env.NoiseKeyID, ServerKey: r.env.NoisePublic,
 		AppID: AppID, Platform: clientpb.Platform_PLATFORM_MOBILE,
-		Token: func(context.Context, bool) (string, error) { return r.token(i) },
+		Token: func(_ context.Context, refresh bool) (string, error) {
+			if t := sc.tok.Load(); t != nil && !refresh {
+				return *t, nil // a phone's cached token
+			}
+			t, err := r.token(i)
+			if err == nil {
+				sc.tok.Store(&t)
+			}
+			return t, err
+		},
 		Store: &sdk.MemStore{}, OnEvent: sc.event, Windows: r.cfg.windows,
 		Dial: func(ctx context.Context, _ string) (net.Conn, error) {
 			nc, gw, err := r.bal.Dial(ctx)
-			if err == nil {
-				sc.gw.Store(int32(gw))
+			if err != nil {
+				return nil, err
 			}
-			return nc, err
+			sc.gw.Store(int32(gw))
+			return &replyConn{Conn: nc, rec: r.rec}, nil
+		},
+		Initiate: func(keyID uint16, pub []byte) (*wire.Initiator, []byte, error) {
+			if r.pre != nil {
+				if pr := r.pre.take(sc); pr != nil {
+					r.rec.Handshake(true)
+					return pr.in, pr.frame, nil
+				}
+			}
+			r.rec.Handshake(false)
+			return wire.Initiate(keyID, pub, uint16(clientpb.Cmd_CMD_HANDSHAKE))
 		}})
 }
 
@@ -44,10 +69,20 @@ func (sc *sdkClient) event(e sdk.Event) {
 	switch e.Kind {
 	case sdk.EventConnecting:
 		sc.start = now
+		if !sc.due.IsZero() { // how late loadgen starts the attempt (#107)
+			sc.r.rec.AttemptLag(now.Sub(sc.due))
+			sc.due = time.Time{}
+		}
 	case sdk.EventOnline:
 		sc.online = true
 		sc.r.rec.Online(sc.i, int(sc.gw.Load()), sc.start, now)
+		if sc.r.pre != nil {
+			sc.r.pre.enqueue(sc)
+		}
 	case sdk.EventWaiting, sdk.EventIdle, sdk.EventLoginRequired:
+		if e.Kind == sdk.EventWaiting {
+			sc.due = now.Add(e.Wait.D)
+		}
 		switch {
 		case sc.online:
 			sc.online = false
@@ -56,4 +91,29 @@ func (sc *sdkClient) event(e sdk.Event) {
 			sc.r.rec.Failed(e.End.String())
 		}
 	}
+}
+
+// replyConn records how long the client took from the read that completed
+// the server's handshake reply to its Login frame, its second write: Finish
+// and the Login's seal, on loadgen's CPU (#107).
+type replyConn struct {
+	net.Conn
+	rec    *Recorder
+	read   atomic.Int64 // unix ns the latest Read returned
+	writes atomic.Int32
+}
+
+func (c *replyConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	c.read.Store(time.Now().UnixNano())
+	return n, err
+}
+
+func (c *replyConn) Write(b []byte) (int, error) {
+	if c.writes.Add(1) == 2 {
+		if at := c.read.Load(); at != 0 {
+			c.rec.ReplyLag(time.Duration(time.Now().UnixNano() - at))
+		}
+	}
+	return c.Conn.Write(b)
 }
