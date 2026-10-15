@@ -5,8 +5,10 @@ import (
 	"errors"
 	"io"
 	"net"
+	"runtime"
 	"testing"
 	"time"
+	"weak"
 
 	"github.com/Tallinzp/goim/api/clientpb"
 	"github.com/Tallinzp/goim/internal/sdk"
@@ -73,19 +75,20 @@ func readFrame(s net.Conn) <-chan []byte {
 
 // #109: a handshake no reply answered is sent again by the next attempt,
 // and completes there; once answered, the next attempt makes a new one.
+// Each attempt dials before it initiates, as the SDK's login does.
 func TestUnansweredHandshakeIsSentAgain(t *testing.T) {
 	sc, key := handshakeClient(t)
 	cmd := uint16(clientpb.Cmd_CMD_HANDSHAKE)
 
 	// Attempt 1: the gateway reads the frame and closes (its handshake limit).
 	c1, s1 := net.Pipe()
+	rc1 := sc.track(c1)
 	in1, f1, err := sc.initiate(1, key.Public)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := readFrame(s1)
 	go func() { <-got; s1.Close() }()
-	rc1 := sc.track(c1)
 	if _, err := wire.ClientHandshakeWith(rc1, in1, f1); err == nil {
 		t.Fatal("attempt 1: a closed gateway completed the handshake")
 	}
@@ -95,6 +98,7 @@ func TestUnansweredHandshakeIsSentAgain(t *testing.T) {
 	c2, s2 := net.Pipe()
 	defer c2.Close()
 	defer s2.Close()
+	rc2 := sc.track(c2)
 	in2, f2, err := sc.initiate(1, key.Public)
 	if err != nil {
 		t.Fatal(err)
@@ -113,7 +117,7 @@ func TestUnansweredHandshakeIsSentAgain(t *testing.T) {
 		s2.Write(reply)
 		srv <- sess
 	}()
-	cs, err := wire.ClientHandshakeWith(sc.track(c2), in2, f2)
+	cs, err := wire.ClientHandshakeWith(rc2, in2, f2)
 	if err != nil {
 		t.Fatalf("attempt 2: %v", err)
 	}
@@ -133,6 +137,7 @@ func TestUnansweredHandshakeIsSentAgain(t *testing.T) {
 	if sc.held.Load() != nil {
 		t.Fatal("an answered handshake is still held")
 	}
+	sc.track(byteConn{})
 	_, f3, err := sc.initiate(1, key.Public)
 	if err != nil || bytes.Equal(f3, f1) {
 		t.Fatalf("attempt 3: %v, same frame %v", err, bytes.Equal(f3, f1))
@@ -151,63 +156,51 @@ func (byteConn) Read(b []byte) (int, error)  { b[0] = 1; return 1, nil }
 func (byteConn) Write(b []byte) (int, error) { return len(b), nil }
 func (byteConn) Close() error                { return nil }
 
-// #109: an attempt the SDK cancels can still be running when the next one
-// starts. A handshake is sent again only once its sender's connection is
-// closed, which then can neither take it nor read a reply for it; one
-// answered is never sent again.
+// #109: the SDK runs one attempt at a time and dials before it initiates,
+// but an attempt it cancels (drop: logout, Close) keeps running until its
+// connection's close lands, so it can write or read after the next attempt
+// dialed. Only the client's newest connection may send or finish its held
+// handshake; an unanswered one is sent again by every attempt, so no other
+// first message is pending.
 func TestAHeldHandshakeIsFinishedOnce(t *testing.T) {
-	t.Run("not while its sender is open", func(t *testing.T) {
+	t.Run("a newer attempt takes it from an open sender", func(t *testing.T) {
 		sc, key := handshakeClient(t)
+		rcA := sc.track(byteConn{})
 		_, f, _ := sc.initiate(1, key.Public)
-		if _, err := sc.track(byteConn{}).Write(f); err != nil {
+		if _, err := rcA.Write(f); err != nil {
 			t.Fatal(err)
 		}
-		if _, f2, _ := sc.initiate(1, key.Public); bytes.Equal(f2, f) {
-			t.Fatal("sent again while its sender may still read the reply")
+		rcB := sc.track(byteConn{}) // A was cancelled; its close has not landed
+		if _, fb, _ := sc.initiate(1, key.Public); !bytes.Equal(fb, f) {
+			t.Fatal("not sent again")
+		}
+		if _, err := rcA.Read(make([]byte, 1)); !errors.Is(err, errHandshakeTaken) {
+			t.Fatalf("the older sender read a reply: %v", err)
+		}
+		if _, err := rcB.Write(f); err != nil {
+			t.Fatal(err)
+		}
+		if n, err := rcB.Read(make([]byte, 1)); n != 1 || err != nil {
+			t.Fatalf("the newest sender: %d %v", n, err)
 		}
 	})
-	t.Run("its closed sender reads no reply", func(t *testing.T) {
+	// Review M2: a cancelled attempt writing after the live one must not
+	// take the handshake from it.
+	t.Run("an older attempt's late write", func(t *testing.T) {
 		sc, key := handshakeClient(t)
-		_, f, _ := sc.initiate(1, key.Public)
-		rc1 := sc.track(byteConn{})
-		if _, err := rc1.Write(f); err != nil {
-			t.Fatal(err)
-		}
-		rc1.Close()
-		_, f2, _ := sc.initiate(1, key.Public)
-		if !bytes.Equal(f2, f) {
-			t.Fatal("not sent again after its sender closed")
-		}
-		if _, err := rc1.Read(make([]byte, 1)); !errors.Is(err, errHandshakeTaken) {
-			t.Fatalf("the closed sender read a reply: %v", err)
-		}
-		rc2 := sc.track(byteConn{})
-		if _, err := rc2.Write(f2); err != nil {
-			t.Fatal(err)
-		}
-		if n, err := rc2.Read(make([]byte, 1)); n != 1 || err != nil {
-			t.Fatalf("the new sender: %d %v", n, err)
-		}
-	})
-	// Review O3: A took the held handshake, was cancelled before writing
-	// (its connection closed), and B took it too; A's late write must not
-	// take it back from B, whose reply would then be refused.
-	t.Run("a closed sender's late write", func(t *testing.T) {
-		sc, key := handshakeClient(t)
-		_, f, _ := sc.initiate(1, key.Public)
 		rc0 := sc.track(byteConn{})
+		_, f, _ := sc.initiate(1, key.Public)
 		if _, err := rc0.Write(f); err != nil {
 			t.Fatal(err)
 		}
-		rc0.Close() // refused: the handshake is reusable
-		_, fa, _ := sc.initiate(1, key.Public)
+		rc0.Close() // refused
 		rcA := sc.track(byteConn{})
-		rcA.Close() // cancelled before its write
+		_, fa, _ := sc.initiate(1, key.Public) // A is cancelled before its write
+		rcB := sc.track(byteConn{})
 		_, fb, _ := sc.initiate(1, key.Public)
 		if !bytes.Equal(fa, f) || !bytes.Equal(fb, f) {
 			t.Fatal("not sent again")
 		}
-		rcB := sc.track(byteConn{})
 		if _, err := rcB.Write(fb); err != nil {
 			t.Fatal(err)
 		}
@@ -218,10 +211,45 @@ func TestAHeldHandshakeIsFinishedOnce(t *testing.T) {
 			t.Fatalf("the live sender: %d %v", n, err)
 		}
 	})
+	// Review M1: with two attempts cancelled in a row, the third still sends
+	// the same handshake, so no late write carries a frame the guards no
+	// longer know; nor can a late write of an answered one.
+	t.Run("two cancelled attempts", func(t *testing.T) {
+		sc, key := handshakeClient(t)
+		rc0 := sc.track(byteConn{})
+		_, f, _ := sc.initiate(1, key.Public)
+		if _, err := rc0.Write(f); err != nil {
+			t.Fatal(err)
+		}
+		rc0.Close() // refused
+		rcA := sc.track(byteConn{})
+		sc.initiate(1, key.Public) // cancelled before its write
+		rc1 := sc.track(byteConn{})
+		sc.initiate(1, key.Public)
+		if _, err := rc1.Write(f); err != nil {
+			t.Fatal(err)
+		}
+		rc2 := sc.track(byteConn{}) // rc1 cancelled, still open
+		if _, f2, _ := sc.initiate(1, key.Public); !bytes.Equal(f2, f) {
+			t.Fatal("a new handshake while one is unanswered")
+		}
+		if _, err := rc1.Read(make([]byte, 1)); !errors.Is(err, errHandshakeTaken) {
+			t.Fatalf("a cancelled sender read a reply: %v", err)
+		}
+		if _, err := rc2.Write(f); err != nil {
+			t.Fatal(err)
+		}
+		if n, err := rc2.Read(make([]byte, 1)); n != 1 || err != nil {
+			t.Fatalf("the newest sender: %d %v", n, err)
+		}
+		if _, err := rcA.Write(f); !errors.Is(err, errHandshakeTaken) {
+			t.Fatalf("a late write of the answered handshake: %v", err)
+		}
+	})
 	t.Run("answered before the resend", func(t *testing.T) {
 		sc, key := handshakeClient(t)
-		_, f, _ := sc.initiate(1, key.Public)
 		rc1 := sc.track(byteConn{})
+		_, f, _ := sc.initiate(1, key.Public)
 		if _, err := rc1.Write(f); err != nil {
 			t.Fatal(err)
 		}
@@ -229,8 +257,29 @@ func TestAHeldHandshakeIsFinishedOnce(t *testing.T) {
 			t.Fatalf("the sender: %d %v", n, err)
 		}
 		rc1.Close()
+		sc.track(byteConn{})
 		if _, f2, _ := sc.initiate(1, key.Public); bytes.Equal(f2, f) {
 			t.Fatal("an answered handshake was sent again")
+		}
+	})
+	// Review M3: a client waiting to resend holds its handshake, not the
+	// closed connection that sent it.
+	t.Run("keeps no closed sender", func(t *testing.T) {
+		sc, key := handshakeClient(t)
+		rc := sc.track(byteConn{})
+		_, f, _ := sc.initiate(1, key.Public)
+		if _, err := rc.Write(f); err != nil {
+			t.Fatal(err)
+		}
+		rc.Close()
+		w := weak.Make(rc)
+		rc = nil
+		runtime.GC()
+		if w.Value() != nil {
+			t.Fatal("the held handshake keeps its closed sender alive")
+		}
+		if sc.held.Load() == nil {
+			t.Fatal("the unanswered handshake was dropped")
 		}
 	})
 }

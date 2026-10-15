@@ -23,6 +23,7 @@ type sdkClient struct {
 	pre    atomic.Pointer[prepared]  // the next attempt's first message (#106)
 	queued atomic.Bool               // waiting for a precompute worker
 	held   atomic.Pointer[handshake] // the last attempt's first message while no reply answered it (#109)
+	dials  atomic.Uint64             // connections dialed; the latest is the attempt that runs (#109)
 	due    time.Time                 // the next attempt's due time (its wait's end), zero: no wait (#107); run loop only
 	start  time.Time                 // the current attempt's start; run loop only
 	online bool                      // run loop only
@@ -58,12 +59,11 @@ func (r *Runner) newSDK(i int) (*sdk.Client, error) {
 
 // track wraps a connection the client just dialed (#107, #109).
 func (sc *sdkClient) track(nc net.Conn) *replyConn {
-	return &replyConn{Conn: nc, sc: sc, dialed: time.Now()}
+	return &replyConn{Conn: nc, sc: sc, seq: sc.dials.Add(1), dialed: time.Now()}
 }
 
 // initiate is the client's Config.Initiate. It sends the last attempt's
-// first message again while no reply byte answered it and its connection is
-// closed (#109): the gateway refuses a handshake over its limit before any
+// first message again while no reply byte answered it (#109): the gateway refuses a handshake over its limit before any
 // X25519, so it costs the server the same, and loadgen is spared the two
 // X25519 a phone makes on its own CPU. Otherwise it takes the precomputed
 // one (#106) or makes one. A prepared or held frame is for the env's key,
@@ -127,42 +127,43 @@ func (sc *sdkClient) event(e sdk.Event) {
 
 // handshake is a client's last first message (#109). An Initiator serves
 // one handshake, so it is sent again only while no reply byte has come back
-// for it, and only once the connection that sent it last is closed. A
-// closed connection can neither take it (a cancelled attempt writing late,
-// review O3) nor finish it, so no two attempts can finish it. (An attempt
-// the SDK cancels can still be running when the next one starts; the
-// cancel closes its connection.)
+// for it. The SDK runs one attempt at a time and dials before it initiates;
+// an attempt it cancels (drop) keeps running until its connection's close
+// lands, so it can write or read after the next attempt dialed. Only the
+// client's newest connection may send the handshake or finish it, so no two
+// attempts can finish it (review O3, M1, M2). The sender is kept as its
+// dial number, not the connection (review M3).
 type handshake struct {
 	pr       *prepared
 	mu       sync.Mutex
-	owner    *replyConn // the connection that sent it last
-	answered bool       // a reply byte came back on owner: never sent again
+	owner    uint64 // the dial number of the connection that sent it last
+	answered bool   // a reply byte came back on owner: never sent again
 }
 
 func (h *handshake) reusable() bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return !h.answered && h.owner != nil && h.owner.closed.Load()
+	return !h.answered
 }
 
-// send: c sends h's frame. False if a reply answered h meanwhile, or c is
-// closed (review O3): c must not use it.
+// send: c sends h's frame. False if a reply answered h meanwhile, or a newer
+// connection was dialed: c must not use it.
 func (h *handshake) send(c *replyConn) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.answered || c.closed.Load() {
+	if h.answered || c.seq != c.sc.dials.Load() {
 		return false
 	}
-	h.owner = c
+	h.owner = c.seq
 	return true
 }
 
-// reply: a reply byte for h came back on c. False if c is closed or another
-// connection sent h since: c must not finish it.
+// reply: a reply byte for h came back on c. False if c did not send h last,
+// or a newer connection was dialed: c must not finish it.
 func (h *handshake) reply(c *replyConn) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.owner != c || c.closed.Load() {
+	if h.answered || h.owner != c.seq || c.seq != c.sc.dials.Load() {
 		return false
 	}
 	h.answered = true
@@ -170,7 +171,8 @@ func (h *handshake) reply(c *replyConn) bool {
 }
 
 // errHandshakeTaken fails a connection that may not use the client's held
-// handshake: closed, or another connection sent it since (#109).
+// handshake: a newer connection was dialed, or another one sent it since
+// (#109).
 var errHandshakeTaken = errors.New("loadgen: handshake used by a later attempt")
 
 // replyConn measures loadgen's own lags on one connection: from the dial
@@ -182,16 +184,11 @@ var errHandshakeTaken = errors.New("loadgen: handshake used by a later attempt")
 type replyConn struct {
 	net.Conn
 	sc     *sdkClient
+	seq    uint64 // its dial number (#109)
 	dialed time.Time
 	read   atomic.Int64 // unix ns the latest Read returned
 	writes atomic.Int32
 	hs     atomic.Pointer[handshake] // the held handshake this connection sent (#109)
-	closed atomic.Bool
-}
-
-func (c *replyConn) Close() error {
-	c.closed.Store(true)
-	return c.Conn.Close()
 }
 
 func (c *replyConn) Read(b []byte) (int, error) {
@@ -209,11 +206,16 @@ func (c *replyConn) Read(b []byte) (int, error) {
 
 // Write's first call is the handshake frame, recognized as the held one by
 // its backing array: the SDK writes it unchanged in one Write (#109, review
-// O4; TestSDKResendsARefusedHandshake).
+// O4; TestSDKResendsARefusedHandshake). A connection older than the newest
+// is a cancelled attempt's: its first message, held or one answered since,
+// is not sent (review M1).
 func (c *replyConn) Write(b []byte) (int, error) {
 	switch c.writes.Add(1) {
 	case 1:
 		c.sc.r.rec.SendLag(time.Since(c.dialed))
+		if c.seq != c.sc.dials.Load() {
+			return 0, errHandshakeTaken
+		}
 		if h := c.sc.held.Load(); h != nil && len(b) > 0 && len(h.pr.frame) > 0 && &b[0] == &h.pr.frame[0] {
 			if !h.send(c) {
 				return 0, errHandshakeTaken
