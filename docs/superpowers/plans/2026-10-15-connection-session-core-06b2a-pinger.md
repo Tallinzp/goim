@@ -10,6 +10,8 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-03-connection-session-core-design-rev6.md` (*Dead-server detection*: one Ping per heartbeat; close and reconnect when no frame arrives within 10s of a Ping). Inputs: plan 6b2a-reuse's *Execution Notes* (`docs/superpowers/plans/2026-10-14-connection-session-core-06b2a-reuse.md`). The 16GiB diagnostic run (`517cfba`) had 1.80M goroutines at the end (three per online client: `Client.run`, `attempt.run`, `attempt.ping`) and 9.83GB of stacks (~5.5KB each). The 19GiB run (`96b5733`) got all clients back in 208s with GC calm, but the host swapped.
 
+**Review (2026-10-15):** objections O1–O5 (`docs/superpowers/objections/connection-session-core-06b2a-pinger.md`) decided and applied (`…-06b2a-pinger-dispositions.md`): `stop` does not wait for a firing (O1, O2), the dry run measures the saving before and after (O3), a numeric gate (O4).
+
 ## Global Constraints
 
 - The SDK's observable behaviour does not change: first Ping at one heartbeat after the Login reply, then one per heartbeat; the connection is closed (`EndPongTimeout`) when no frame arrives within `PongTimeout` (10s) of the oldest Ping sent since the last frame.
@@ -19,16 +21,16 @@
 
 ## Review Focus
 
-1. **A firing that races `stop`.** When the connection ends (Kick, Reconnect, read error), `serve` stops the pinger while a firing may be running or due. Expected: no Ping is sent and no timeout is reported after `stop` returns, and no timer stays armed. Pinned by `TestPingerStopsForGood` (Task 1).
+1. **A firing that races `stop`.** When the connection ends (Kick, Reconnect, read error), `serve` stops the pinger while a firing may be running or due. Expected: `stop` returns at once; after it, no firing re-arms the timer, so nothing more is sent or reported. A firing already past its `stopped` check may still finish its one `Send` or `timeout`, harmlessly: the connection is closed first, and `serve` has stopped reading the timeout flag (review O2). Pinned by `TestPingerStopsForGood` (Task 1).
 2. **The Pong timeout on the timer's goroutine.** The close now runs on the callback's goroutine, not on a goroutine `serve` started. Expected: `serve`'s `Recv` fails and the end is still `EndPongTimeout`, not `EndLost`. Pinned by the existing `TestPongTimeoutClosesAndReconnects` and by `TestPingerTimesOutOncePongTimeoutAfterAPing` (Task 1).
-3. **A `Send` that blocks** (a full socket send buffer). Expected: the firing waits in `Send` as the goroutine used to; `serve`'s deferred `Close` runs before `stop`, so the `Send` fails and `stop` does not wait forever. The defer order in Task 1 Step 3 pins it (Close registered after stop, so it runs first).
+3. **A `Send` that blocks** (a full socket send buffer). Expected: the firing waits in `Send` as the goroutine used to, without `mu`; `stop` does not wait for it, so a blocked `Send` cannot hold up `serve` (review O2). `serve`'s deferred `Close` still runs before `stop`, so the `Send` fails at once, but that order is no longer load-bearing.
 4. **Goroutines per online client.** Expected: one goroutine holds an `attempt` frame per online client, not two. Pinned by `TestAnOnlineClientHoldsOneAttemptGoroutine` (Task 1).
 5. **Heartbeat Pings answered over a long time.** Expected: no spurious timeout over many heartbeats once fires come from a timer. Pinned by `TestPingerKeepsPingingWhileAnswered` (Task 1) and the existing 10-minute tail of `TestPongTimeoutClosesAndReconnects`.
 
 ## Implementation choices this plan makes
 
 - **`pinger` in its own file** (`internal/sdk/pinger.go`) with `send` and `timeout` as functions, so it is tested without a connection. `attempt.serve` wires it to `a.cc`.
-- **One mutex held for the whole firing.** Firings never overlap (one timer, re-armed at the end of each firing), but the race detector sees no happens-before edge from `Reset` to the next callback. Holding `mu` through the firing gives it one, and makes `stop` exact: once `stop` returns, no firing is running or will run. A firing blocked in `Send` holds `mu`, so `stop` waits for it. `serve` closes the connection before it stops the pinger, so that `Send` fails at once.
+- **A mutex around the state, not around `send`/`timeout`** (review O2). Firings never overlap (one timer, re-armed at the end of each firing), but the race detector sees no happens-before edge from `Reset` to the next callback; the pinger's state is touched only under `mu`, which gives it one. `fire` releases `mu` while it calls `send` or `timeout`, and `stop` (under `mu`: `stopped`, `t.Stop()`) never waits for a firing: holding `mu` through a `Send` would let a blocked `Send` hold up `serve`, a hang the old goroutine (cancelled, never waited for) could not have. Nothing needs `stop` to be exact: after `serve`'s `Close` a late `Send` fails, and a late `timeout` sets a flag `serve` no longer reads and closes a closed socket. What must hold is that no firing re-arms the timer after `stop`: `fire` checks `stopped` on entry and again before `Reset`.
 - **No context.** The old goroutine also watched the attempt's context. A cancel closes the socket (`context.AfterFunc` in `login`), `serve`'s `Recv` fails and `serve` stops the pinger, so the context adds nothing.
 
 ## File Structure
@@ -147,8 +149,9 @@ func TestPingerKeepsPingingWhileAnswered(t *testing.T) {
 	})
 }
 
-// Review Focus 1: after stop, nothing is sent or reported, whether stop
-// comes between firings or during one, and stop twice is harmless.
+// Review Focus 1: after stop, no firing re-arms, whether stop comes between
+// firings or during one (stop does not wait for it), and stop twice is
+// harmless.
 func TestPingerStopsForGood(t *testing.T) {
 	t.Run("between firings", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
@@ -178,17 +181,11 @@ func TestPingerStopsForGood(t *testing.T) {
 				return l.send(id)
 			}, l.timeout)
 			<-inSend
-			stopped := make(chan struct{})
-			go func() { p.stop(); close(stopped) }()
-			synctest.Wait()
-			select {
-			case <-stopped:
-				t.Fatal("stop returned while a firing was in Send")
-			default:
-			}
+			p.stop() // returns at once: it does not wait for the firing (review O2)
 			close(release)
-			<-stopped
 			time.Sleep(10 * time.Minute)
+			// The released firing finishes its Ping but does not re-arm: no
+			// timeout at 40s, no second Ping.
 			if pings, timeouts := l.got(); len(pings) != 1 || len(timeouts) != 0 {
 				t.Fatalf("pings %v timeouts %v, want the one Ping and no timeout", pings, timeouts)
 			}
@@ -267,8 +264,9 @@ type pinger struct {
 	send            func(reqID uint32) error
 	timeout         func()
 
-	// mu is held through each firing: firings never overlap, the next one
-	// sees this one's state, and once stop returns none runs again.
+	// mu guards the state below, not send or timeout: stop never waits for
+	// a firing (a blocked Send must not hold up serve), and a firing checks
+	// stopped before it re-arms, so none runs after the one in progress.
 	mu         sync.Mutex
 	t          *time.Timer
 	stopped    bool
@@ -291,8 +289,8 @@ func startPinger(hb, pongTimeout time.Duration, start time.Time, lastRecv *atomi
 // unanswered Ping is pongTimeout old, and otherwise arms the next firing.
 func (p *pinger) fire() {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.stopped {
+		p.mu.Unlock()
 		return
 	}
 	now := time.Since(p.start)
@@ -300,14 +298,27 @@ func (p *pinger) fire() {
 		p.unanswered = -1
 	}
 	if p.unanswered >= 0 && now >= p.unanswered+p.pongTimeout {
+		p.mu.Unlock()
 		p.timeout()
 		return
 	}
-	if now >= p.next {
+	ping := now >= p.next
+	if ping {
 		p.reqID++
-		if p.send(p.reqID) != nil {
-			return // the reader sees the broken connection
-		}
+	}
+	reqID := p.reqID
+	p.mu.Unlock()
+
+	if ping && p.send(reqID) != nil {
+		return // the reader sees the broken connection
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.stopped {
+		return // stopped during the Send: do not re-arm
+	}
+	if ping {
 		if p.unanswered < 0 {
 			p.unanswered = now
 		}
@@ -320,8 +331,9 @@ func (p *pinger) fire() {
 	p.t.Reset(at - time.Since(p.start))
 }
 
-// stop ends the pinger: it waits for a firing in progress, and none runs
-// after it returns.
+// stop ends the pinger without waiting for a firing in progress: that
+// firing may still finish its Send or timeout, harmlessly (serve closes the
+// connection first), but it does not re-arm, and none runs after it.
 func (p *pinger) stop() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -342,7 +354,7 @@ func (a *attempt) serve(ctx context.Context, cfg *Config, resp *clientpb.LoginRe
 		func(reqID uint32) error { return a.cc.Send(clientpb.Cmd_CMD_PING, reqID, nil) },
 		func() { pongTimedOut.Store(true); a.cc.Close() })
 	defer p.stop()
-	defer a.cc.Close() // before stop: a firing blocked in Send fails at once
+	defer a.cc.Close() // before stop: a firing still in Send fails at once
 	for {
 ```
 
@@ -359,9 +371,8 @@ Expected: all pass.
 - [ ] **Step 5: Mutation checks**
 
 Make each change, run the named test, confirm it fails, then revert:
-1. In `stop`, drop the lock (set `stopped` and call `p.t.Stop()` without `mu`). Expected: `TestPingerStopsForGood/during_a_firing` fails. `stop` returns while the firing is in `Send` ("stop returned while a firing was in Send"), and the firing then re-arms the timer, so a second Ping at 60s follows. `fire`'s `if p.stopped` check covers a callback the timer had already started when `stop` took `mu`. No deterministic test reaches that order, so it is reviewed by reading.
-2. In `serve`, swap the two defers (`defer a.cc.Close()` first, then `defer p.stop()`). Expected: no unit test fails; review by reading only. Record in the *Execution Notes* that Review Focus 3 rests on the defer order and its comment.
-3. In `fire`, drop `p.unanswered = now`. Expected: `TestPingerTimesOutOncePongTimeoutAfterAPing` fails (no timeout).
+1. In `fire`, drop both `stopped` checks (on entry and before `Reset`). Expected: `TestPingerStopsForGood/during_a_firing` fails: the released firing re-arms at 40s and reports a timeout ("timeouts [40s]"). Dropping only one does not fail it, and that is expected: the entry check stops the re-armed 40s firing, and the check before `Reset` stops the re-arm. The entry check alone also covers a callback the timer had already started when `stop` ran; no deterministic test reaches that order, so it is reviewed by reading.
+2. In `fire`, drop `p.unanswered = now`. Expected: `TestPingerTimesOutOncePongTimeoutAfterAPing` fails (no timeout).
 
 - [ ] **Step 6: Commit**
 
@@ -386,8 +397,8 @@ git commit -m "feat(sdk): the pinger runs on a timer, not a goroutine: one gorou
 
 - [ ] **Step 1: Dry run on the dev machine**
 
-Run: `GWLOSS_PHASES=b_stress GWLOSS_STRESS_CLIENTS=1500 GWLOSS_SS_EVERY=2 make test-tier2 SCENARIO=gwloss`. Use the same small-scale settings as the reuse plan's dry runs; check `gwloss.sh`'s header (lines 30–80) for the client, rate and cap variables.
-Expected: 15 checks, only `no_swap_in_b_stress` may fail (the dev machine). In the `loadgen` socket samples, goroutines after all victims are back are about 2 per SDK client (≈3,000 plus a constant), not 3 (≈4,500).
+Run: `GWLOSS_PHASES=b_stress GWLOSS_STRESS_CLIENTS=1500 GWLOSS_SS_EVERY=2 make test-tier2 SCENARIO=gwloss`. Use the same small-scale settings as the reuse plan's dry runs; check `gwloss.sh`'s header (lines 30–80) for the client, rate and cap variables. Run it twice (review O3): first on the commit before Task 1 (a temporary `git worktree` at it), then on Task 1's commit.
+Expected: 15 checks each, only `no_swap_in_b_stress` may fail (the dev machine). From loadgen's last `/runtime` sample once all victims are back, record in each run the goroutines and stack bytes: goroutines about 3 per SDK client before (≈4,500 plus a constant) and 2 after (≈3,000). In the *Execution Notes*: stack bytes per online SDK client before and after, the difference, and the difference scaled to 600,000, against this plan's ~3.3GB. The 1,500-client figure is a guide (stack sizes may differ at scale), not the Tier 2 result.
 
 - [ ] **Step 2: Smoke at 100k SDK clients (Tier 2 host)**
 
@@ -404,7 +415,11 @@ Read it against the 16GiB diagnostic run (`517cfba`) and the 19GiB run (`96b5733
 - time until all 600,000 are back (650s at 16GiB, 208s at 19GiB), and `connect_lag` p50/p99;
 - `no_swap_in_b_stress` (762k pages in at 19GiB);
 - `b_stress_loadgen_headroom` and `b_stress_storm_real`.
-`b_stress_storm_real`'s 100ms p99 bound may still fail in the storm's first 30s, where loadgen used 12.2 of 14 cores without GC pressure (19GiB run). That is a separate question, not this plan's gate. This plan's gate is loadgen staying under its limit with GC calm and no swap.
+`b_stress_storm_real`'s 100ms p99 bound may still fail in the storm's first 30s, where loadgen used 12.2 of 14 cores without GC pressure (19GiB run). That is a separate question, not this plan's gate. This plan's gate (review O4):
+1. loadgen's mapped memory ≤ `GOMEMLIMIT` (16GiB, 17.18GB) in every `/runtime` sample after all victims are back;
+2. the GC CPU limiter engaged in no cycle after t≈60s;
+3. `no_swap_in_b_stress` may fail with ≤ 1,000 pages swapped in: recorded, not gating (every 16GiB b_stress run so far had 1–272).
+Run this step before the host's UMA change. If the UMA change is already made, say so in the *Execution Notes*; that run does not show the result holds without it (Global Constraints).
 
 - [ ] **Step 4: Record**
 
@@ -420,6 +435,7 @@ git commit -m "docs: b_stress with the SDK pinger as a timer recorded (plan 6b2a
 
 ## After this plan
 
+If gate 1 or 2 (Task 2 Step 3) fails, loadgen is still over its limit: stop and decide with the user between `Client.run`'s goroutine (the one left per online client besides `serve`), a smaller b_stress population, or recording b_stress as loadgen-bound (review O3).
 If b_stress passes apart from `b_stress_storm_real`'s first-30s bound, decide that bound with the user: a second machine for loadgen, or record b_stress's storm as loadgen-bound (#102's `loadgen_bound`). If it passes 15/15, run the full `gwloss` (both phases, 29 checks). Then 6b2a-stress is complete: the README's *Measured results* (both languages) get b-stress's numbers, and `main` is fast-forwarded.
 
 ## Execution Notes
