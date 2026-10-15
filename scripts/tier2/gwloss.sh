@@ -478,8 +478,10 @@ print(json.dumps(out))' "$STACK_DIR/artifacts/ss-storm.jsonl" 2>/dev/null || ech
   # accept, inside it; the b_stress diagnostic run), sent each handshake
   # frame after its dial (send_lag, run 25: a late frame is a survivor's
   # handshake_timeout) and answered each handshake reply within
-  # GWLOSS_LAG_P99_MS (p99; loadgen's own lags only, review I1/I2). b-stress has no SLO; its relogin distribution is the
-  # measurement only when this passes. Detection (mark → loss noticed on the
+  # GWLOSS_LAG_P99_MS (p99; loadgen's own lags only, review I1/I2). Its
+  # detail has the storm's handshake counts: precomputed, inline and reused
+  # (#109; run 25: 5.2M inline, before #109). b-stress has no SLO; its
+  # relogin distribution is the measurement only when this passes. Detection (mark → loss noticed on the
   # client's run loop) is recorded beside the lags, not gated: it includes
   # the dying gateway's socket teardown, which production has too.
   storm_d=$(lg_get /stats 'd["storm_since_mark"]')

@@ -63,3 +63,5 @@ The b_stress run with `connect_lag` (`0fe01ae`) measured the gap: `connect_lag` 
 
 **Recommended (Claude, 2026-10-15), not yet decided:** #109's reuse (Tasks 2–3), then run 27.
 
+**Decision (2026-10-15, the user):** #109's reuse as recommended: Tasks 2–3 executed inline (O2–O5 applied), then Tier 2 run 27 (b_stress, `GWLOSS_SS_EVERY=10`).
+
