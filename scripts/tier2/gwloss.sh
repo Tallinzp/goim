@@ -69,6 +69,17 @@
 #                      those with unacked bytes (Send-Q), its accept queue,
 #                      and its handshake gauge and counters; on the Logic CPU
 #                      set. The result gets ss_<phase>, the samples in order.
+#                      Each sample also has loadgen's GET /runtime: GC CPU
+#                      seconds, GC cycles, goroutines, stack and heap bytes,
+#                      mapped bytes against GOMEMLIMIT, and its scheduling
+#                      waits (run 27: GC at the memory limit?).
+#   GWLOSS_TAIL_PROFILE_AT  seconds after the kill to take a second 30s
+#                      loadgen CPU profile, artifacts/storm_tail/ (default 0:
+#                      off; at least 30, after the storm's own profile:
+#                      loadgen serves one CPU profile at a time). A
+#                      diagnostic (run 27: loadgen held ~13 cores while few
+#                      clients were left to log in); taken only if the
+#                      victims are not back by then.
 #
 # Checks (b1; b_stress has the same with its own prefix, unless noted):
 #   b1_stack           redis, devtoken, Logic and the gateways become Ready
@@ -143,6 +154,13 @@ PHASES=${GWLOSS_PHASES:-b1 b_stress}
 for p in $PHASES; do
   case $p in b1 | b_stress) ;; *) echo "gwloss: unknown phase '$p' (b1, b_stress)" >&2; exit 1 ;; esac
 done
+# The tail profile starts after the storm's own 30s profile: loadgen serves
+# one CPU profile at a time.
+case ${GWLOSS_TAIL_PROFILE_AT:-0} in
+  0) ;;
+  *[!0-9]*) echo "gwloss: GWLOSS_TAIL_PROFILE_AT must be 0 or seconds >= 30" >&2; exit 1 ;;
+  *) [ "$GWLOSS_TAIL_PROFILE_AT" -ge 30 ] || { echo "gwloss: GWLOSS_TAIL_PROFILE_AT must be 0 or seconds >= 30" >&2; exit 1; } ;;
+esac
 # The memory each phase needs available (#93): b1's loadgen peaked at
 # 10.6-11.5GB with 400k SDK clients (runs 20, 21). b_stress's loadgen peaked
 # at 16.1GB with 600k (run 22): its live heap was 3.25GB, the rest mostly
@@ -236,6 +254,7 @@ lg_heap() {
 # cli_est and cli_sendq_* are loadgen's sockets to it and those holding bytes
 # its kernel has not acked; accept_q is its listener's queue (backlog: the
 # limit); then its handshake gauge and counters. ss_ms: what ss took.
+# loadgen: its GET /runtime (run 27).
 ss_sample() {
   local t=$1 g ports="" t0 ms est lst gw=""
   for g in "${survivors[@]}"; do ports+=" 127.0.0.1:$((STACK_PORT_BASE + 100 + 10 * ${g#gw-}))"; done
@@ -256,7 +275,7 @@ ss_sample() {
       pending_mem='goim_gateway_admission_rejects_total:reason="pending_mem"' \
       handshakes_ok='goim_gateway_handshakes_total:result="ok"' handshakes_no_slot='goim_gateway_handshakes_total:result="no_slot"')"
   done
-  echo "{\"t\": $t, \"ss_ms\": $ms, \"sockets\": {$est}, \"listeners\": {$lst}, \"gateways\": {$gw}}"
+  echo "{\"t\": $t, \"ss_ms\": $ms, \"sockets\": {$est}, \"listeners\": {$lst}, \"gateways\": {$gw}, \"loadgen\": $(lg_get /runtime d)}"
 }
 
 t=$SECONDS
@@ -393,6 +412,13 @@ for name in $PHASES; do
   # hid it in run 22 (3.2 of 8 cores, 7.9 in the first 30s).
   (stack_profile storm 30 & lg_profile storm 30 & { sleep 30; stack_usage_json >"$STACK_DIR/storm30.json"; }; wait) >/dev/null 2>&1 &
   prof=$!
+  # GWLOSS_TAIL_PROFILE_AT: loadgen's CPU in the storm's tail (run 27), if
+  # the victims are not back by then; stopped with them.
+  tail_at=${GWLOSS_TAIL_PROFILE_AT:-0} tailprof=""
+  if [ "$tail_at" -gt 0 ]; then
+    (sleep "$tail_at"; lg_profile storm_tail 30) >/dev/null 2>&1 &
+    tailprof=$!
+  fi
   # GWLOSS_SS_EVERY: socket samples from the kill until the victims are back,
   # on the Logic CPU set (a diagnostic, off by default; run 26).
   ss_every=${GWLOSS_SS_EVERY:-0} sampler=""
@@ -430,6 +456,12 @@ for l in open(sys.argv[1]):
     except ValueError:
         pass
 print(json.dumps(out))' "$STACK_DIR/artifacts/ss-storm.jsonl" 2>/dev/null || echo null)"
+  fi
+  # A tail profile still running finishes: the storm's last clients are its
+  # tail too; one not started yet is not taken.
+  if [ -n "$tailprof" ]; then
+    [ $((SECONDS - kill_t)) -lt "$tail_at" ] && { pkill -P "$tailprof" 2>/dev/null; kill "$tailprof" 2>/dev/null; }
+    wait "$tailprof" 2>/dev/null
   fi
   lg_get "/slo?mark=death&within=30s" d >"$STACK_DIR/artifacts/slo-death.json"
   wait "$sweeping"

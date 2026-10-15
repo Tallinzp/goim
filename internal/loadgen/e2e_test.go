@@ -391,6 +391,16 @@ func TestControlAPI(t *testing.T) {
 	if st.Online != 4 || st.Mode != "light" || st.Sources != 1 {
 		t.Fatalf("/stats %+v", st)
 	}
+	resp, err = http.Get(srv.URL + "/runtime")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rt Runtime
+	json.NewDecoder(resp.Body).Decode(&rt)
+	resp.Body.Close()
+	if rt.Goroutines == 0 || rt.MappedBytes == 0 {
+		t.Fatalf("/runtime %+v", rt)
+	}
 	if code, _ := post(t, srv.URL+"/mark?gateway=nope&mark=x"); code != http.StatusBadRequest {
 		t.Fatalf("/mark unknown gateway: %d", code)
 	}

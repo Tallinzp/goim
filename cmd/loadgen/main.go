@@ -2,7 +2,7 @@
 // scripts/stack.sh's stack.env, starts -clients at -rate through a
 // least-connections balancer from 127.0.0.2… (choices #69, #81), holds them,
 // and serves the control API on -control (GET /stats, POST /kill, POST /mark,
-// POST /up, GET /slo; choice #84) until SIGTERM, Ctrl-C or -duration.
+// POST /up, GET /slo, GET /runtime; choice #84) until SIGTERM, Ctrl-C or -duration.
 // -down keeps gateways out of the balancer until POST /up (#93). It then writes
 // the result, the stats at that moment and every mark's SLO against
 // -within, as JSON to -out, and only then stops every client: stopping 200k

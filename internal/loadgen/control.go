@@ -35,10 +35,12 @@ func (r *Runner) Result(within time.Duration) Result {
 //	POST /up?gateway=gw-1                     the gateway is back in the balancer  {"gateway"}
 //	                                          also after /kill: send it once the gateway listens again
 //	GET  /slo?mark=death&within=30s           SLO
+//	GET  /runtime                             Runtime: loadgen's GC, memory and scheduling counters
 //	/debug/pprof/                             loadgen's own profiles
 func (r *Runner) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /stats", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, r.Stats()) })
+	mux.HandleFunc("GET /runtime", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, ReadRuntime()) })
 	mux.HandleFunc("POST /kill", func(w http.ResponseWriter, q *http.Request) {
 		gw := r.env.Gateway(q.FormValue("gateway"))
 		pid, err := strconv.Atoi(q.FormValue("pid"))
