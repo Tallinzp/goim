@@ -52,10 +52,18 @@
 #   GWLOSS_STRESS_SOURCES  b_stress: loadgen's source addresses (default:
 #                          loadgen's, sized for the victim alone: 120 for 600k)
 #   GWLOSS_STRESS_LG_MEMLIMIT b_stress: loadgen's GOMEMLIMIT (default 16GiB, #93)
+#   GWLOSS_LAG_P99_MS  the storm's attempt lag p99 bound, ms (default 100, #107)
+#   GWLOSS_STRESS_CPUS_LOADGEN  b_stress: loadgen's CPU set (default
+#                      0-5,10,12-17,22, #108)
+#   GWLOSS_STRESS_CPUS_GATEWAY  b_stress: the gateways' CPU set (default 6-9,18-21,
+#                      4 GOMAXPROCS each, #108)
+#   GWLOSS_STRESS_CPUS_LOGIC  b_stress: Logic + Redis's CPU set (default
+#                      11,23, #108)
 #
 # Checks (b1; b_stress has the same with its own prefix, unless noted):
 #   b1_stack           redis, devtoken, Logic and the gateways become Ready
-#   pinning            (first phase) gateways, Logic + Redis and loadgen on their CPU sets
+#   b1_pinning         gateways, Logic + Redis and loadgen on their phase's CPU
+#                      sets (b_stress's differ, #108)
 #   b1_online          every client logs in, each gateway holds 45-55% of
 #                      them; b_stress: every client on gw-0, then gw-1 and
 #                      gw-2 are back in loadgen's balancer
@@ -65,10 +73,9 @@
 #                      reject without counting it, P6b2a-b1I-2)
 #   b_stress_back      (b_stress only) loadgen SIGKILLs gw-0: every one of its
 #                      clients logs in again within GWLOSS_STRESS_BACK_WAIT, and
-#                      the survivors rejected none at capacity; no SLO. Its
-#                      relogin times are loadgen-bound when loadgen_bound is
-#                      true (#102): one host cannot do the client side of a
-#                      600k storm's Noise handshakes in the SDK's 0-20s jitter
+#                      the survivors rejected none at capacity; no SLO.
+#                      Its relogin times are the measurement when
+#                      b_stress_storm_real passes (#107)
 #   b1_kicks           Kick first attempts in the storm, sent or dropped by a
 #                      full queue (R5S-O2), are 0.9-1.1 per relogin (at least 0.9
 #                      per relogin whose entry the sweep had not deleted: such a
@@ -82,6 +89,13 @@
 #                      and did not time out (by Login once the lease is gone,
 #                      or by the refused Kick while it is live, P6b2a-b1I-7),
 #                      and at most 1.1 per relogin
+#   b1_storm_real      the storm was the spec's, not loadgen's (#106, #107):
+#                      every logged-in client held its next handshake frame
+#                      at the kill (loadgen -precompute); after the kill,
+#                      loadgen started each attempt within GWLOSS_LAG_P99_MS
+#                      of its wait's end and wrote each Login frame within
+#                      GWLOSS_LAG_P99_MS of the handshake reply (both p99,
+#                      at least one per relogin)
 #   b1_lease           every survivor renews its lease every interval from
 #                      the kill to the sweep: no call failed or found the
 #                      lease missing, and Logic saw no renewal error
@@ -92,6 +106,7 @@
 #                      storm, and the storm's first 30s, where its relogins
 #                      peak (P6a2aI-4, #102); b_stress's checks the ramp and
 #                      the storm, and records the first 30s as loadgen_bound
+#                      (data; b_stress_storm_real decides, #107)
 #   b1_idle            after loadgen stops, every survivor reaches 0
 #                      connections, 0 awaiting Logout and one Logout done per
 #                      login, none dropped (stack_wait_idle, P6b1I-4)
@@ -133,7 +148,6 @@ t2_nofile 1048576
 export STACK_PIN=1
 STACK_PORT_BASE=${STACK_PORT_BASE:-17000}
 STACK_REDIS_SERVER=$PWD/.cache/redis/bin/redis-server
-LG_CPUS=$(t2_cpulist_expand "$T2_CPUS_LOADGEN" | wc -w)
 t2_on_exit 'stack_down'
 t2_on_exit 'lg_stop' # newest first: loadgen stops before the stack
 
@@ -205,13 +219,18 @@ fi
 STACK_DIR=$T2_OUT stack_build >"$T2_OUT/build.log" 2>&1 || { echo "build failed, see $T2_OUT/build.log" >&2; exit 1; }
 t2_duration setup $((SECONDS - t))
 
-first=1
 missing=""
+# b1 keeps #71's CPU sets; b_stress gives loadgen the CPUs its storm left
+# idle (#108).
+cpus_gateway=$T2_CPUS_GATEWAY cpus_loadgen=$T2_CPUS_LOADGEN cpus_logic=$T2_CPUS_LOGIC
+lag_max=${GWLOSS_LAG_P99_MS:-100}
 for name in $PHASES; do
   # Each phase's stack, victim and waits.
   case $name in
     b1)
       export STACK_GATEWAYS=2
+      export T2_CPUS_GATEWAY=$cpus_gateway T2_CPUS_LOADGEN=$cpus_loadgen T2_CPUS_LOGIC=$cpus_logic
+      unset STACK_GATEWAY_PROCS
       clients=${GWLOSS_CLIENTS:-400000} rate=${GWLOSS_RATE:-5000} cap=${GWLOSS_CAP:-450000}
       sweep_wait=${GWLOSS_SWEEP_WAIT:-180} back_wait=60 idle_wait=300 sources=${GWLOSS_SOURCES:-}
       victim=gw-1 survivors=(gw-0) down="" LG_ENV=()
@@ -220,6 +239,12 @@ for name in $PHASES; do
       ;;
     b_stress)
       export STACK_GATEWAYS=3
+      # #108: loadgen the 4 fast cores and 3 compact (14 CPUs); the gateways
+      # 4 compact cores at 4 GOMAXPROCS each as before (the victim alone in
+      # the ramp, the two survivors after the kill); Logic + Redis one core.
+      export T2_CPUS_GATEWAY=${GWLOSS_STRESS_CPUS_GATEWAY:-6-9,18-21} T2_CPUS_LOADGEN=${GWLOSS_STRESS_CPUS_LOADGEN:-0-5,10,12-17,22}
+      export T2_CPUS_LOGIC=${GWLOSS_STRESS_CPUS_LOGIC:-11,23}
+      export STACK_GATEWAY_PROCS=4
       clients=${GWLOSS_STRESS_CLIENTS:-600000} rate=${GWLOSS_STRESS_RATE:-5000} cap=${GWLOSS_STRESS_CAP:-650000}
       sweep_wait=${GWLOSS_STRESS_SWEEP_WAIT:-300} back_wait=${GWLOSS_STRESS_BACK_WAIT:-900} idle_wait=600
       sources=${GWLOSS_STRESS_SOURCES:-}
@@ -228,6 +253,7 @@ for name in $PHASES; do
       online_rule='d["online"] == '"$clients"' and d["online_by_gateway"].get("gw-0") == '"$clients"
       ;;
   esac
+  LG_CPUS=$(t2_cpulist_expand "$T2_CPUS_LOADGEN" | wc -w)
   export STACK_DIR=$T2_OUT/$name
   mkdir -p "$STACK_DIR"
   ln -sfn ../bin "$STACK_DIR/bin"
@@ -246,7 +272,7 @@ for name in $PHASES; do
   t2_cpustat_snap "$STACK_DIR/cpustat-0"
   t2_tcpstat_snap "$STACK_DIR/tcpstat-0"
   reset_ramp=true; stack_redis_resetstat || reset_ramp=false
-  lg_start "$name" -mode sdk -clients "$clients" -rate "$rate" -uid-prefix "$name" ${sources:+-sources "$sources"} ${down:+-down "$down"}
+  lg_start "$name" -mode sdk -precompute -clients "$clients" -rate "$rate" -uid-prefix "$name" ${sources:+-sources "$sources"} ${down:+-down "$down"} ${GWLOSS_DRY_NO_PRECOMPUTE:+-precompute=false}
   stack_usage_start loadgen="$LG_PID"
   t=$SECONDS
   online=false
@@ -273,21 +299,28 @@ for name in $PHASES; do
   [ -z "$ups" ] || online=false
   t2_check "${name}_online" "$online" "\"want\": $clients, \"online\": $(lg_get /stats 'd["online"]'), \"by_gateway\": $by_gateway, \"ramp_s\": $ramp_s, \"failed\": $(lg_get /stats 'd["failed"]'), \"up_failed\": $(t2_json_str "${ups# }")"
 
-  if [ -n "$first" ]; then
-    first=""
-    wrong=""
-    for ((i = 0; i < STACK_GATEWAYS; i++)); do stack_pinned "gw-$i" "$T2_CPUS_GATEWAY" || wrong+=" gw-$i"; done
-    for n in logic redis; do stack_pinned "$n" "$T2_CPUS_LOGIC" || wrong+=" $n"; done
-    have=$(taskset -pc "$LG_PID" 2>/dev/null)
-    [ "$(t2_cpulist_expand "${have##*: }")" = "$(t2_cpulist_expand "$T2_CPUS_LOADGEN")" ] || wrong+=" loadgen"
-    t2_check pinning "$(t2_bool [ -z "$wrong" ])" "\"gateway_cpus\": $(t2_json_str "$T2_CPUS_GATEWAY"), \"gateway_procs\": $(. "$STACK_DIR/stack.env"; echo "$GATEWAY_PROCS"), \"wrong\": $(t2_json_str "${wrong# }")"
-  fi
+  wrong=""
+  for ((i = 0; i < STACK_GATEWAYS; i++)); do stack_pinned "gw-$i" "$T2_CPUS_GATEWAY" || wrong+=" gw-$i"; done
+  for n in logic redis; do stack_pinned "$n" "$T2_CPUS_LOGIC" || wrong+=" $n"; done
+  have=$(taskset -pc "$LG_PID" 2>/dev/null)
+  [ "$(t2_cpulist_expand "${have##*: }")" = "$(t2_cpulist_expand "$T2_CPUS_LOADGEN")" ] || wrong+=" loadgen"
+  t2_check "${name}_pinning" "$(t2_bool [ -z "$wrong" ])" "\"gateway_cpus\": $(t2_json_str "$T2_CPUS_GATEWAY"), \"logic_cpus\": $(t2_json_str "$T2_CPUS_LOGIC"), \"loadgen_cpus\": $(t2_json_str "$T2_CPUS_LOADGEN"), \"gateway_procs\": $(. "$STACK_DIR/stack.env"; echo "$GATEWAY_PROCS"), \"wrong\": $(t2_json_str "${wrong# }")"
   if [ "$online" != true ]; then
     lg_stop
     stack_down
     t2_duration "$name" $((SECONDS - t0))
     continue
   fi
+
+  # #107: every logged-in client holds its next handshake frame at
+  # the kill, so the storm's first attempts are the spec's, not loadgen's.
+  # Wall clock (#103).
+  t=$SECONDS
+  until [ "$(lg_get /stats '(d.get("precompute") or {}).get("pending") == 0 and (d.get("precompute") or {}).get("ready") == d["online"]')" = true ]; do
+    [ $((SECONDS - t)) -lt 120 ] || break
+    sleep 1
+  done
+  precompute=$(lg_get /stats '{"pending": (d.get("precompute") or {}).get("pending"), "ready": (d.get("precompute") or {}).get("ready"), "online": d["online"], "wait_s": '"$((SECONDS - t))"'}')
 
   # The storm: counters before, SIGKILL, CPU profiles of its first 30s.
   stack_snapshot before
@@ -369,6 +402,14 @@ for name in $PHASES; do
   # out, by Login (lease gone) or by the refused Kick (lease live).
   t2_check "${name}_cross_check" "$(echo "{\"d\": $logic_d, \"pop\": $pop}" | lg_true - '0.9 * (d["d"]["kick_first"] - d["d"]["kick_first_timeout"]) <= d["d"]["dead_epoch_relogins"] <= 1.1 * d["pop"]')" \
     "\"relogins\": $pop, \"samples\": $(echo "$logic_d" | lg_py - 'd["dead_epoch_relogins"]'), \"mean_s\": $(echo "$logic_d" | lg_py - 'round(d["dead_epoch_relogin_s"] / d["dead_epoch_relogins"], 1)')"
+  # #107: the storm was the spec's: every logged-in client was prepared at
+  # the kill, and after it loadgen started each attempt and answered each
+  # handshake reply within GWLOSS_LAG_P99_MS (p99; loadgen's own lags only,
+  # review I1/I2). b-stress has no SLO; its relogin distribution is the
+  # measurement only when this passes.
+  storm_d=$(lg_get /stats 'd["storm_since_mark"]')
+  t2_check "${name}_storm_real" "$(echo "{\"s\": $storm_d, \"p\": $precompute, \"pop\": $pop}" | lg_true - 'd["p"]["ready"] is not None and d["p"]["ready"] == d["p"]["online"] and all(d["s"][k]["n"] >= d["pop"] and d["s"][k]["p99_ms"] <= '"$lag_max"' for k in ("attempt_lag", "reply_lag"))')" \
+    "\"lag_p99_max_ms\": $lag_max, \"precompute_at_kill\": $precompute, \"storm\": $storm_d"
   # One renewal per 10s interval (the gateway's -lease-interval default): the
   # window holds at least window_s / 10 - 1 whole intervals.
   t2_check "${name}_lease" "$(echo "{\"g\": $sv_d, \"l\": $logic_d, \"w\": $window_s}" | lg_true - 'all(v["lease_error"] == 0 and v["lease_missing"] == 0 and v["lease_live"] >= d["w"] // 10 - 1 for v in d["g"].values()) and d["l"]["lease_error"] == 0')" \
@@ -403,7 +444,7 @@ for name in $PHASES; do
 
   cpu_sets="{\"ramp\": $(t2_cpusets_json "$STACK_DIR/cpustat-0" "$STACK_DIR/cpustat-1"), \"storm\": $(t2_cpusets_json "$STACK_DIR/cpustat-2" "$STACK_DIR/cpustat-3")}"
   tcp="{\"ramp\": $(t2_tcpstat_json "$STACK_DIR/tcpstat-0" "$STACK_DIR/tcpstat-1"), \"storm\": $(t2_tcpstat_json "$STACK_DIR/tcpstat-2" "$STACK_DIR/tcpstat-3")}"
-  t2_field "$name" "{\"clients\": $clients, \"victim\": \"$victim\", \"by_gateway_at_kill\": $by_gateway, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"loadgen_env\": $(t2_json_str "${LG_ENV[*]}"), \"ramp_s\": $ramp_s, \"ramp\": $ramp, \"loadgen_heap\": $lg_heap, \"storm\": $storm, \"storm_first30\": $storm30, \"loadgen_bound\": $loadgen_bound, \"back_s\": $back_s, \"sweep_s\": $sweep_s, \"logic\": $logic_d, \"survivors\": $sv_d, \"redis_latency\": {\"ramp\": $redis_ramp, \"storm\": $redis_storm, \"reset\": {\"ramp\": $reset_ramp, \"storm\": $reset_storm}}, \"backoff\": $backoff, \"cpu_sets\": $cpu_sets, \"tcp\": $tcp, \"profile_in_storm_s\": 30, \"stop_s\": $stop_s, \"loadgen_exit\": $LG_STATUS, \"login_latency\": $(lg_json 'd["login_latency"]'), \"failed\": $(lg_json 'd["failed"]'), \"lost\": $(lg_json 'd["lost"]'), \"sources\": $(lg_json 'd["sources"]')}"
+  t2_field "$name" "{\"clients\": $clients, \"victim\": \"$victim\", \"by_gateway_at_kill\": $by_gateway, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"loadgen_env\": $(t2_json_str "${LG_ENV[*]}"), \"ramp_s\": $ramp_s, \"ramp\": $ramp, \"loadgen_heap\": $lg_heap, \"storm\": $storm, \"storm_first30\": $storm30, \"loadgen_bound\": $loadgen_bound, \"precompute_at_kill\": $precompute, \"storm_since_mark\": $storm_d, \"back_s\": $back_s, \"sweep_s\": $sweep_s, \"logic\": $logic_d, \"survivors\": $sv_d, \"redis_latency\": {\"ramp\": $redis_ramp, \"storm\": $redis_storm, \"reset\": {\"ramp\": $reset_ramp, \"storm\": $reset_storm}}, \"backoff\": $backoff, \"cpu_sets\": $cpu_sets, \"tcp\": $tcp, \"profile_in_storm_s\": 30, \"stop_s\": $stop_s, \"loadgen_exit\": $LG_STATUS, \"login_latency\": $(lg_json 'd["login_latency"]'), \"failed\": $(lg_json 'd["failed"]'), \"lost\": $(lg_json 'd["lost"]'), \"sources\": $(lg_json 'd["sources"]')}"
   t2_duration "$name" $((SECONDS - t0))
 
   # Artifacts: metrics before and after the storm, its CPU profiles, the SLO
