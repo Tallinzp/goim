@@ -10,7 +10,7 @@
 #   stack_snapshot NAME         # /metrics, heap and goroutine profiles of each process + redis INFO
 #                               #   -> $STACK_DIR/artifacts/NAME/
 #   stack_profile NAME SECONDS  # CPU profiles of Logic and every gateway at once -> artifacts/NAME/
-#   stack_expect_dead NAME      # NAME was killed on purpose (loadgen /kill): reap and record it
+#   stack_expect_dead NAME [SECONDS]  # NAME was killed on purpose (loadgen /kill): reap and record it
 #   stack_metric NAME METRIC [MATCH]  # sum of METRIC's samples (with MATCH in the line) on NAME's /metrics
 #   stack_metrics NAME          # NAME's /metrics once; stack_metric_in BODY METRIC [MATCH] reads it
 #   stack_wait_idle SECONDS     # phase boundary: every gateway at 0 connections, 0 awaiting Logout,
@@ -455,15 +455,17 @@ stack_forget() {
   STACK_ORDER=("${order[@]}")
 }
 
-# stack_expect_dead NAME: NAME was killed on purpose (a load scenario's
-# SIGKILL through loadgen's /kill, choice #84). Waits up to 5s for it to
-# end, records "NAME expected:STATUS" in exit-status and forgets it, so
-# stack_health does not report it and stack_down does not stop it again.
-# Fails, keeping NAME, if it is still running.
+# stack_expect_dead NAME [SECONDS]: NAME was killed on purpose (a load
+# scenario's SIGKILL through loadgen's /kill, choice #84). Waits up to
+# SECONDS (default 5) for it to end, records "NAME expected:STATUS" in
+# exit-status and forgets it, so stack_health does not report it and
+# stack_down does not stop it again. Fails, keeping NAME, if it is still
+# running. A process exits only once the kernel has closed its sockets: a
+# gateway with 600k took ~5.3s (Tier 2 run 25).
 stack_expect_dead() {
   local pid=${STACK_PIDS[$1]:-} i
   [ -n "$pid" ] || { echo "stack: no process $1" >&2; return 1; }
-  for i in $(seq 50); do
+  for i in $(seq $((${2:-5} * 10))); do
     kill -0 "$pid" 2>/dev/null || break
     sleep 0.1
   done

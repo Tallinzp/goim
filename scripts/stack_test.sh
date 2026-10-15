@@ -296,7 +296,9 @@ kill $holder; wait $holder 2>/dev/null
 # problem; a running one is refused.
 STACK_GATEWAYS=2
 if stack_up; then
-  stack_expect_dead gw-1 2>/dev/null && bad "dead: a running gateway is refused" || ok "dead: a running gateway is refused"
+  t=$SECONDS
+  stack_expect_dead gw-1 1 2>/dev/null && bad "dead: a running gateway is refused" || ok "dead: a running gateway is refused"
+  [ $((SECONDS - t)) -le 3 ] && ok "dead: SECONDS bounds the wait" || bad "dead: waited $((SECONDS - t))s for 1"
   kill -KILL "${STACK_PIDS[gw-1]}"
   stack_expect_dead gw-1 && ok "dead: a killed gateway is reaped" || bad "dead: reap"
   expect "dead: not a problem while the stack runs" "$(stack_health 2>&1)" ""

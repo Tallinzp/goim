@@ -26,6 +26,7 @@ type Recorder struct {
 	since          BackoffCount // since the latest mark (P6b2a-stressI-1)
 	lag            *hist        // attempt lag since the latest mark, ms (#107)
 	reply          *hist        // reply lag since the latest mark, ms (#107)
+	send           *hist        // send lag since the latest mark, ms (#107, run 25)
 	storm          StormCount   // since the latest mark; the lags filled by Counts
 	pongs          int64
 	missing        int64
@@ -61,7 +62,7 @@ type mark struct {
 func NewRecorder(n int, ids []string) *Recorder {
 	r := &Recorder{ids: ids, clients: make([]clientState, n), online: make([]int, len(ids)),
 		login: newHist(), pongRTT: newHist(), lost: map[string]int64{}, failed: map[string]int64{}, backoff: map[string]int64{},
-		since: BackoffCount{Waits: map[string]int64{}}, lag: newHist(), reply: newHist(), byName: map[string]*mark{}}
+		since: BackoffCount{Waits: map[string]int64{}}, lag: newHist(), reply: newHist(), send: newHist(), byName: map[string]*mark{}}
 	for i := range r.clients {
 		r.clients[i] = clientState{gw: -1, mark: -1}
 	}
@@ -150,6 +151,14 @@ func (r *Recorder) ReplyLag(lag time.Duration) {
 	r.mu.Unlock()
 }
 
+// SendLag: a client wrote its handshake frame lag after its dial returned:
+// making or taking the frame, on loadgen's CPU (#107, run 25).
+func (r *Recorder) SendLag(lag time.Duration) {
+	r.mu.Lock()
+	r.send.add(max(lag, 0).Milliseconds())
+	r.mu.Unlock()
+}
+
 // Handshake: an attempt's first handshake message was made ahead of time
 // (precomputed) or when it dialed (#106).
 func (r *Recorder) Handshake(precomputed bool) {
@@ -211,7 +220,7 @@ func (r *Recorder) Mark(name string, gw int, now time.Time) (int, error) {
 	r.marks = append(r.marks, m)
 	r.byName[name] = m
 	r.since = BackoffCount{Mark: name, Waits: map[string]int64{}}
-	r.lag, r.reply, r.storm = newHist(), newHist(), StormCount{Mark: name}
+	r.lag, r.reply, r.send, r.storm = newHist(), newHist(), newHist(), StormCount{Mark: name}
 	return len(m.members), nil
 }
 
@@ -309,12 +318,14 @@ type BackoffCount struct {
 
 // StormCount is the attempts since mark Mark ("": the run's start): how late
 // each started after its wait's end (AttemptLag, ms; an attempt with no wait,
-// such as the first, is not in it), how long each handshake took from the
+// such as the first, is not in it), how long each took from its dial to its
+// handshake frame (SendLag, ms), how long each handshake took from the
 // server's reply to the Login frame (ReplyLag, ms), and whether its first
 // message was made ahead of time or when it dialed (#106, #107).
 type StormCount struct {
 	Mark                  string `json:"mark"`
 	AttemptLag            Dist   `json:"attempt_lag"`
+	SendLag               Dist   `json:"send_lag"`
 	ReplyLag              Dist   `json:"reply_lag"`
 	HandshakesPrecomputed int64  `json:"handshakes_precomputed"`
 	HandshakesInline      int64  `json:"handshakes_inline"`
@@ -347,5 +358,6 @@ func (r *Recorder) Counts() Counts {
 	}
 	c.StormSinceMark.AttemptLag = r.lag.dist(r.lag.n)
 	c.StormSinceMark.ReplyLag = r.reply.dist(r.reply.n)
+	c.StormSinceMark.SendLag = r.send.dist(r.send.n)
 	return c
 }

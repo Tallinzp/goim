@@ -46,7 +46,7 @@ func (r *Runner) newSDK(i int) (*sdk.Client, error) {
 				return nil, err
 			}
 			sc.gw.Store(int32(gw))
-			return &replyConn{Conn: nc, rec: r.rec}, nil
+			return &replyConn{Conn: nc, rec: r.rec, dialed: time.Now()}, nil
 		},
 		// A prepared frame is for the env's key, which is this Config's
 		// KeyID and ServerKey: the SDK pins one key (P6b2a-stormI-3).
@@ -95,12 +95,15 @@ func (sc *sdkClient) event(e sdk.Event) {
 	}
 }
 
-// replyConn records how long the client took from the read that completed
-// the server's handshake reply to its Login frame, its second write: Finish
-// and the Login's seal, on loadgen's CPU (#107).
+// replyConn measures loadgen's own lags on one connection: from the dial
+// returning to the handshake frame, its first write (SendLag: making or
+// taking the frame and the scheduling wait, run 25), and from the read that
+// completed the server's handshake reply to the Login frame, its second
+// write (ReplyLag: Finish and the Login's seal) (#107).
 type replyConn struct {
 	net.Conn
 	rec    *Recorder
+	dialed time.Time
 	read   atomic.Int64 // unix ns the latest Read returned
 	writes atomic.Int32
 }
@@ -112,7 +115,10 @@ func (c *replyConn) Read(b []byte) (int, error) {
 }
 
 func (c *replyConn) Write(b []byte) (int, error) {
-	if c.writes.Add(1) == 2 {
+	switch c.writes.Add(1) {
+	case 1:
+		c.rec.SendLag(time.Since(c.dialed))
+	case 2:
 		if at := c.read.Load(); at != 0 {
 			c.rec.ReplyLag(time.Duration(time.Now().UnixNano() - at))
 		}

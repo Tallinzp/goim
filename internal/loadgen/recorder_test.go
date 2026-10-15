@@ -187,6 +187,7 @@ func TestRecorderCountsBackoffSinceMark(t *testing.T) {
 func TestRecorderCountsTheStormSinceMark(t *testing.T) {
 	r := NewRecorder(2, []string{"gw-0"})
 	r.AttemptLag(5 * time.Second) // the ramp's: before any mark
+	r.SendLag(5 * time.Second)
 	r.ReplyLag(5 * time.Second)
 	r.Handshake(false)
 	if _, err := r.Mark("death", 0, time.Now()); err != nil {
@@ -194,12 +195,14 @@ func TestRecorderCountsTheStormSinceMark(t *testing.T) {
 	}
 	r.AttemptLag(120 * time.Millisecond)
 	r.AttemptLag(-time.Millisecond)
+	r.SendLag(7 * time.Millisecond)
 	r.ReplyLag(3 * time.Millisecond)
 	r.Handshake(true)
 	r.Handshake(false)
 	r.Handshake(false)
 	s := r.Counts().StormSinceMark
-	if s.Mark != "death" || s.AttemptLag.N != 2 || s.AttemptLag.Max != 120 || s.ReplyLag.N != 1 || s.ReplyLag.Max != 3 ||
+	if s.Mark != "death" || s.AttemptLag.N != 2 || s.AttemptLag.Max != 120 || s.SendLag.N != 1 || s.SendLag.Max != 7 ||
+		s.ReplyLag.N != 1 || s.ReplyLag.Max != 3 ||
 		s.HandshakesPrecomputed != 1 || s.HandshakesInline != 2 {
 		t.Fatalf("storm since mark %+v", s)
 	}
