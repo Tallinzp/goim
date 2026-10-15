@@ -170,13 +170,23 @@ func (r *Recorder) SendLag(lag time.Duration) {
 	r.mu.Unlock()
 }
 
-// Handshake: an attempt's first handshake message was made ahead of time
-// (precomputed) or when it dialed (#106).
-func (r *Recorder) Handshake(precomputed bool) {
+// Where an attempt's first handshake message came from (#106, #109).
+const (
+	HandshakePrecomputed = "precomputed" // made ahead of time, before the first mark
+	HandshakeInline      = "inline"      // made when it dialed
+	HandshakeReused      = "reused"      // the last attempt's, which no reply answered
+)
+
+// Handshake counts an attempt's first handshake message by where it came
+// from: HandshakePrecomputed, HandshakeInline or HandshakeReused.
+func (r *Recorder) Handshake(how string) {
 	r.mu.Lock()
-	if precomputed {
+	switch how {
+	case HandshakePrecomputed:
 		r.storm.HandshakesPrecomputed++
-	} else {
+	case HandshakeReused:
+		r.storm.HandshakesReused++
+	default:
 		r.storm.HandshakesInline++
 	}
 	r.mu.Unlock()
@@ -332,8 +342,9 @@ type BackoffCount struct {
 // such as the first, is not in it), how long each dial took from connect to
 // its return (ConnectLag, ms), from its return to the handshake frame
 // (SendLag, ms), how long each handshake took from the
-// server's reply to the Login frame (ReplyLag, ms), and whether its first
-// message was made ahead of time or when it dialed (#106, #107).
+// server's reply to the Login frame (ReplyLag, ms), and where its first
+// message came from: made ahead of time, when it dialed, or the last attempt's
+// again (#106, #107, #109).
 type StormCount struct {
 	Mark                  string `json:"mark"`
 	AttemptLag            Dist   `json:"attempt_lag"`
@@ -342,6 +353,7 @@ type StormCount struct {
 	ReplyLag              Dist   `json:"reply_lag"`
 	HandshakesPrecomputed int64  `json:"handshakes_precomputed"`
 	HandshakesInline      int64  `json:"handshakes_inline"`
+	HandshakesReused      int64  `json:"handshakes_reused"`
 }
 
 // Counts returns a snapshot of the counters.

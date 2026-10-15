@@ -182,7 +182,7 @@ func TestRecorderCountsBackoffSinceMark(t *testing.T) {
 	}
 }
 
-// #107: the storm's lags and handshake counts restart at each mark; a
+// #107, #109: the storm's lags and handshake counts restart at each mark; a
 // negative lag (a wall-clock step) counts as 0.
 func TestRecorderCountsTheStormSinceMark(t *testing.T) {
 	r := NewRecorder(2, []string{"gw-0"})
@@ -190,7 +190,7 @@ func TestRecorderCountsTheStormSinceMark(t *testing.T) {
 	r.ConnectLag(5 * time.Second)
 	r.SendLag(5 * time.Second)
 	r.ReplyLag(5 * time.Second)
-	r.Handshake(false)
+	r.Handshake(HandshakeInline)
 	if _, err := r.Mark("death", 0, time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -200,14 +200,15 @@ func TestRecorderCountsTheStormSinceMark(t *testing.T) {
 	r.ConnectLag(-time.Millisecond)
 	r.SendLag(7 * time.Millisecond)
 	r.ReplyLag(3 * time.Millisecond)
-	r.Handshake(true)
-	r.Handshake(false)
-	r.Handshake(false)
+	r.Handshake(HandshakePrecomputed)
+	r.Handshake(HandshakeInline)
+	r.Handshake(HandshakeInline)
+	r.Handshake(HandshakeReused)
 	s := r.Counts().StormSinceMark
 	if s.Mark != "death" || s.AttemptLag.N != 2 || s.AttemptLag.Max != 120 ||
 		s.ConnectLag.N != 2 || s.ConnectLag.Max != 9 || s.SendLag.N != 1 || s.SendLag.Max != 7 ||
 		s.ReplyLag.N != 1 || s.ReplyLag.Max != 3 ||
-		s.HandshakesPrecomputed != 1 || s.HandshakesInline != 2 {
+		s.HandshakesPrecomputed != 1 || s.HandshakesInline != 2 || s.HandshakesReused != 1 {
 		t.Fatalf("storm since mark %+v", s)
 	}
 }

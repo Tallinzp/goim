@@ -1,6 +1,7 @@
 package loadgen
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os/exec"
+	"slices"
 	"strconv"
 	"sync"
 	"syscall"
@@ -266,6 +268,94 @@ func TestLightRetriesAPreHandshakeClose(t *testing.T) {
 	}
 	if took := time.Since(begin); took < time.Second {
 		t.Fatalf("logged in after %v: retries must wait 0.5–1.5s each", took)
+	}
+}
+
+// refuseFirst forwards to addr like closeFirst, but reads each connection's
+// whole handshake frame first: it closes the first n after their frame, as
+// a gateway's handshake limit does, and sends the rest on with their frame.
+// frames returns the refused and the forwarded frames (#109).
+func refuseFirst(t *testing.T, addr string, n int) (string, func() (refused, passed [][]byte)) {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	var mu sync.Mutex
+	var refused, passed [][]byte
+	go func() {
+		for k := 0; ; k++ {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func(k int) {
+				f := make([]byte, wire.HeaderLen+wire.HandshakeLen)
+				if _, err := io.ReadFull(c, f); err != nil {
+					c.Close()
+					return
+				}
+				mu.Lock()
+				if k < n {
+					refused = append(refused, f)
+				} else {
+					passed = append(passed, f)
+				}
+				mu.Unlock()
+				if k < n {
+					c.Close()
+					return
+				}
+				up, err := net.Dial("tcp", addr)
+				if err != nil {
+					c.Close()
+					return
+				}
+				if _, err := up.Write(f); err != nil {
+					up.Close()
+					c.Close()
+					return
+				}
+				go func() { io.Copy(up, c); up.Close() }()
+				io.Copy(c, up)
+				c.Close()
+			}(k)
+		}
+	}()
+	return l.Addr().String(), func() ([][]byte, [][]byte) {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(refused), slices.Clone(passed)
+	}
+}
+
+// #109, review O4: through the real SDK and clientconn, a client whose
+// first handshake the gateway refused sends the same frame again and logs
+// in with it. The clients start 33ms apart and retry after 0.5–1.5s, so the
+// first three connections are the three clients' first attempts.
+func TestSDKResendsARefusedHandshake(t *testing.T) {
+	env, _ := startStack(t, 1)
+	addr, frames := refuseFirst(t, env.GatewayAddrs[0], 3)
+	env.GatewayAddrs[0] = addr
+	r, err := New(Config{Mode: "sdk", Clients: 3, Rate: 30, UIDPrefix: "reuse"}, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := run(r)
+	defer stop()
+	waitFor(t, "3 online", 10*time.Second, func() bool { return r.Stats().Online == 3 })
+	if s := r.Stats().StormSinceMark; s.HandshakesInline != 3 || s.HandshakesReused != 3 || s.HandshakesPrecomputed != 0 {
+		t.Fatalf("storm %+v: want 3 inline, 3 reused", s)
+	}
+	refused, passed := frames()
+	if len(refused) != 3 || len(passed) != 3 {
+		t.Fatalf("%d refused, %d passed: want 3 and 3", len(refused), len(passed))
+	}
+	for _, p := range passed {
+		if !slices.ContainsFunc(refused, func(f []byte) bool { return bytes.Equal(f, p) }) {
+			t.Fatal("a client logged in with a frame the gateway had not refused")
+		}
 	}
 }
 
