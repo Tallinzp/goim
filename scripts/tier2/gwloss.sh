@@ -72,7 +72,9 @@
 #                      Each sample also has loadgen's GET /runtime: GC CPU
 #                      seconds, GC cycles, goroutines, stack and heap bytes,
 #                      mapped bytes against GOMEMLIMIT, and its scheduling
-#                      waits (run 27: GC at the memory limit?).
+#                      waits (run 27: GC at the memory limit?). Each phase
+#                      records one such reading once its victims are back,
+#                      sampler or not: loadgen_at_back (P6b2a-pingerI-1).
 #   GWLOSS_TAIL_PROFILE_AT  seconds after the kill to take a second 30s
 #                      loadgen CPU profile, artifacts/storm_tail/ (default 0:
 #                      off; at least 30, after the storm's own profile:
@@ -169,9 +171,12 @@ esac
 # at 16.1GB with 600k (run 22): its live heap was 3.25GB, the rest mostly
 # goroutine stacks, which GOMEMLIMIT does not bound. Run 22 started with
 # 22GiB available (t2_mem_budget counts GiB) and swapped ~1GiB out, so
-# b_stress needs about 23GiB with the victim, the survivors, Redis and the
-# kernel's socket memory (#105). That is the host's ceiling with a desktop
-# session, so there is no margin here: the swap check is the verdict.
+# b_stress was given about 23GiB with the victim, the survivors, Redis and
+# the kernel's socket memory (#105). Since the SDK's pinger runs on a timer
+# (plan 6b2a-pinger, 8381a9e), b_stress's loadgen peaks at 15.5GB RSS
+# (7.38GB of stacks, mapped 16.51GB under its 16GiB limit) and the run
+# swapped nothing at 23. The budgets stay until the host's UMA change
+# (P6b2a-pingerI-3, I-4); the swap check is the verdict.
 mem=14
 case " $PHASES " in *" b_stress "*) mem=23 ;; esac
 t2_mem_budget $mem
@@ -447,6 +452,11 @@ for name in $PHASES; do
   sweeping=$!
   back=$(t2_bool lg_wait_back death "$back_wait")
   back_s=$((SECONDS - kill_t))
+  # Loadgen's runtime once the victims are back (or the wait ran out), even
+  # with GWLOSS_SS_EVERY off: its memory against GOMEMLIMIT and the GC
+  # limiter at the storm's end (P6b2a-pingerI-1). Recorded, not a check.
+  rt_back=$(lg_get /runtime d 2>/dev/null)
+  [ -n "$rt_back" ] || rt_back=null
   if [ -n "$sampler" ]; then
     kill "$sampler" 2>/dev/null
     wait "$sampler" 2>/dev/null
@@ -564,7 +574,7 @@ print(json.dumps(out))' "$STACK_DIR/artifacts/ss-storm.jsonl" 2>/dev/null || ech
 
   cpu_sets="{\"ramp\": $(t2_cpusets_json "$STACK_DIR/cpustat-0" "$STACK_DIR/cpustat-1"), \"storm\": $(t2_cpusets_json "$STACK_DIR/cpustat-2" "$STACK_DIR/cpustat-3")}"
   tcp="{\"ramp\": $(t2_tcpstat_json "$STACK_DIR/tcpstat-0" "$STACK_DIR/tcpstat-1"), \"storm\": $(t2_tcpstat_json "$STACK_DIR/tcpstat-2" "$STACK_DIR/tcpstat-3")}"
-  t2_field "$name" "{\"clients\": $clients, \"victim\": \"$victim\", \"by_gateway_at_kill\": $by_gateway, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"loadgen_env\": $(t2_json_str "${LG_ENV[*]}"), \"ramp_s\": $ramp_s, \"ramp\": $ramp, \"loadgen_heap\": {\"ramp\": $heap_ramp, \"at_kill\": $heap_kill}, \"storm\": $storm, \"storm_first30\": $storm30, \"loadgen_bound\": $loadgen_bound, \"precompute_at_kill\": $precompute, \"storm_since_mark\": $storm_d, \"back_s\": $back_s, \"sweep_s\": $sweep_s, \"logic\": $logic_d, \"survivors\": $sv_d, \"redis_latency\": {\"ramp\": $redis_ramp, \"storm\": $redis_storm, \"reset\": {\"ramp\": $reset_ramp, \"storm\": $reset_storm}}, \"backoff\": $backoff, \"cpu_sets\": $cpu_sets, \"tcp\": $tcp, \"profile_in_storm_s\": 30, \"stop_s\": $stop_s, \"loadgen_exit\": $LG_STATUS, \"login_latency\": $(lg_json 'd["login_latency"]'), \"failed\": $(lg_json 'd["failed"]'), \"lost\": $(lg_json 'd["lost"]'), \"sources\": $(lg_json 'd["sources"]')}"
+  t2_field "$name" "{\"clients\": $clients, \"victim\": \"$victim\", \"by_gateway_at_kill\": $by_gateway, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"loadgen_env\": $(t2_json_str "${LG_ENV[*]}"), \"ramp_s\": $ramp_s, \"ramp\": $ramp, \"loadgen_heap\": {\"ramp\": $heap_ramp, \"at_kill\": $heap_kill}, \"storm\": $storm, \"storm_first30\": $storm30, \"loadgen_bound\": $loadgen_bound, \"precompute_at_kill\": $precompute, \"storm_since_mark\": $storm_d, \"back_s\": $back_s, \"loadgen_at_back\": $rt_back, \"sweep_s\": $sweep_s, \"logic\": $logic_d, \"survivors\": $sv_d, \"redis_latency\": {\"ramp\": $redis_ramp, \"storm\": $redis_storm, \"reset\": {\"ramp\": $reset_ramp, \"storm\": $reset_storm}}, \"backoff\": $backoff, \"cpu_sets\": $cpu_sets, \"tcp\": $tcp, \"profile_in_storm_s\": 30, \"stop_s\": $stop_s, \"loadgen_exit\": $LG_STATUS, \"login_latency\": $(lg_json 'd["login_latency"]'), \"failed\": $(lg_json 'd["failed"]'), \"lost\": $(lg_json 'd["lost"]'), \"sources\": $(lg_json 'd["sources"]')}"
   t2_duration "$name" $((SECONDS - t0))
 
   # Artifacts: metrics before and after the storm, its CPU profiles, the SLO
