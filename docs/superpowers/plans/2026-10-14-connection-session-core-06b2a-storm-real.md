@@ -7,7 +7,7 @@
 **Architecture:** Three parts.
 1. **Precompute what a phone already holds (#106).** A phone whose connection drops already has a cached token, and its own CPU makes its handshake message. Loadgen pays for both on 8 shared CPUs at the worst moment. Each SDK client now keeps its last token and reuses it until a `refresh`, as the spec's SDK rules say (amended in review (M2): loadgen used to sign a new one per attempt). With `-precompute`, loadgen also prepares each logged-in SDK client's Noise first message (the ephemeral key and `es`, the two X25519 operations of the client's three) in background workers during the ramp, and stops at the first mark. The survivors receive the same bytes at the same moments. The SDK gets `Config.Initiate`, the hook that hands an attempt its first message; production leaves it nil. `wire` and `clientconn` get `ClientHandshakeWith` and `HandshakeWith`, which take a first message made earlier.
 2. **Measure how late loadgen is (#107).** Loadgen records two lags since the latest mark, both on its own side only (amended in review (I1, I2)): `attempt_lag`, for every attempt that follows a wait, from the wait's end to the attempt's start (`EventConnecting`, on the client's run loop: no TCP connect and no server in it); and `reply_lag`, for every handshake, from the read that completed the server's reply to the Login frame's write (`Finish` and the Login's seal, loadgen's CPU). A new check `<phase>_storm_real` passes only if every logged-in client was prepared at the kill and both lags' p99 are at most `GWLOSS_LAG_P99_MS` (100ms). An invalid storm fails the run; it is not recorded as a pass. The survivors' connect path (listen overflows in `tcp`) and `auth_timeout` rejects stay recorded as data: they can be the gateways', not loadgen's.
-3. **Give loadgen the idle CPUs in b_stress (#108).** In runs 22–24 the gateway set was 92–93% idle in the storm and the Logic set 96%. b_stress gets its own CPU sets for loadgen (12 CPUs), the gateways and Logic + Redis (`GOMAXPROCS` 4 per gateway as before: the victim alone in the ramp, the two survivors after the kill). The sets are chosen from the host's `lscpu -e` before Task 3 (the user, 2026-10-14). b1 keeps #71's sets.
+3. **Give loadgen the idle CPUs in b_stress (#108).** In runs 22–24 the gateway set was 92–93% idle in the storm and the Logic set 96%. b_stress moves loadgen to `0-5,10,12-17,22` (14 CPUs: the host's 4 fast cores and 3 compact ones), the gateways to `6-9,18-21` (4 compact cores, `GOMAXPROCS` 4 each as before: the victim alone in the ramp, the two survivors after the kill) and Logic + Redis to `11,23` (chosen from the host's `lscpu -e` by the user, 2026-10-14). b1 keeps #71's sets.
 
 **Tech Stack:** Go 1.27.1, `github.com/flynn/noise` v1.1.0, bash 5.2, python3 (reads JSON only).
 
@@ -39,14 +39,11 @@
 
 ## Implementation choices this plan makes
 
-Proposed 2026-10-14 with this plan, for the user's review. #106 was decided in principle by the user on 2026-10-14 (a real storm, never a throttle). Reviewed 2026-10-14: I1 (attempt lag at `EventConnecting`), I2 (`reply_lag`), M2 (token reuse) amended below; I3 (memory: no host change, swap stays fatal) and I4 (b_stress's sets chosen from `lscpu`) decided by the user; M1 (29 checks) and M3 (run 25's CPU-set numbers not comparable with runs 22–24) fixed in Task 3.
+Proposed 2026-10-14 with this plan, for the user's review. #106 was decided in principle by the user on 2026-10-14 (a real storm, never a throttle). Reviewed 2026-10-14: I1 (attempt lag at `EventConnecting`), I2 (`reply_lag`), M2 (token reuse) amended below; I3 (memory: no host change, swap stays fatal) and I4 (b_stress's sets from `lscpu`: #108's split D) decided by the user; M1 (29 checks) and M3 (run 25's CPU-set numbers not comparable with runs 22–24) fixed in Task 3.
 
 106. **Loadgen prepares what a phone already holds** (`-precompute`, sdk mode only). Every SDK client keeps its last token and reuses it until a `refresh` (with or without `-precompute`; amended in review (M2): `Runner.token` used to sign one per attempt, which a phone does not, and which cost ~1 core at the storm's retry rate). When an SDK client logs in, it is queued (a channel sized to `Clients`, so `OnEvent` never blocks) for one of `max(1, GOMAXPROCS/2)` workers, which runs `wire.Initiate` for the pinned key. The client's next attempt takes it: `Config.Initiate` swaps the prepared first message out, or computes one inline when there is none. Preparing stops at the first mark (`Runner.Mark`, which `/kill` also calls). Retries after the storm's first attempt compute inline (counted): expect more inline handshakes than precomputed ones in b_stress, since the survivors' handshake limit refuses much of a 30k/s storm (run 21: 180k `handshake_rate` refusals for b1's 200k victims at ~10k/s), so the saving below holds for first attempts only (review I2). Per first attempt this moves the ephemeral key and `es` off the storm: on the dev machine `wire.Initiate` costs 281µs and `Finish` 153µs, so the storm's client-side handshake cost falls to about a third. The server sees the same bytes. **SDK:** `Config.Initiate func(keyID uint16, serverPub []byte) (*wire.Initiator, []byte, error)`, nil by default; `wire.ClientHandshakeWith` and `clientconn.Conn.HandshakeWith` run a handshake from a first message made earlier. Rejected: an in-flight handshake cap (a throttle: the user's decision); precomputing only the ephemeral key (`noise.Config.EphemeralKeypair`), which saves one X25519 of three; a shared pool refilled during the storm (spends the storm's CPU).
 107. **Loadgen's lags and `<phase>_storm_real`.** Both lags are loadgen's own (amended in review (I1, I2): the proposal took the attempt lag at the first write, after the TCP connect, so a survivor's full accept queue (a SYN resent after 1s) would have marked the storm invalid and pointed at loadgen; and it stopped at the first message, missing `Finish` and the Login's seal, which a late loadgen turns into the survivors' `auth_timeout`). **`attempt_lag`:** the SDK client stores `due = now + Wait.D` on every `EventWaiting`; the next `EventConnecting` (same run loop, when the wait's timer fires and the attempt starts) records `now − due` and clears `due`. **`reply_lag`:** loadgen's `Dial` wraps the connection; it stamps every `Read`'s return, and its second `Write` (the Login frame, after the handshake frame) records `now − last read`. The recorder keeps both and the handshake counts (`handshakes_precomputed`, `handshakes_inline`) since the latest mark, like `backoff_since_mark`: `/stats`' `storm_since_mark` `{mark, attempt_lag, reply_lag, handshakes_precomputed, handshakes_inline}`. `gwloss.sh` waits up to 120s (wall clock, #103) before the kill until `precompute.pending` is 0 and `precompute.ready` equals `online`, and records `precompute_at_kill`. **New check in both phases:** `<phase>_storm_real`: `ready == online` at the kill, `attempt_lag.n` and `reply_lag.n` ≥ the population, and both `p99_ms` ≤ `GWLOSS_LAG_P99_MS` (default 100). The survivors' `auth_timeout` and `handshake_timeout` rejects and listen overflows stay recorded (they can be the gateways'). `b_stress_back` keeps its rule (every victim back within the wait, no rejects at capacity); its relogin distribution is the measurement (b-stress has no SLO) once `b_stress_storm_real` passes. `loadgen_bound` stays recorded (loadgen's CPU in the storm's first 30s) as data, no longer the run's verdict. Detection (mark → loss noticed) is recorded as now and not gated: it includes the dying gateway's own socket teardown, which production has too.
-108. **b_stress's CPU sets.** `GWLOSS_STRESS_CPUS_LOADGEN` (12 CPUs), `GWLOSS_STRESS_CPUS_GATEWAY` and `GWLOSS_STRESS_CPUS_LOGIC` (Logic + Redis), with `STACK_GATEWAY_PROCS=4` so each gateway keeps 4 `GOMAXPROCS` (#79 would otherwise divide the set by 3). b1 keeps #71's sets. The `pinning` check runs in every phase, renamed `<phase>_pinning`, because b_stress's sets differ. The victim runs alone in the ramp (1.7 cores in run 24). **The defaults are chosen before Task 3 from the host's `lscpu -e=CPU,CORE,MAXMHZ`** (the user, review I4, 2026-10-14: the host may mix fast and compact cores). The candidates:
-     - **A** (the proposal): loadgen `0-5,12-17`, gateways `6-9,18-21` (8 CPUs: each survivor's 4 procs on 2 physical cores, a third less than runs 22–24's 3), Logic + Redis `10,11,22,23`.
-     - **B** (review I4): loadgen `0-5,12-17`, gateways `6-10,18-22` (10 CPUs), Logic + Redis `11,23` (one core: they used 0.10 + 0.03 cores in run 22's b_stress storm and ~0.45 + 0.07 in b1's ramp at 5,000 logins/s).
-     Task 3 Step 1's code carries A's sets as placeholders; the executor replaces them, and #108's text, with the chosen sets before running it.
+108. **b_stress's CPU sets** (decided by the user 2026-10-14 from the host's `lscpu -e=CPU,CORE,MAXMHZ`, review I4). The host has 4 fast cores (0–3, 5.16GHz) and 8 compact ones (4–11, 3.29GHz), SMT siblings n and n+12; #71 already gives loadgen the fast cores. b_stress: loadgen `0-5,10,12-17,22` (`GWLOSS_STRESS_CPUS_LOADGEN`, 14 CPUs: the 4 fast cores and 3 compact), gateways `6-9,18-21` (`GWLOSS_STRESS_CPUS_GATEWAY`, 4 compact cores), Logic + Redis `11,23` (`GWLOSS_STRESS_CPUS_LOGIC`, one compact core: they used 0.10 + 0.03 cores in run 22's b_stress storm and ~0.45 + 0.07 in b1's ramp at 5,000 logins/s). `STACK_GATEWAY_PROCS=4` keeps each gateway at 4 `GOMAXPROCS` (#79 would otherwise divide the set by 3): 4 procs on 4 hyperthreads, a 4-vCPU gateway; the victim runs alone in the ramp (1.7 cores in run 24), the two survivors share the set after the kill. Spare CPU goes to loadgen, not the gateways: a loadgen-bound storm invalidates the run (`storm_real`), a gateway-bound one is b-stress's measurement. Rejected: candidates A (Logic + Redis keep `10,11,22,23`: a core idle), B (Logic's spare core to the gateways) and C (gateways `5-10,17-22` as in runs 22–24, loadgen 10 CPUs). b1 keeps #71's sets. The `pinning` check runs in every phase, renamed `<phase>_pinning`, because b_stress's sets differ.
 
 If `<phase>_storm_real` fails on the host after this plan, the next step is a second machine for loadgen, or 6d's cloud target, not a throttle (the user, 2026-10-14).
 
@@ -843,10 +840,6 @@ git commit -m "feat(loadgen): -precompute prepares what a phone holds before the
 - Consumes: Task 2's `-precompute`, `/stats`' `precompute` and `storm_since_mark`.
 - Produces: checks `<phase>_storm_real` and `<phase>_pinning` (replaces `pinning`); the phase field's `precompute_at_kill` and `storm`; knobs `GWLOSS_LAG_P99_MS`, `GWLOSS_STRESS_CPUS_LOADGEN`, `GWLOSS_STRESS_CPUS_GATEWAY`, `GWLOSS_STRESS_CPUS_LOGIC`; 29 checks in all (today's 26 are 12 per phase, `pinning` and `artifacts`; this adds two `<phase>_storm_real` and makes `pinning` one per phase, review M1).
 
-- [ ] **Step 0: Choose b_stress's CPU sets (#108, the user)**
-
-Ask the user for the Tier 2 host's `lscpu -e=CPU,CORE,MAXMHZ` and which of #108's candidates (A, B, or another) to use. Put the chosen sets into Step 1's `b_stress)` defaults, Step 5's header, #108's text and Step 6's expectations in place of candidate A's placeholders.
-
 - [ ] **Step 1: Per-phase CPU sets**
 
 Before the phase loop (`for name in $PHASES; do`), add:
@@ -870,11 +863,11 @@ In the `b1)` case, add after `export STACK_GATEWAYS=2`:
 In the `b_stress)` case, add after `export STACK_GATEWAYS=3`:
 
 ```bash
-      # #108: loadgen 12 CPUs; the gateways at 4 GOMAXPROCS each as before
-      # (the victim alone in the ramp, the two survivors after the kill).
-      # Defaults: candidate A's placeholders until Step 0's choice.
-      export T2_CPUS_GATEWAY=${GWLOSS_STRESS_CPUS_GATEWAY:-6-9,18-21} T2_CPUS_LOADGEN=${GWLOSS_STRESS_CPUS_LOADGEN:-0-5,12-17}
-      export T2_CPUS_LOGIC=${GWLOSS_STRESS_CPUS_LOGIC:-10,11,22,23}
+      # #108: loadgen the 4 fast cores and 3 compact (14 CPUs); the gateways
+      # 4 compact cores at 4 GOMAXPROCS each as before (the victim alone in
+      # the ramp, the two survivors after the kill); Logic + Redis one core.
+      export T2_CPUS_GATEWAY=${GWLOSS_STRESS_CPUS_GATEWAY:-6-9,18-21} T2_CPUS_LOADGEN=${GWLOSS_STRESS_CPUS_LOADGEN:-0-5,10,12-17,22}
+      export T2_CPUS_LOGIC=${GWLOSS_STRESS_CPUS_LOGIC:-11,23}
       export STACK_GATEWAY_PROCS=4
 ```
 
@@ -948,11 +941,12 @@ In the header's knobs, add:
 
 ```bash
 #   GWLOSS_LAG_P99_MS  the storm's attempt lag p99 bound, ms (default 100, #107)
-#   GWLOSS_STRESS_CPUS_LOADGEN  b_stress: loadgen's CPU set (default 0-5,12-17, #108)
+#   GWLOSS_STRESS_CPUS_LOADGEN  b_stress: loadgen's CPU set (default
+#                      0-5,10,12-17,22, #108)
 #   GWLOSS_STRESS_CPUS_GATEWAY  b_stress: the gateways' CPU set (default 6-9,18-21,
 #                      4 GOMAXPROCS each, #108)
 #   GWLOSS_STRESS_CPUS_LOGIC  b_stress: Logic + Redis's CPU set (default
-#                      10,11,22,23, #108)
+#                      11,23, #108)
 ```
 
 Replace the `pinning` line of the checks with:
@@ -1013,7 +1007,7 @@ git push
 
 - [ ] **Step 8: Tier 2 run 25 (the user, on the host)**
 
-Host prep as for run 24 (services stopped, `vm.swappiness=1`, swap emptied, desktop off), then `GOIM_TEST_TIER=2 make test-tier2 SCENARIO=gwloss`. No host change beyond run 24's (review I3: the BIOS UMA reservation stays). Expected: 29/29, though `no_swap_in_b_stress` may fail for the host's memory as in runs 23–24 (it stays fatal; memory is decided after this run). What to read: `b_stress_storm_real` (`attempt_lag` and `reply_lag` p99, `handshakes_precomputed` vs `handshakes_inline`: expect more inline, from the survivors' handshake-limit retries), `b_stress_back`'s `back_s` and relogin distribution, the survivors' `handshake_rate`, `handshake_timeout`, `auth_timeout` and `pending_mem` rejects and the storm's listen overflows (the herd the survivors' guards and accept path now meet), loadgen's `storm_first30` cores on 12 CPUs, loadgen's peak RSS against its 16GiB `GOMEMLIMIT`, `no_swap_in_b_stress`. b_stress's `cpu_sets`, clocks and `loadgen_headroom` now describe #108's sets, so they do not compare with runs 22–24's (review M3). If `b_stress_storm_real` fails, the host cannot make the storm: the next step is a second machine for loadgen (the user's decision, not a throttle).
+Host prep as for run 24 (services stopped, `vm.swappiness=1`, swap emptied, desktop off), then `GOIM_TEST_TIER=2 make test-tier2 SCENARIO=gwloss`. No host change beyond run 24's (review I3: the BIOS UMA reservation stays). Expected: 29/29, though `no_swap_in_b_stress` may fail for the host's memory as in runs 23–24 (it stays fatal; memory is decided after this run). What to read: `b_stress_storm_real` (`attempt_lag` and `reply_lag` p99, `handshakes_precomputed` vs `handshakes_inline`: expect more inline, from the survivors' handshake-limit retries), `b_stress_back`'s `back_s` and relogin distribution, the survivors' `handshake_rate`, `handshake_timeout`, `auth_timeout` and `pending_mem` rejects and the storm's listen overflows (the herd the survivors' guards and accept path now meet), loadgen's `storm_first30` cores on 14 CPUs, loadgen's peak RSS against its 16GiB `GOMEMLIMIT`, `no_swap_in_b_stress`. b_stress's `cpu_sets`, clocks and `loadgen_headroom` now describe #108's sets, so they do not compare with runs 22–24's (review M3). If `b_stress_storm_real` fails, the host cannot make the storm: the next step is a second machine for loadgen (the user's decision, not a throttle).
 
 ## After this plan
 
