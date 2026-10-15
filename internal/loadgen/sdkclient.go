@@ -45,30 +45,41 @@ func (r *Runner) newSDK(i int) (*sdk.Client, error) {
 		},
 		Store: &sdk.MemStore{}, OnEvent: sc.event, Windows: r.cfg.windows,
 		Dial: func(ctx context.Context, _ string) (net.Conn, error) {
+			// Numbered when the dial starts: a cancelled attempt's dial that
+			// returns after the next attempt's stays older (review
+			// P6b2a-reuseI-1).
+			seq := sc.dials.Add(1)
 			nc, gw, err := r.bal.Dial(ctx)
 			if err != nil {
 				return nil, err
 			}
-			sc.gw.Store(int32(gw))
-			rc := sc.track(nc)
+			if seq == sc.dials.Load() {
+				sc.gw.Store(int32(gw))
+			}
+			rc := sc.track(nc, seq)
 			r.rec.ConnectLag(rc.dialed.Sub(nc.(*conn).connecting))
 			return rc, nil
 		},
 		Initiate: sc.initiate})
 }
 
-// track wraps a connection the client just dialed (#107, #109).
-func (sc *sdkClient) track(nc net.Conn) *replyConn {
-	return &replyConn{Conn: nc, sc: sc, seq: sc.dials.Add(1), dialed: time.Now()}
+// track wraps a connection the client just dialed; seq is its dial number,
+// taken when its dial started (#107, #109).
+func (sc *sdkClient) track(nc net.Conn, seq uint64) *replyConn {
+	return &replyConn{Conn: nc, sc: sc, seq: seq, dialed: time.Now()}
 }
 
 // initiate is the client's Config.Initiate. It sends the last attempt's
-// first message again while no reply byte answered it (#109): the gateway refuses a handshake over its limit before any
-// X25519, so it costs the server the same, and loadgen is spared the two
-// X25519 a phone makes on its own CPU. Otherwise it takes the precomputed
-// one (#106) or makes one. A prepared or held frame is for the env's key,
-// which is this Config's KeyID and ServerKey: the SDK pins one key
-// (P6b2a-stormI-3).
+// first message again while no reply byte answered it (#109): the gateway
+// refuses a handshake over its limit before any X25519, so it costs the
+// server the same, and loadgen is spared the two X25519 a phone makes on its
+// own CPU. Otherwise it takes the precomputed one (#106) or makes one. A
+// prepared or held frame is for the env's key, which is this Config's KeyID
+// and ServerKey: the SDK pins one key (P6b2a-stormI-3). It assumes the
+// gateway refuses by closing with no byte sent (a refusal frame would mark
+// the handshake answered: reuse would stop) and keeps no replay check on a
+// first message, which Noise NK lets anyone replay (a check would fail
+// every resend) (review P6b2a-reuseI-3).
 func (sc *sdkClient) initiate(keyID uint16, pub []byte) (*wire.Initiator, []byte, error) {
 	r := sc.r
 	if h := sc.held.Load(); h != nil && h.reusable() {

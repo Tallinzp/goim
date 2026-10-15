@@ -82,7 +82,7 @@ func TestUnansweredHandshakeIsSentAgain(t *testing.T) {
 
 	// Attempt 1: the gateway reads the frame and closes (its handshake limit).
 	c1, s1 := net.Pipe()
-	rc1 := sc.track(c1)
+	rc1 := sc.track(c1, sc.dials.Add(1))
 	in1, f1, err := sc.initiate(1, key.Public)
 	if err != nil {
 		t.Fatal(err)
@@ -98,7 +98,7 @@ func TestUnansweredHandshakeIsSentAgain(t *testing.T) {
 	c2, s2 := net.Pipe()
 	defer c2.Close()
 	defer s2.Close()
-	rc2 := sc.track(c2)
+	rc2 := sc.track(c2, sc.dials.Add(1))
 	in2, f2, err := sc.initiate(1, key.Public)
 	if err != nil {
 		t.Fatal(err)
@@ -137,7 +137,7 @@ func TestUnansweredHandshakeIsSentAgain(t *testing.T) {
 	if sc.held.Load() != nil {
 		t.Fatal("an answered handshake is still held")
 	}
-	sc.track(byteConn{})
+	sc.track(byteConn{}, sc.dials.Add(1))
 	_, f3, err := sc.initiate(1, key.Public)
 	if err != nil || bytes.Equal(f3, f1) {
 		t.Fatalf("attempt 3: %v, same frame %v", err, bytes.Equal(f3, f1))
@@ -165,12 +165,12 @@ func (byteConn) Close() error                { return nil }
 func TestAHeldHandshakeIsFinishedOnce(t *testing.T) {
 	t.Run("a newer attempt takes it from an open sender", func(t *testing.T) {
 		sc, key := handshakeClient(t)
-		rcA := sc.track(byteConn{})
+		rcA := sc.track(byteConn{}, sc.dials.Add(1))
 		_, f, _ := sc.initiate(1, key.Public)
 		if _, err := rcA.Write(f); err != nil {
 			t.Fatal(err)
 		}
-		rcB := sc.track(byteConn{}) // A was cancelled; its close has not landed
+		rcB := sc.track(byteConn{}, sc.dials.Add(1)) // A was cancelled; its close has not landed
 		if _, fb, _ := sc.initiate(1, key.Public); !bytes.Equal(fb, f) {
 			t.Fatal("not sent again")
 		}
@@ -188,15 +188,15 @@ func TestAHeldHandshakeIsFinishedOnce(t *testing.T) {
 	// take the handshake from it.
 	t.Run("an older attempt's late write", func(t *testing.T) {
 		sc, key := handshakeClient(t)
-		rc0 := sc.track(byteConn{})
+		rc0 := sc.track(byteConn{}, sc.dials.Add(1))
 		_, f, _ := sc.initiate(1, key.Public)
 		if _, err := rc0.Write(f); err != nil {
 			t.Fatal(err)
 		}
 		rc0.Close() // refused
-		rcA := sc.track(byteConn{})
+		rcA := sc.track(byteConn{}, sc.dials.Add(1))
 		_, fa, _ := sc.initiate(1, key.Public) // A is cancelled before its write
-		rcB := sc.track(byteConn{})
+		rcB := sc.track(byteConn{}, sc.dials.Add(1))
 		_, fb, _ := sc.initiate(1, key.Public)
 		if !bytes.Equal(fa, f) || !bytes.Equal(fb, f) {
 			t.Fatal("not sent again")
@@ -211,25 +211,53 @@ func TestAHeldHandshakeIsFinishedOnce(t *testing.T) {
 			t.Fatalf("the live sender: %d %v", n, err)
 		}
 	})
+	// Review P6b2a-reuseI-1: a cancelled attempt's dial that returns after
+	// the live attempt's is still the older one.
+	t.Run("a cancelled attempt's dial returns late", func(t *testing.T) {
+		sc, key := handshakeClient(t)
+		rc0 := sc.track(byteConn{}, sc.dials.Add(1))
+		_, f, _ := sc.initiate(1, key.Public)
+		if _, err := rc0.Write(f); err != nil {
+			t.Fatal(err)
+		}
+		rc0.Close()             // refused
+		seqA := sc.dials.Add(1) // A dials, then is cancelled
+		rcB := sc.track(byteConn{}, sc.dials.Add(1))
+		_, fb, _ := sc.initiate(1, key.Public)
+		rcA := sc.track(byteConn{}, seqA) // A's dial returns now
+		_, fa, _ := sc.initiate(1, key.Public)
+		if !bytes.Equal(fa, f) || !bytes.Equal(fb, f) {
+			t.Fatal("not sent again")
+		}
+		if _, err := rcA.Write(fa); !errors.Is(err, errHandshakeTaken) {
+			t.Fatalf("the cancelled attempt's write: %v", err)
+		}
+		if _, err := rcB.Write(fb); err != nil {
+			t.Fatalf("the live attempt's write: %v", err)
+		}
+		if n, err := rcB.Read(make([]byte, 1)); n != 1 || err != nil {
+			t.Fatalf("the live sender: %d %v", n, err)
+		}
+	})
 	// Review M1: with two attempts cancelled in a row, the third still sends
 	// the same handshake, so no late write carries a frame the guards no
 	// longer know; nor can a late write of an answered one.
 	t.Run("two cancelled attempts", func(t *testing.T) {
 		sc, key := handshakeClient(t)
-		rc0 := sc.track(byteConn{})
+		rc0 := sc.track(byteConn{}, sc.dials.Add(1))
 		_, f, _ := sc.initiate(1, key.Public)
 		if _, err := rc0.Write(f); err != nil {
 			t.Fatal(err)
 		}
 		rc0.Close() // refused
-		rcA := sc.track(byteConn{})
+		rcA := sc.track(byteConn{}, sc.dials.Add(1))
 		sc.initiate(1, key.Public) // cancelled before its write
-		rc1 := sc.track(byteConn{})
+		rc1 := sc.track(byteConn{}, sc.dials.Add(1))
 		sc.initiate(1, key.Public)
 		if _, err := rc1.Write(f); err != nil {
 			t.Fatal(err)
 		}
-		rc2 := sc.track(byteConn{}) // rc1 cancelled, still open
+		rc2 := sc.track(byteConn{}, sc.dials.Add(1)) // rc1 cancelled, still open
 		if _, f2, _ := sc.initiate(1, key.Public); !bytes.Equal(f2, f) {
 			t.Fatal("a new handshake while one is unanswered")
 		}
@@ -248,7 +276,7 @@ func TestAHeldHandshakeIsFinishedOnce(t *testing.T) {
 	})
 	t.Run("answered before the resend", func(t *testing.T) {
 		sc, key := handshakeClient(t)
-		rc1 := sc.track(byteConn{})
+		rc1 := sc.track(byteConn{}, sc.dials.Add(1))
 		_, f, _ := sc.initiate(1, key.Public)
 		if _, err := rc1.Write(f); err != nil {
 			t.Fatal(err)
@@ -257,7 +285,7 @@ func TestAHeldHandshakeIsFinishedOnce(t *testing.T) {
 			t.Fatalf("the sender: %d %v", n, err)
 		}
 		rc1.Close()
-		sc.track(byteConn{})
+		sc.track(byteConn{}, sc.dials.Add(1))
 		if _, f2, _ := sc.initiate(1, key.Public); bytes.Equal(f2, f) {
 			t.Fatal("an answered handshake was sent again")
 		}
@@ -266,7 +294,7 @@ func TestAHeldHandshakeIsFinishedOnce(t *testing.T) {
 	// closed connection that sent it.
 	t.Run("keeps no closed sender", func(t *testing.T) {
 		sc, key := handshakeClient(t)
-		rc := sc.track(byteConn{})
+		rc := sc.track(byteConn{}, sc.dials.Add(1))
 		_, f, _ := sc.initiate(1, key.Public)
 		if _, err := rc.Write(f); err != nil {
 			t.Fatal(err)
