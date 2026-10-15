@@ -1017,3 +1017,11 @@ Host prep as for run 24 (services stopped, `vm.swappiness=1`, swap emptied, desk
 
 - **Executed inline 2026-10-14** (`c04d543` Task 1, `d6ada50` Task 2, Task 3 below). `make test`, `make test-load-probe`, `make test-scripts` pass. Dry run (2 × 1,000 / 1,500, CPU sets folded onto the dev machine's 2 CPUs): 29 checks, 27 pass, only `no_swap_in_b1` and `no_swap_in_b_stress` fail (dev machine swap). `b1_storm_real`: `precompute_at_kill` 2000/2000 (wait 0s), `handshakes_precomputed` 1000, inline 0, `attempt_lag` n 1000 p99 1ms, `reply_lag` n 1000 p99 0ms. `b_stress_storm_real`: 1500/1500, precomputed 1500, inline 0, `attempt_lag` p99 1ms, `reply_lag` p99 0ms; `b_stress_pinning` `gateway_procs` 4. Negative case (`GWLOSS_PHASES=b1 GWLOSS_DRY_NO_PRECOMPUTE=1`): `b1_storm_real` fails, `precompute_at_kill.ready` null after `wait_s` 120, 1000 handshakes inline.
 - Rulings: (1) `TestRunRefusesBadFlags`' `-precompute` row passed before the flag existed (the flag package's "not defined: -precompute" contains the word); kept, since `TestNewRefusesPrecomputeInLightMode` covers the refusal. (2) The roadmap records #106–#108 as decided (the plan review and the user decided them), not "proposed".
+- **Final review (2026-10-14, Opus):** no Critical/Important. All 6 minors fixed in the next commit:
+  1. `<phase>_storm_real` records detection (`slo.detection`: mark → loss noticed on the client's run loop), data only.
+  2. The precompute workers wait for the ramp's end, so the ramp does not pay for a second first message beside each login (`TestPrecomputeWaitsForTheRampsEnd`).
+  3. `Runner.Mark` documents why a failed mark leaves precompute stopped: only a duplicate name fails, so an earlier mark already stopped it. No code change, since no test can reach the case.
+  4. The `-precompute` flag row wants "sdk mode".
+  5. `TestAttemptLagOnlyAfterAWait` pins "no lag without a wait"; it catches the mutation that drops the `due` guard.
+  6. The `prepared` comment no longer suggests a prepared token.
+  Dry run after the fixes: 27/29 (only dev swap); `precompute_at_kill` wait 0s in both phases; detection p99 27ms (b1) and 38ms (b_stress).

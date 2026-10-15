@@ -25,7 +25,7 @@ func TestRunRefusesBadFlags(t *testing.T) {
 		{[]string{"-env", "/nonexistent"}, "no such file"},
 		{[]string{"-nope"}, "flag provided but not defined"},
 		{[]string{"-env", "ENV", "-down", "gw-9"}, "down"},
-		{[]string{"-env", "ENV", "-precompute"}, "precompute"},
+		{[]string{"-env", "ENV", "-precompute"}, "sdk mode"},
 	} {
 		for i, a := range tc.args {
 			if a == "ENV" {

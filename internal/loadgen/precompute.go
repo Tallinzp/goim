@@ -9,16 +9,18 @@ import (
 )
 
 // prepared is what a phone's own CPU has made when its connection drops:
-// the first handshake message (#106; its token is the client's cached one).
-// One serves one attempt.
+// the first handshake message (#106). The token is not in it: the client
+// keeps that itself (sdkClient.tok). One serves one attempt.
 type prepared struct {
 	in    *wire.Initiator
 	frame []byte
 }
 
 // precomputer prepares each logged-in SDK client's next attempt in the
-// background until the first mark (#106), so a storm's first attempts do not
-// spend loadgen's CPU on what a phone has ready.
+// background, from the ramp's end until the first mark (#106), so a storm's
+// first attempts do not spend loadgen's CPU on what a phone has ready. It
+// waits for the ramp's end because each ramp login makes its own first
+// message: preparing beside them would double the ramp's handshake work.
 type precomputer struct {
 	r       *Runner
 	q       chan *sdkClient // sized to Clients: each client is queued at most once
@@ -49,8 +51,13 @@ func (p *precomputer) enqueue(sc *sdkClient) {
 	p.q <- sc
 }
 
-// run prepares queued clients until ctx ends.
+// run prepares queued clients from the ramp's end until ctx ends.
 func (p *precomputer) run(ctx context.Context) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-p.r.ramped:
+	}
 	for {
 		select {
 		case <-ctx.Done():

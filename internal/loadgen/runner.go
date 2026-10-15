@@ -64,6 +64,7 @@ type Runner struct {
 	begin    atomic.Int64 // unix ns Run started, 0: not yet
 	started  atomic.Int64
 	rampDone atomic.Bool
+	ramped   chan struct{} // closed when every client has started
 
 	mu    sync.Mutex
 	stops []func() // one per started client
@@ -110,7 +111,7 @@ func New(cfg Config, env Env) (*Runner, error) {
 	for _, gw := range down {
 		bal.SetDown(gw)
 	}
-	r := &Runner{cfg: cfg, env: env, rec: NewRecorder(cfg.Clients, env.GatewayIDs), bal: bal}
+	r := &Runner{cfg: cfg, env: env, rec: NewRecorder(cfg.Clients, env.GatewayIDs), bal: bal, ramped: make(chan struct{})}
 	if cfg.Mode == "light" {
 		r.pinger = newPingers(runtime.GOMAXPROCS(0), cfg.PingEvery, r.rec)
 	}
@@ -161,6 +162,7 @@ func (r *Runner) Run(ctx context.Context) {
 		r.started.Add(1)
 	}
 	r.rampDone.Store(ctx.Err() == nil)
+	close(r.ramped)
 	<-ctx.Done()
 	r.mu.Lock()
 	stops := r.stops
@@ -236,7 +238,10 @@ func (r *Runner) Kill(gw, pid int, name string) (int, error) {
 // health check would, once the mark is taken.
 func (r *Runner) Mark(gw int, name string, down bool) (int, error) {
 	if r.pre != nil {
-		r.pre.stopped.Store(true) // the storm's CPU is the storm's (#106)
+		// The storm's CPU is the storm's (#106). Stopped before the mark, and
+		// not undone if the mark fails: rec.Mark fails only on a name already
+		// taken, so an earlier mark has stopped it already.
+		r.pre.stopped.Store(true)
 	}
 	n, err := r.rec.Mark(name, gw, time.Now())
 	if err == nil && down && gw >= 0 {
