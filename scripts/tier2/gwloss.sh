@@ -52,6 +52,13 @@
 #   GWLOSS_STRESS_SOURCES  b_stress: loadgen's source addresses (default:
 #                          loadgen's, sized for the victim alone: 120 for 600k)
 #   GWLOSS_STRESS_LG_MEMLIMIT b_stress: loadgen's GOMEMLIMIT (default 16GiB, #93)
+#   GWLOSS_STRESS_HANDSHAKE_CONCURRENCY  b_stress: each gateway's
+#                      -handshake-concurrency (default unset: the gateway's
+#                      own, half its loops, 2 at 4). An experiment (run at
+#                      271c022: 3.9M no_slot rejects for 600k logins, 201k
+#                      clients in backoff, all back in 188s); the victim's
+#                      ramp gets it too. The phase field's gateway_args
+#                      records it.
 #   GWLOSS_LAG_P99_MS  the storm's p99 bound on loadgen's lags, attempt_lag,
 #                      connect_lag, send_lag and reply_lag, ms (default 100,
 #                      #107)
@@ -165,6 +172,9 @@ case ${GWLOSS_TAIL_PROFILE_AT:-0} in
   0) ;;
   *[!0-9]*) echo "gwloss: GWLOSS_TAIL_PROFILE_AT must be 0 or seconds >= 30" >&2; exit 1 ;;
   *) [ "$GWLOSS_TAIL_PROFILE_AT" -ge 30 ] || { echo "gwloss: GWLOSS_TAIL_PROFILE_AT must be 0 or seconds >= 30" >&2; exit 1; } ;;
+esac
+case ${GWLOSS_STRESS_HANDSHAKE_CONCURRENCY:-1} in
+  ''|*[!0-9]*|0) echo "gwloss: GWLOSS_STRESS_HANDSHAKE_CONCURRENCY must be a positive integer" >&2; exit 1 ;;
 esac
 # The memory each phase needs available (#93): b1's loadgen peaked at
 # 10.6-11.5GB with 400k SDK clients (runs 20, 21). b_stress's loadgen peaked
@@ -333,6 +343,8 @@ for name in $PHASES; do
   mkdir -p "$STACK_DIR"
   ln -sfn ../bin "$STACK_DIR/bin"
   STACK_GATEWAY_ARGS=(-max-conns "$cap")
+  [ "$name" = b_stress ] && [ -n "${GWLOSS_STRESS_HANDSHAKE_CONCURRENCY:-}" ] &&
+    STACK_GATEWAY_ARGS+=(-handshake-concurrency "$GWLOSS_STRESS_HANDSHAKE_CONCURRENCY")
   t0=$SECONDS
 
   busy=$(stack_busy_ports)
