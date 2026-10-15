@@ -50,7 +50,9 @@ type Config struct {
 	// Initiate makes an attempt's first handshake frame for the pinned key
 	// (nil: wire.Initiate for CMD_HANDSHAKE, after the dial). Loadgen hands
 	// over one made ahead of time (#106): the server sees the same bytes,
-	// and a phone's own CPU, not loadgen's, would have made them.
+	// and a phone's own CPU, not loadgen's, would have made them. Each call
+	// must return a fresh Initiator, made for keyID and serverPub: an
+	// Initiator serves one handshake, and a reused one fails at Finish.
 	Initiate func(keyID uint16, serverPub []byte) (*wire.Initiator, []byte, error)
 }
 

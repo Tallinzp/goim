@@ -52,7 +52,8 @@
 #   GWLOSS_STRESS_SOURCES  b_stress: loadgen's source addresses (default:
 #                          loadgen's, sized for the victim alone: 120 for 600k)
 #   GWLOSS_STRESS_LG_MEMLIMIT b_stress: loadgen's GOMEMLIMIT (default 16GiB, #93)
-#   GWLOSS_LAG_P99_MS  the storm's attempt lag p99 bound, ms (default 100, #107)
+#   GWLOSS_LAG_P99_MS  the storm's p99 bound on both loadgen lags, attempt_lag
+#                      and reply_lag, ms (default 100, #107)
 #   GWLOSS_STRESS_CPUS_LOADGEN  b_stress: loadgen's CPU set (default
 #                      0-5,10,12-17,22, #108)
 #   GWLOSS_STRESS_CPUS_GATEWAY  b_stress: the gateways' CPU set (default 6-9,18-21,
@@ -112,8 +113,8 @@
 #                      login, none dropped (stack_wait_idle, P6b1I-4)
 #   b1_processes       nothing but the victim died, panicked or stopped uncleanly
 #   artifacts          (once) every phase's storm CPU profiles, metrics before
-#                      and after, loadgen's heap at the ramp's end, the SLO and
-#                      loadgen's result
+#                      and after, loadgen's heap at the ramp's end and at the
+#                      kill, the SLO and loadgen's result
 # The phase field's redis_latency.ramp and .storm are Redis's per-command
 # latency since a CONFIG RESETSTAT at each window's start; .reset says
 # whether that reset succeeded (false: the window also holds the commands
@@ -210,6 +211,15 @@ t2_report_extra() {
 lo_dropped() { cat /sys/class/net/lo/statistics/rx_dropped 2>/dev/null || echo null; }
 # usage_ok JSON: loadgen used under 3/4 of its CPU set.
 usage_ok() { [ "$(echo "$1" | lg_true - 'd["loadgen"]["cores"] < '"$LG_CPUS"' * 0.75')" = true ]; }
+# lg_heap WHEN: saves loadgen's heap after a forced GC to artifacts/WHEN/ and
+# prints {live_mb, sys_mb, live_bytes_per_client} from it (null: unreadable).
+lg_heap() {
+  mkdir -p "$STACK_DIR/artifacts/$1"
+  curl -sf -m 60 "http://$(lg_control)/debug/pprof/heap?gc=1&debug=1" >"$STACK_DIR/artifacts/$1/loadgen.heap.txt"
+  awk -v n="$clients" '/^# HeapAlloc = / { a = $4 } /^# Sys = / { s = $4 }
+    END { if (a == "") print "null"; else printf "{\"live_mb\": %d, \"sys_mb\": %d, \"live_bytes_per_client\": %d}\n", a / 1048576, s / 1048576, a / n }' \
+    "$STACK_DIR/artifacts/$1/loadgen.heap.txt"
+}
 
 t=$SECONDS
 if ! make redis-server >"$T2_OUT/redis-build.log" 2>&1; then
@@ -286,11 +296,7 @@ for name in $PHASES; do
   by_gateway=$(lg_get /stats 'd["online_by_gateway"]')
   # Loadgen's live heap per client at the ramp's end, after a forced GC (#93's
   # memory budget estimates it from RSS, which includes GC headroom).
-  mkdir -p "$STACK_DIR/artifacts/ramp"
-  curl -sf -m 60 "http://$(lg_control)/debug/pprof/heap?gc=1&debug=1" >"$STACK_DIR/artifacts/ramp/loadgen.heap.txt"
-  lg_heap=$(awk -v n="$clients" '/^# HeapAlloc = / { a = $4 } /^# Sys = / { s = $4 }
-    END { if (a == "") print "null"; else printf "{\"live_mb\": %d, \"sys_mb\": %d, \"live_bytes_per_client\": %d}\n", a / 1048576, s / 1048576, a / n }' \
-    "$STACK_DIR/artifacts/ramp/loadgen.heap.txt")
+  heap_ramp=$(lg_heap ramp)
   # b_stress: the survivors back in the balancer before the kill.
   ups=""
   for g in ${down//,/ }; do
@@ -321,6 +327,9 @@ for name in $PHASES; do
     sleep 1
   done
   precompute=$(lg_get /stats '{"pending": (d.get("precompute") or {}).get("pending"), "ready": (d.get("precompute") or {}).get("ready"), "online": d["online"], "wait_s": '"$((SECONDS - t))"'}')
+  # Again at the kill: the prepared handshakes (#106) are live through the
+  # storm's first 20s, its memory peak (P6b2a-stormI-1).
+  heap_kill=$(lg_heap at_kill)
 
   # The storm: counters before, SIGKILL, CPU profiles of its first 30s.
   stack_snapshot before
@@ -446,7 +455,7 @@ for name in $PHASES; do
 
   cpu_sets="{\"ramp\": $(t2_cpusets_json "$STACK_DIR/cpustat-0" "$STACK_DIR/cpustat-1"), \"storm\": $(t2_cpusets_json "$STACK_DIR/cpustat-2" "$STACK_DIR/cpustat-3")}"
   tcp="{\"ramp\": $(t2_tcpstat_json "$STACK_DIR/tcpstat-0" "$STACK_DIR/tcpstat-1"), \"storm\": $(t2_tcpstat_json "$STACK_DIR/tcpstat-2" "$STACK_DIR/tcpstat-3")}"
-  t2_field "$name" "{\"clients\": $clients, \"victim\": \"$victim\", \"by_gateway_at_kill\": $by_gateway, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"loadgen_env\": $(t2_json_str "${LG_ENV[*]}"), \"ramp_s\": $ramp_s, \"ramp\": $ramp, \"loadgen_heap\": $lg_heap, \"storm\": $storm, \"storm_first30\": $storm30, \"loadgen_bound\": $loadgen_bound, \"precompute_at_kill\": $precompute, \"storm_since_mark\": $storm_d, \"back_s\": $back_s, \"sweep_s\": $sweep_s, \"logic\": $logic_d, \"survivors\": $sv_d, \"redis_latency\": {\"ramp\": $redis_ramp, \"storm\": $redis_storm, \"reset\": {\"ramp\": $reset_ramp, \"storm\": $reset_storm}}, \"backoff\": $backoff, \"cpu_sets\": $cpu_sets, \"tcp\": $tcp, \"profile_in_storm_s\": 30, \"stop_s\": $stop_s, \"loadgen_exit\": $LG_STATUS, \"login_latency\": $(lg_json 'd["login_latency"]'), \"failed\": $(lg_json 'd["failed"]'), \"lost\": $(lg_json 'd["lost"]'), \"sources\": $(lg_json 'd["sources"]')}"
+  t2_field "$name" "{\"clients\": $clients, \"victim\": \"$victim\", \"by_gateway_at_kill\": $by_gateway, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"loadgen_env\": $(t2_json_str "${LG_ENV[*]}"), \"ramp_s\": $ramp_s, \"ramp\": $ramp, \"loadgen_heap\": {\"ramp\": $heap_ramp, \"at_kill\": $heap_kill}, \"storm\": $storm, \"storm_first30\": $storm30, \"loadgen_bound\": $loadgen_bound, \"precompute_at_kill\": $precompute, \"storm_since_mark\": $storm_d, \"back_s\": $back_s, \"sweep_s\": $sweep_s, \"logic\": $logic_d, \"survivors\": $sv_d, \"redis_latency\": {\"ramp\": $redis_ramp, \"storm\": $redis_storm, \"reset\": {\"ramp\": $reset_ramp, \"storm\": $reset_storm}}, \"backoff\": $backoff, \"cpu_sets\": $cpu_sets, \"tcp\": $tcp, \"profile_in_storm_s\": 30, \"stop_s\": $stop_s, \"loadgen_exit\": $LG_STATUS, \"login_latency\": $(lg_json 'd["login_latency"]'), \"failed\": $(lg_json 'd["failed"]'), \"lost\": $(lg_json 'd["lost"]'), \"sources\": $(lg_json 'd["sources"]')}"
   t2_duration "$name" $((SECONDS - t0))
 
   # Artifacts: metrics before and after the storm, its CPU profiles, the SLO
@@ -461,7 +470,9 @@ for name in $PHASES; do
     done
   done
   for f in logic "${survivors[@]}" loadgen; do gzip -t "$a/storm/$f.cpu.pb.gz" 2>/dev/null || missing+=" $name/storm/$f.cpu"; done
-  grep -q '^# HeapAlloc = ' "$a/ramp/loadgen.heap.txt" 2>/dev/null || missing+=" $name/ramp/loadgen.heap.txt"
+  for w in ramp at_kill; do
+    grep -q '^# HeapAlloc = ' "$a/$w/loadgen.heap.txt" 2>/dev/null || missing+=" $name/$w/loadgen.heap.txt"
+  done
   [ "$(lg_true "$a/slo-death.json" '"population" in d')" = true ] || missing+=" $name/slo-death.json"
   [ "$(lg_true "$res" '"mode" in d')" = true ] || missing+=" $name/loadgen-$name.json"
 done

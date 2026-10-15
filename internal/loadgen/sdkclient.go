@@ -48,6 +48,8 @@ func (r *Runner) newSDK(i int) (*sdk.Client, error) {
 			sc.gw.Store(int32(gw))
 			return &replyConn{Conn: nc, rec: r.rec}, nil
 		},
+		// A prepared frame is for the env's key, which is this Config's
+		// KeyID and ServerKey: the SDK pins one key (P6b2a-stormI-3).
 		Initiate: func(keyID uint16, pub []byte) (*wire.Initiator, []byte, error) {
 			if r.pre != nil {
 				if pr := r.pre.take(sc); pr != nil {
