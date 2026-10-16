@@ -741,4 +741,7 @@ Push the branch. Fast-forwarding `main` is the user's call, as with every earlie
 
 ## Execution Notes
 
-(none yet)
+- 2026-10-15, executed inline (superpowers:executing-plans) on `feat/plan6b2b-b2` from `feat/plan6b2b` (`a80b11a`). Both patches applied cleanly.
+- Task 1 (`e7ead47`): RED 9 failed (6 hist, 3 buckets) as planned; GREEN `make test-scripts` all passed; both mutations (`floor`, `>`) caught with the planned FAIL lines, reverted.
+- Task 2 (`04746ae`): `bash -n` clean, 8 `NETDROP`. Dev dry run (`b1 b2`, 2,000 clients, fake `goim-netdrop`): exit 1, 33 checks, failed only `b2_detection` (`lost` `{"lost": 1000}`, detection max 40ms) and `b2_kicks` (`first_refused` 1000) by design, plus `no_swap_in_b1` (dev swap, 54 pages). `b2_netdrop` 4/0; `b2_slo` back_s 20, `pass_from_detection` true; `b2_login_p99` ramp 16ms, storm 16ms (the prototype's ramp was 64ms; two shared CPUs); `b2_goroutines` at_drop 28, max 93, 20 samples; `b2_cross_check` 1000 samples, mean 15.9s; `b2_swept` 60s. Fields: b2 `-max-conns 3000 -heartbeat 30s`, `profile_at_s` 15, goroutines set; b1 `profile_at_s` 0, goroutines null. Artifacts `b2/artifacts/slo-drop.json`, `b1/artifacts/slo-death.json`. Fake rules empty after the run; no process left. Unknown phase refused (`exit 1`). No rules, no kill: 5 checks, `b2_netdrop` failed with `rules_at_kill` 0, `rules_left` null, the others passed. Whole branch: `make test`, `test-race-suite`, `test-scripts`, `test-load-probe` all passed.
+- Next: Task 3 on the Tier 2 host (the user): the interrupt check, then run 28 (`GWLOSS_PHASES=b2`, 19 checks).
