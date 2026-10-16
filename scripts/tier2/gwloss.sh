@@ -169,9 +169,8 @@
 #                      gives up as live. A refused Kick is not retried (#97):
 #                      only first attempts that timed out while the victim's
 #                      sockets were torn down are, once each, and refused
-#                      (R2-O6; #97 amended, run 20). b2: the same bounds (first
-#                      attempts at most 1.1 per relogin, sent or dropped at
-#                      least 0.9), no Kick refused (the DROP answers nothing:
+#                      (R2-O6; #97 amended, run 20). b2: the same bounds, no
+#                      Kick refused (the DROP answers nothing:
 #                      they time out or fail fast, and keep their retries while
 #                      the lease is live), at most 3 retries per first attempt,
 #                      none gives up as live; and Kicks were exercised: sent
@@ -180,7 +179,11 @@
 #                      (review O1) if the ramp lasted at least one heartbeat:
 #                      a shorter ramp bunches every Ping, so the relogins may
 #                      all come after the lease (a 20k trial on the host).
-#                      Otherwise live_lease_exercised is recorded, not gated
+#                      Otherwise live_lease_exercised is recorded, not gated.
+#                      Both record dropped_first and dropped_retry apart, and
+#                      open_chains: first attempts not ended by a success, a
+#                      give-up or a dropped retry (0 expected; recorded, not
+#                      gated, P6b2b-b2-run28I-1)
 #   b1_cross_check     Logic's dead-epoch cross-check (R1-O7) has a sample for
 #                      at least 0.9 of the relogins whose first Kick was sent
 #                      and did not time out (by Login once the lease is gone,
@@ -303,6 +306,13 @@ LOGIC_COUNTERS=(
   kick_giveups_dead='goim_logic_kick_giveups_total:target_lease="dead"'
   kick_giveups_live='goim_logic_kick_giveups_total:target_lease="live"'
   kick_dropped=goim_logic_kick_dropped_total
+  # P6b2b-b2-run28I-1: every chain (a first attempt and its retries) ends in
+  # a success, a give-up (live, dead or unknown) or a dropped retry; the rest
+  # are open_chains.
+  kick_ok='goim_logic_kick_attempts_total:result="ok"'
+  kick_giveups_unknown='goim_logic_kick_giveups_total:target_lease="unknown"'
+  kick_dropped_first='goim_logic_kick_dropped_total:attempt="first"'
+  kick_dropped_retry='goim_logic_kick_dropped_total:attempt="retry"'
   dead_epoch_relogins=goim_logic_dead_epoch_relogin_seconds_count
   dead_epoch_relogin_s=goim_logic_dead_epoch_relogin_seconds_sum
   lease_live='goim_logic_lease_renewals_total:result="live"'
@@ -725,8 +735,8 @@ print(json.dumps(out))' "$STACK_DIR/artifacts/ss-storm.jsonl" 2>/dev/null || ech
   if [ "$name" = b2 ]; then
     # A silent target (#112): no Kick refused; retries kept while the lease
     # is live, at most 3 per first attempt (R2-O6); the sent-or-dropped
-    # bounds as b1's (dropped also counts retries a full queue dropped, so
-    # only the first attempts have the upper bound). Kicks were exercised
+    # bounds as b1's (first attempts only: a dropped retry is counted apart,
+    # P6b2b-b2-run28I-2). Kicks were exercised
     # (review O1): some retried while the lease was live, and first attempts
     # sent or dropped for at least half the relogins (at a 30s heartbeat
     # nearly all relogins come before the sweep). The retries' floor only
@@ -736,19 +746,19 @@ print(json.dumps(out))' "$STACK_DIR/artifacts/ss-storm.jsonl" 2>/dev/null || ech
     # 2026-10-16: an 11s ramp, detection 27-39s, every Kick given up dead).
     pings_spread=false
     [ "$ramp_s" -ge "$b2_hb" ] && pings_spread=true
-    kicks_rule='d["d"]["kick_first_refused"] == 0 and d["d"]["kick_retry_refused"] == 0 and d["d"]["kick_giveups_live"] == 0 and (d["d"]["kick_retry"] > 0 or not d["spread"]) and d["d"]["kick_retry"] <= 3 * d["d"]["kick_first"] and d["d"]["kick_first"] <= 1.1 * d["pop"] and max(0.5 * d["pop"], 0.9 * (d["pop"] - (d["d"]["sweep_deleted"] or 0))) <= d["d"]["kick_first"] + (d["d"]["kick_dropped"] or 0)'
+    kicks_rule='d["d"]["kick_first_refused"] == 0 and d["d"]["kick_retry_refused"] == 0 and d["d"]["kick_giveups_live"] == 0 and (d["d"]["kick_retry"] > 0 or not d["spread"]) and d["d"]["kick_retry"] <= 3 * d["d"]["kick_first"] and max(0.5 * d["pop"], 0.9 * (d["pop"] - (d["d"]["sweep_deleted"] or 0))) <= d["d"]["kick_first"] + (d["d"]["kick_dropped_first"] or 0) <= 1.1 * d["pop"]'
     # R1-O7: only Login records the cross-check here (no refused Kick), for
     # relogins between the lease's end and the sweep: most of them at a 30s
     # heartbeat; 0.1 per relogin is a cautious floor (review O6).
     cross_rule='0.1 * d["pop"] <= d["d"]["dead_epoch_relogins"] <= 1.1 * d["pop"]'
   else
-    kicks_rule='d["d"]["kick_retry"] <= d["d"]["kick_first_timeout"] and d["d"]["kick_retry_refused"] == d["d"]["kick_retry"] and d["d"]["kick_giveups_live"] == 0 and 0.9 * (d["pop"] - (d["d"]["sweep_deleted"] or 0)) <= d["d"]["kick_first"] + (d["d"]["kick_dropped"] or 0) <= 1.1 * d["pop"]'
+    kicks_rule='d["d"]["kick_retry"] <= d["d"]["kick_first_timeout"] and d["d"]["kick_retry_refused"] == d["d"]["kick_retry"] and d["d"]["kick_giveups_live"] == 0 and 0.9 * (d["pop"] - (d["d"]["sweep_deleted"] or 0)) <= d["d"]["kick_first"] + (d["d"]["kick_dropped_first"] or 0) <= 1.1 * d["pop"]'
     # R1-O7: one sample per relogin whose first Kick was sent and did not time
     # out, by Login (lease gone) or by the refused Kick (lease live).
     cross_rule='0.9 * (d["d"]["kick_first"] - d["d"]["kick_first_timeout"]) <= d["d"]["dead_epoch_relogins"] <= 1.1 * d["pop"]'
   fi
   t2_check "${name}_kicks" "$(echo "{\"d\": $logic_d, \"pop\": $pop, \"spread\": ${pings_spread:-false}}" | lg_true - "$kicks_rule")" \
-    "${pings_spread:+\"pings_spread\": $pings_spread, \"ramp_s\": $ramp_s, \"live_lease_exercised\": $(echo "$logic_d" | lg_py - 'd["kick_retry"] > 0'), }\"relogins\": $pop, \"swept_first\": $(echo "$logic_d" | lg_py - 'd["sweep_deleted"]'), \"first\": $(echo "$logic_d" | lg_py - 'd["kick_first"]'), \"retries\": $(echo "$logic_d" | lg_py - 'd["kick_retry"]'), \"first_timeouts\": $(echo "$logic_d" | lg_py - 'd["kick_first_timeout"]'), \"first_errors\": $(echo "$logic_d" | lg_py - 'd["kick_first_error"]'), \"first_refused\": $(echo "$logic_d" | lg_py - 'd["kick_first_refused"]'), \"retries_refused\": $(echo "$logic_d" | lg_py - 'd["kick_retry_refused"]'), \"retries_timeout\": $(echo "$logic_d" | lg_py - 'd["kick_retry_timeout"]'), \"retries_error\": $(echo "$logic_d" | lg_py - 'd["kick_retry_error"]'), \"giveups_dead\": $(echo "$logic_d" | lg_py - 'd["kick_giveups_dead"]'), \"giveups_live\": $(echo "$logic_d" | lg_py - 'd["kick_giveups_live"]'), \"dropped\": $(echo "$logic_d" | lg_py - 'd["kick_dropped"]')"
+    "${pings_spread:+\"pings_spread\": $pings_spread, \"ramp_s\": $ramp_s, \"live_lease_exercised\": $(echo "$logic_d" | lg_py - 'd["kick_retry"] > 0'), }\"relogins\": $pop, \"swept_first\": $(echo "$logic_d" | lg_py - 'd["sweep_deleted"]'), \"first\": $(echo "$logic_d" | lg_py - 'd["kick_first"]'), \"retries\": $(echo "$logic_d" | lg_py - 'd["kick_retry"]'), \"first_timeouts\": $(echo "$logic_d" | lg_py - 'd["kick_first_timeout"]'), \"first_errors\": $(echo "$logic_d" | lg_py - 'd["kick_first_error"]'), \"first_refused\": $(echo "$logic_d" | lg_py - 'd["kick_first_refused"]'), \"retries_refused\": $(echo "$logic_d" | lg_py - 'd["kick_retry_refused"]'), \"retries_timeout\": $(echo "$logic_d" | lg_py - 'd["kick_retry_timeout"]'), \"retries_error\": $(echo "$logic_d" | lg_py - 'd["kick_retry_error"]'), \"giveups_dead\": $(echo "$logic_d" | lg_py - 'd["kick_giveups_dead"]'), \"giveups_live\": $(echo "$logic_d" | lg_py - 'd["kick_giveups_live"]'), \"giveups_unknown\": $(echo "$logic_d" | lg_py - 'd["kick_giveups_unknown"]'), \"dropped\": $(echo "$logic_d" | lg_py - 'd["kick_dropped"]'), \"dropped_first\": $(echo "$logic_d" | lg_py - 'd["kick_dropped_first"]'), \"dropped_retry\": $(echo "$logic_d" | lg_py - 'd["kick_dropped_retry"]'), \"open_chains\": $(echo "$logic_d" | lg_py - 'd["kick_first"] - sum(d[k] or 0 for k in ("kick_ok", "kick_giveups_dead", "kick_giveups_live", "kick_giveups_unknown", "kick_dropped_retry"))')"
   t2_check "${name}_cross_check" "$(echo "{\"d\": $logic_d, \"pop\": $pop}" | lg_true - "$cross_rule")" \
     "\"relogins\": $pop, \"samples\": $(echo "$logic_d" | lg_py - 'd["dead_epoch_relogins"]'), \"mean_s\": $(echo "$logic_d" | lg_py - 'round(d["dead_epoch_relogin_s"] / d["dead_epoch_relogins"], 1)')"
   # #107: the storm was the spec's: every logged-in client was prepared at
@@ -807,7 +817,19 @@ print(json.dumps(out))' "$STACK_DIR/artifacts/ss-storm.jsonl" 2>/dev/null || ech
   t2_check "${name}_processes" "$(t2_bool [ -z "$problems" ])" "\"problems\": $(t2_json_str "$problems")"
 
   cpu_sets="{\"ramp\": $(t2_cpusets_json "$STACK_DIR/cpustat-0" "$STACK_DIR/cpustat-1"), \"storm\": $(t2_cpusets_json "$STACK_DIR/cpustat-2" "$STACK_DIR/cpustat-3")}"
-  tcp="{\"ramp\": $(t2_tcpstat_json "$STACK_DIR/tcpstat-0" "$STACK_DIR/tcpstat-1"), \"storm\": $(t2_tcpstat_json "$STACK_DIR/tcpstat-2" "$STACK_DIR/tcpstat-3")}"
+  # The orphan limits (P6b2b-b2-run28I-5): the victim's sockets and loadgen's
+  # closed ones linger as orphans (behind b2's DROP, retransmitting) until
+  # the kernel aborts them (TCPAbortOnMemory) or gives up retrying, which
+  # decides how long the storm's retransmit bursts last on another host.
+  orphans=$(python3 -c 'import json, sys
+def read(n):
+    try:
+        v = [int(x) for x in open("/proc/sys/net/ipv4/" + n).read().split()]
+    except (OSError, ValueError):
+        return None
+    return v[0] if len(v) == 1 else v
+print(json.dumps({n: read(n) for n in ("tcp_max_orphans", "tcp_orphan_retries", "tcp_mem")}))')
+  tcp="{\"ramp\": $(t2_tcpstat_json "$STACK_DIR/tcpstat-0" "$STACK_DIR/tcpstat-1"), \"storm\": $(t2_tcpstat_json "$STACK_DIR/tcpstat-2" "$STACK_DIR/tcpstat-3"), \"sysctl\": $orphans}"
   t2_field "$name" "{\"clients\": $clients, \"victim\": \"$victim\", \"by_gateway_at_kill\": $by_gateway, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"loadgen_env\": $(t2_json_str "${LG_ENV[*]}"), \"ramp_s\": $ramp_s, \"ramp\": $ramp, \"loadgen_heap\": {\"ramp\": $heap_ramp, \"at_kill\": $heap_kill}, \"storm\": $storm, \"storm_first30\": $storm30, \"loadgen_bound\": $loadgen_bound, \"precompute_at_kill\": $precompute, \"storm_since_mark\": $storm_d, \"back_s\": $back_s, \"loadgen_at_back\": $rt_back, \"sweep_s\": $sweep_s, \"logic\": $logic_d, \"survivors\": $sv_d, \"redis_latency\": {\"ramp\": $redis_ramp, \"storm\": $redis_storm, \"reset\": {\"ramp\": $reset_ramp, \"storm\": $reset_storm}}, \"backoff\": $backoff, \"cpu_sets\": $cpu_sets, \"tcp\": $tcp, \"profile_in_storm_s\": 30, \"profile_at_s\": $prof_at, \"stop_s\": $stop_s, \"goroutines\": $goroutines, \"loadgen_exit\": $LG_STATUS, \"login_latency\": $(lg_json 'd["login_latency"]'), \"failed\": $(lg_json 'd["failed"]'), \"lost\": $(lg_json 'd["lost"]'), \"sources\": $(lg_json 'd["sources"]')}"
   t2_duration "$name" $((SECONDS - t0))
 

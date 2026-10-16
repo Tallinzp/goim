@@ -106,7 +106,13 @@ func (k *Kicker) enqueue(ref store.EpochRef, j kickJob) {
 		k.mu.Unlock()
 	default:
 		k.mu.Unlock()
-		k.m.KickDropped.WithLabelValues(k.cachedLeaseLabel(ref)).Inc()
+		// A dropped retry ends its chain as a give-up would; counted apart,
+		// so a retry lost under a live lease is not read as a first attempt.
+		kind := "first"
+		if j.attempt > 0 {
+			kind = "retry"
+		}
+		k.m.KickDropped.WithLabelValues(kind, k.cachedLeaseLabel(ref)).Inc()
 	}
 }
 

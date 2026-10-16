@@ -392,13 +392,56 @@ func TestKickQueueFullDrops(t *testing.T) {
 	}
 	// One attempt in flight (or not yet taken) and two queued; the rest dropped.
 	// No attempt has failed yet, so the lease was never read: "unknown".
-	d := counter(env.m.KickDropped.WithLabelValues("unknown"))
+	d := counter(env.m.KickDropped.WithLabelValues("first", "unknown"))
 	if d < 7 || d > 8 {
 		t.Fatalf("dropped %v, want 7 or 8", d)
 	}
 	if q := counter(env.m.KickQueueDepth.WithLabelValues(gw + ":4")); q > 2 {
 		t.Fatalf("queue depth %v above its size", q)
 	}
+}
+
+// P6b2b-b2-run28I-1: a retry dropped by a full queue is counted as a retry,
+// apart from the first attempts, and ends its chain: once every chain is over,
+// each first attempt is accounted for by a success, a give-up or a dropped
+// retry (gwloss's open_chains).
+func TestKickRetryDroppedIsCountedAsRetry(t *testing.T) {
+	gw := testredis.Gateway()
+	cfg := testConfig().Kick
+	cfg.Workers, cfg.Queue = 1, 1
+	env := newKickEnv(t, cfg, map[string]string{gw: blackhole(t)})
+	ref := store.EpochRef{Gateway: gw, Epoch: 14}
+	if _, err := env.st.RenewLease(ctx, ref); err != nil {
+		t.Fatal(err)
+	}
+	// dropped sums kind's drops over every lease label (the test's lease cache
+	// expires before a retry comes back, so its label is "unknown").
+	dropped := func(kind string) float64 {
+		var n float64
+		for _, l := range []string{"live", "dead", "unknown"} {
+			n += counter(env.m.KickDropped.WithLabelValues(kind, l))
+		}
+		return n
+	}
+	// Keep the queue full, so a retry coming back finds no room.
+	for i := 0; dropped("retry") == 0; i++ {
+		if i == 500 {
+			t.Fatal("no retry dropped in 5s")
+		}
+		env.k.Kick(ref, uint64(i), pb.KickReason_KICK_REASON_REPLACED)
+		time.Sleep(10 * time.Millisecond)
+	}
+	if dropped("first") == 0 {
+		t.Fatal("no first attempt dropped by the full queue")
+	}
+	waitFor(t, "every chain over", func() bool {
+		ended := dropped("retry")
+		for _, l := range []string{"live", "dead", "unknown"} {
+			ended += counter(env.m.KickGiveUps.WithLabelValues(l))
+		}
+		ended += counter(env.m.KickAttempts.WithLabelValues("first", "ok")) + counter(env.m.KickAttempts.WithLabelValues("retry", "ok"))
+		return ended == attempts(env.m, "first")
+	})
 }
 
 // slowLeases makes every lease read take a second.

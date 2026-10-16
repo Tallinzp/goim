@@ -26,7 +26,7 @@ type Metrics struct {
 
 	KickAttempts       *prometheus.CounterVec // attempt: first | retry; result: ok | refused | timeout | error (#97)
 	KickGiveUps        *prometheus.CounterVec // target_lease
-	KickDropped        *prometheus.CounterVec // target_lease (R5S-O2)
+	KickDropped        *prometheus.CounterVec // attempt: first | retry; target_lease (R5S-O2, P6b2b-b2-run28I-1)
 	KickQueueDepth     *prometheus.GaugeVec   // target gw:epoch
 	KickAttemptSeconds prometheus.Histogram
 
@@ -103,7 +103,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 
 		KickAttempts:       cv("kick_attempts_total", "Kick attempts.", "attempt", "result"),
 		KickGiveUps:        cv("kick_giveups_total", "Kicks given up after their attempts.", "target_lease"),
-		KickDropped:        cv("kick_dropped_total", "Kick attempts dropped by a full per-target queue.", "target_lease"),
+		KickDropped:        cv("kick_dropped_total", "Kick attempts dropped by a full per-target queue.", "attempt", "target_lease"),
 		KickQueueDepth:     gv("kick_queue_depth", "Queued Kick attempts per target.", "target"),
 		KickAttemptSeconds: h("kick_attempt_seconds", "Kick attempt latency, connect included.", lat),
 

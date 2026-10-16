@@ -36,10 +36,19 @@ type Config struct {
 }
 
 // KickConfig sizes the hardened Kick client (R2-O6, R5S-O2, roadmap choice #12).
+//
+// Deadline bounds each attempt, its wait for a connection included, but not
+// gRPC's connect itself: that runs on its own minimum connect timeout (20s).
+// Toward a silent target the attempts wait their full Deadline while gRPC
+// connects, so the workers drain only Workers/Deadline Kicks a second, a
+// relogin storm fills the queue, and most drops come then (Tier 2 run 28:
+// 68,511 of 200k relogins dropped, harmless toward a dead gateway;
+// P6b2b-b2-run28I-3). A shorter connect timeout would fail a starved but alive
+// gateway's slow HTTP/2 preface fast instead.
 type KickConfig struct {
 	Workers      int           // per target gw|epoch (64)
 	Queue        int           // per target (1024)
-	Deadline     time.Duration // per attempt, connect included (1s)
+	Deadline     time.Duration // per attempt, not gRPC's connect (1s; above)
 	Retries      int           // after the first attempt, only while the lease is live (3)
 	RetrySpacing time.Duration // between attempts (10s: 3 retries over ~30s)
 	IdleTimeout  time.Duration // a target with no work for this long is dropped (1m)
