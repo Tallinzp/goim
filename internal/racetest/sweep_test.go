@@ -308,7 +308,12 @@ func TestSweepAbortsWhenALeaseKeyReappears(t *testing.T) {
 	const gw, epoch = "gw-9", 77
 	s.fill("sw10f", gw, epoch, 300)
 	s.Redis.SetScore(gw, epoch, s.Redis.Now()-10_000)
-	eventually(t, "the sweep started", 5*time.Second, func() bool { return s.claimed(gw, epoch) })
+	// Past its first batch, not just claimed: a lease key set between the
+	// claim and the sweep's own lease check skips the epoch (lease_live)
+	// instead of aborting it, which a loaded race run hit (6b2b-b2).
+	eventually(t, "the sweep's first batch", 5*time.Second, func() bool {
+		return s.claimed(gw, epoch) && s.logicMetric(logicSweepUIDs) > 0
+	})
 	s.Redis.Client().Set(ctx, "gwlease:"+epochSuffix(gw, epoch), "x", time.Minute)
 	eventually(t, "the sweep aborted", 5*time.Second, func() bool { return s.logicMetric(sprintf(logicSweeps, "aborted")) == 1 })
 	if _, ok := s.Redis.Score(gw, epoch); !ok {

@@ -24,6 +24,7 @@ const (
 	logicSweeps       = `goim_logic_sweeps_total{result="%s"}`
 	logicGuardHolds   = `goim_logic_sweep_guard_holds_total`
 	logicSweepDeleted = `goim_logic_sweep_deleted_total`
+	logicSweepUIDs    = `goim_logic_sweep_uids_total`
 	logicRenewing     = `goim_logic_sweep_guard_renewing_seconds`
 	logicKickAttempts = `goim_logic_kick_attempts_total{attempt="%s",result="%s"}`
 	logicKickGiveUps  = `goim_logic_kick_giveups_total{target_lease="live"}`
