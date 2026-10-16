@@ -195,6 +195,7 @@ expect "hist: only the samples between the readings" "$(stack_hist_quantile "$h0
 expect "hist: no sample between the readings" "$(stack_hist_quantile "$h1" "$h1" 0.99)" null
 expect "hist: a quantile in +Inf" "$(stack_hist_quantile '{}' '{"0.001": 1, "+Inf": 3}' 0.9)" null
 expect "hist: a failed reading" "$(stack_hist_quantile null "$h1" 0.99)" null
+expect "hist: a quantile above 1" "$(stack_hist_quantile '{}' "$h1" 1.5)" null
 # 0.28 x 25 is 7.000000000000001 in floating point: the rank is still 7.
 expect "hist: an exact rank" "$(stack_hist_quantile '{}' '{"0.001": 7, "0.002": 25, "+Inf": 25}' 0.28)" 1
 

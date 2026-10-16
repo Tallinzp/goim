@@ -50,19 +50,23 @@
 #   GWLOSS_SOURCES     b1, b2: loadgen's source addresses (default: loadgen's,
 #                      one per 5,000 connections per gateway, sized for the
 #                      survivor)
-#   GWLOSS_B2_HEARTBEAT  b2: the gateways' -heartbeat (default 30s, the
-#                      SDK's lowest): Ping phases spread evenly over the 80s
-#                      ramp, so some relogins meet a live lease (review O1)
+#   GWLOSS_B2_HEARTBEAT  b2: the gateways' -heartbeat in seconds (default 30,
+#                      the SDK's lowest): Ping phases spread evenly over the
+#                      80s ramp, so some relogins meet a live lease (review
+#                      O1). The detection bound and the back wait follow it
+#                      unless set (P6b2b-b2I-1)
 #   GWLOSS_B2_BACK_WAIT  b2: seconds after the DROP to wait for every victim
-#                      to log in again (default 120: detection within 45s,
-#                      then the SDK's 0-20s storm wait and the login)
+#                      to log in again (default the heartbeat + 90, 120 at
+#                      30s: detection within 45s, then the SDK's 0-20s storm
+#                      wait and the login)
 #   GWLOSS_B2_DETECT_MAX_S  b2: the bound on every victim's detection, from
-#                      the DROP to its Pong timeout (default 45: the 30s
-#                      heartbeat plus the 10s Pong timeout, plus 5s for the
+#                      the DROP to its Pong timeout (default the heartbeat +
+#                      15, 45 at 30s: the 10s Pong timeout plus 5s for the
 #                      timers' and loadgen's slack)
 #   GWLOSS_B2_PROFILE_AT  b2: seconds after the DROP that the storm's 30s CPU
 #                      profiles and loadgen-bound reading start (default 15:
-#                      its relogins run from ~10s to ~60s; review O4)
+#                      its relogins run from ~10s to ~60s; review O4); b2's
+#                      storm_first30 covers this window, not the first 30s
 #   GWLOSS_B2_GOROUTINE_GROWTH  b2: the most Logic's goroutines may grow over
 #                      their count at the DROP while the victims log in again
 #                      (default 500; a goroutine per Kick to the silent
@@ -113,7 +117,9 @@
 #   GWLOSS_TAIL_PROFILE_AT  seconds after the kill to take a second 30s
 #                      loadgen CPU profile, artifacts/storm_tail/ (default 0:
 #                      off; at least 30, after the storm's own profile:
-#                      loadgen serves one CPU profile at a time). A
+#                      loadgen serves one CPU profile at a time; in b2 it
+#                      starts no earlier than GWLOSS_B2_PROFILE_AT + 30,
+#                      P6b2b-b2I-2). A
 #                      diagnostic (run 27: loadgen held ~13 cores while few
 #                      clients were left to log in); taken only if the
 #                      victims are not back by then.
@@ -200,7 +206,10 @@
 #                      storm, and the storm's first 30s, where its relogins
 #                      peak (P6a2aI-4, #102); b_stress's checks the ramp and
 #                      the storm, and records the first 30s as loadgen_bound
-#                      (data; b_stress_storm_real decides, #107)
+#                      (data; b_stress_storm_real decides, #107); b2's 30s
+#                      start GWLOSS_B2_PROFILE_AT after the mark, where its
+#                      relogins are (the field keeps the name storm_first30,
+#                      with profile_at_s beside it; P6b2b-b2I-4)
 #   b1_idle            after loadgen stops, every survivor reaches 0
 #                      connections, 0 awaiting Logout and one Logout done per
 #                      login, none dropped (stack_wait_idle, P6b1I-4)
@@ -233,6 +242,10 @@ case ${GWLOSS_TAIL_PROFILE_AT:-0} in
   *[!0-9]*) echo "gwloss: GWLOSS_TAIL_PROFILE_AT must be 0 or seconds >= 30" >&2; exit 1 ;;
   *) [ "$GWLOSS_TAIL_PROFILE_AT" -ge 30 ] || { echo "gwloss: GWLOSS_TAIL_PROFILE_AT must be 0 or seconds >= 30" >&2; exit 1; } ;;
 esac
+# b2's numbers land in result.json unquoted and in arithmetic.
+for v in GWLOSS_B2_HEARTBEAT GWLOSS_B2_BACK_WAIT GWLOSS_B2_DETECT_MAX_S GWLOSS_B2_PROFILE_AT GWLOSS_B2_GOROUTINE_GROWTH; do
+  case ${!v-0} in ''|*[!0-9]*) echo "gwloss: $v must be whole seconds (or a count)" >&2; exit 1 ;; esac
+done
 case ${GWLOSS_STRESS_HANDSHAKE_CONCURRENCY:-1} in
   ''|*[!0-9]*|0) echo "gwloss: GWLOSS_STRESS_HANDSHAKE_CONCURRENCY must be a positive integer" >&2; exit 1 ;;
 esac
@@ -397,7 +410,11 @@ for name in $PHASES; do
       victim=gw-1 survivors=(gw-0) down="" LG_ENV=() mark=death
       # b2: the loss is the DROP; its clients detect it by Pong timeout,
       # within one heartbeat (30s, GWLOSS_B2_HEARTBEAT) plus 10s.
-      [ "$name" = b2 ] && back_wait=${GWLOSS_B2_BACK_WAIT:-120} mark=drop
+      # The waits follow the heartbeat (P6b2b-b2I-1).
+      if [ "$name" = b2 ]; then
+        b2_hb=${GWLOSS_B2_HEARTBEAT:-30}
+        back_wait=${GWLOSS_B2_BACK_WAIT:-$((b2_hb + 90))} mark=drop
+      fi
       # Every client up from the start, split by the balancer.
       online_rule='d["online"] == '"$clients"' and min(d["online_by_gateway"].get(g, 0) for g in ("gw-0", "gw-1")) >= '"$clients"' * 0.45'
       ;;
@@ -424,7 +441,7 @@ for name in $PHASES; do
   STACK_GATEWAY_ARGS=(-max-conns "$cap")
   [ "$name" = b_stress ] && [ -n "${GWLOSS_STRESS_HANDSHAKE_CONCURRENCY:-}" ] &&
     STACK_GATEWAY_ARGS+=(-handshake-concurrency "$GWLOSS_STRESS_HANDSHAKE_CONCURRENCY")
-  [ "$name" = b2 ] && STACK_GATEWAY_ARGS+=(-heartbeat "${GWLOSS_B2_HEARTBEAT:-30s}")
+  [ "$name" = b2 ] && STACK_GATEWAY_ARGS+=(-heartbeat "${b2_hb}s")
   t0=$SECONDS
 
   busy=$(stack_busy_ports)
@@ -549,8 +566,10 @@ for name in $PHASES; do
   prof=$!
   storm_helpers=("$prof")
   # GWLOSS_TAIL_PROFILE_AT: loadgen's CPU in the storm's tail (run 27), if
-  # the victims are not back by then; stopped with them.
+  # the victims are not back by then; stopped with them. Never inside the
+  # storm's own profile, which b2 starts late (P6b2b-b2I-2).
   tail_at=${GWLOSS_TAIL_PROFILE_AT:-0} tailprof=""
+  [ "$tail_at" -gt 0 ] && [ "$tail_at" -lt $((prof_at + 30)) ] && tail_at=$((prof_at + 30))
   if [ "$tail_at" -gt 0 ]; then
     (sleep "$tail_at"; lg_profile storm_tail 30) >/dev/null 2>&1 &
     tailprof=$!
@@ -653,6 +672,9 @@ print(json.dumps(out))' "$STACK_DIR/artifacts/ss-storm.jsonl" 2>/dev/null || ech
     sudo -n "$NETDROP" del "$vport"
     sudo -n "$NETDROP" del $((vport + 1))
     drop_left=$(sudo -n "$NETDROP" list | wc -l)
+    # A rule left would refuse the next phase's stack: b_stress's gw-1
+    # listens on the same port (P6b2b-b2I-3). b2_netdrop records it.
+    [ "$drop_left" = 0 ] || sudo -n "$NETDROP" flush
   fi
   stack_snapshot after
   logic_d=$(stack_counters_delta "$logic0" "$logic1")
@@ -679,12 +701,15 @@ print(json.dumps(out))' "$STACK_DIR/artifacts/ss-storm.jsonl" 2>/dev/null || ech
     # timeout for every victim and nothing else, so a FIN or RST that
     # leaked shows even beside a stray Pong timeout (review M-2).
     lost=$(echo "{\"a\": ${lost0:-null}, \"b\": ${lost1:-null}}" | lg_py - '{k: v - d["a"].get(k, 0) for k, v in d["b"].items()}')
-    detect_max=${GWLOSS_B2_DETECT_MAX_S:-45}
+    detect_max=${GWLOSS_B2_DETECT_MAX_S:-$((b2_hb + 15))}
     t2_check "${name}_detection" "$(echo "{\"s\": $(cat "$slo"), \"lost\": $lost}" | lg_true - 'd["s"]["detection"]["n"] == d["s"]["population"] and 0 <= d["s"]["detection"]["max_ms"] <= '"$detect_max"' * 1000 and d["lost"].get("pong-timeout", 0) >= d["s"]["population"] and all(v == 0 for k, v in d["lost"].items() if k != "pong-timeout")')" \
       "\"max_s\": $detect_max, \"detection\": $(lg_py "$slo" 'd["detection"]'), \"lost_since_drop\": $lost"
     p99_ramp=$(stack_hist_quantile '{}' "$login_h0" 0.99) p99_storm=$(stack_hist_quantile "$login_h0" "$login_h1" 0.99)
+    # The logins behind each p99: a null p99 with logins is one in +Inf
+    # (P6b2b-b2I-5).
+    logins_n=$(echo "{\"a\": $login_h0, \"b\": $login_h1}" | lg_py - '{"ramp": (d["a"] or {}).get("+Inf"), "storm": None if d["a"] is None or d["b"] is None else d["b"].get("+Inf", 0) - d["a"].get("+Inf", 0)}')
     t2_check "${name}_login_p99" "$(echo "{\"r\": $p99_ramp, \"s\": $p99_storm}" | lg_true - 'd["r"] is not None and d["s"] is not None and d["s"] <= 2 * d["r"]')" \
-      "\"ramp_p99_ms\": $p99_ramp, \"storm_p99_ms\": $p99_storm, \"bucket_bounds\": true, \"redis_latency_storm\": $redis_storm"
+      "\"ramp_p99_ms\": $p99_ramp, \"storm_p99_ms\": $p99_storm, \"logins\": $logins_n, \"bucket_bounds\": true, \"redis_latency_storm\": $redis_storm"
     growth=${GWLOSS_B2_GOROUTINE_GROWTH:-500}
     t2_check "${name}_goroutines" "$(echo "$goroutines" | lg_true - 'd is not None and d["at_drop"] is not None and d["max"] is not None and d["max"] - d["at_drop"] <= '"$growth")" \
       "\"max_growth\": $growth, \"logic\": $goroutines"
@@ -798,5 +823,6 @@ t2_check artifacts "$(t2_bool [ -z "$missing" ])" "\"missing\": $(t2_json_str "$
 t2_not_covered "per-shard Redis CPU and p99 with the gwconns shards marked (one redis-server; Redis Cluster in Plan 6c)" \
   "b_stress's survivors start empty: no survivor carries its own load through the 600k storm (#93)" \
   "b2: the lost node's recovery (out-of-service taint, gw-k recreated elsewhere, R5S-O3) is Tier 3 (Plan 6d)" \
+  "b2: Logic's Kick connection to the victim is dialled after the DROP (connecting, then failing fast); one already open, which stays open with no client keepalive until TCP gives up, is not exercised (P6b2b-b2I-6)" \
   "slowed Logic (scenario slowlogic, Plan 6b2b-slow)"
 t2_finish

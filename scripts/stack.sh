@@ -465,7 +465,8 @@ stack_buckets() {
 # holds quantile Q (0-1) of the samples between two stack_buckets readings
 # of the same process (B - A); a bucket's bound, not an interpolation, so a
 # p99 reads as one of the histogram's bounds. Prints null when either
-# reading is null, there is no sample between them, or Q falls in +Inf.
+# reading is null, there is no sample between them, Q falls in +Inf, or Q
+# is above 1.
 # The rank is exact (Q as a fraction), so it never moves up a sample.
 stack_hist_quantile() {
   python3 -c 'import json, math, sys
@@ -484,7 +485,9 @@ for le in les:
     if d[le] >= rank:
         ms = None if le == "+Inf" else round(float(le) * 1000, 3)
         print(json.dumps(int(ms) if ms is not None and ms == int(ms) else ms))
-        break' "$1" "$2" "$3" 2>/dev/null || echo null
+        break
+else:
+    print("null") # Q above 1 (P6b2b-b2I-5)' "$1" "$2" "$3" 2>/dev/null || echo null
 }
 
 # stack_pinned NAME CPUS: the process's affinity is exactly CPUS.
