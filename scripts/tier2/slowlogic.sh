@@ -88,7 +88,9 @@
 #                       at least 0.1 x victims times
 #   storm_expired       gw-0's EXPIRED logins in the storm (Logic's and the
 #                       queue's, expired_queued) are at most 0.1% of its ok
-#                       logins: Busy, not EXPIRED (R4H-O2)
+#                       logins: Busy, not EXPIRED (R4H-O2); gw-0's Login
+#                       timeouts (error: answered Busy, so not EXPIRED, but a
+#                       wait past the deadline the rule bounds) are recorded
 #   storm_back          every victim logs in again within SLOWLOGIC_BACK_WAIT,
 #                       and gw-0 rejected none at capacity; the 30s SLO from
 #                       the kill is recorded (#113)
@@ -249,9 +251,14 @@ t2_check calibrate_saturated "$saturated" "\"throughput_per_s\": $T, \"logic_cor
 t2_field calibrate "{\"clients\": $cal_clients, \"rate\": $cal_rate, \"queue_cap\": $cal_cap, \"skip_s\": $skip, \"throughput_per_s\": $T, \"logic_gomaxprocs\": $gomaxprocs, \"usage\": $usage, \"logic\": $logic_d, \"gateways\": $gws_d, \"loadgen_online\": $(lg_get /stats 'd["online"]'), \"failed\": $(lg_get /stats 'd["failed"]')}"
 lease1=$(stack_counters logic "${LOGIC_COUNTERS[@]}") lease_s=$((SECONDS - lease_t))
 for g in gw-0 gw-1; do lg1[$g]=$(stack_counters "$g" "${GW_COUNTERS[@]}"); done
+# The renewal floor: a renewal counts when its call ends, at most 5s (the
+# call timeout) after its 10s tick, so a window of lease_s seconds holds at
+# least (lease_s - 6) // 10 of them (1s for SECONDS' resolution): 1 over the
+# ~16s calibration, where lease_s // 10 - 1 alone would be 0.
+lease_floor=$(( lease_s / 10 - 1 > (lease_s - 6) / 10 ? lease_s / 10 - 1 : (lease_s - 6) / 10 ))
 lease_d="{\"gw-0\": $(stack_counters_delta "${lg0[gw-0]}" "${lg1[gw-0]}"), \"gw-1\": $(stack_counters_delta "${lg0[gw-1]}" "${lg1[gw-1]}"), \"logic\": $(stack_counters_delta "$lease0" "$lease1")}"
-t2_check calibrate_lease "$(echo "$lease_d" | lg_true - 'all(d[g]["lease_error"] == 0 and d[g]["lease_missing"] == 0 and d[g]["lease_live"] >= '"$lease_s"' // 10 - 1 for g in ("gw-0", "gw-1")) and d["logic"]["lease_error"] == 0')" \
-  "\"elapsed_s\": $lease_s, \"gateways\": $(echo "$lease_d" | lg_py - '{g: {"live": d[g]["lease_live"], "missing": d[g]["lease_missing"], "error": d[g]["lease_error"]} for g in ("gw-0", "gw-1")}'), \"logic_lease_error\": $(echo "$lease_d" | lg_py - 'd["logic"]["lease_error"]')"
+t2_check calibrate_lease "$(echo "$lease_d" | lg_true - 'all(d[g]["lease_error"] == 0 and d[g]["lease_missing"] == 0 and d[g]["lease_live"] >= '"$lease_floor"' for g in ("gw-0", "gw-1")) and d["logic"]["lease_error"] == 0')" \
+  "\"elapsed_s\": $lease_s, \"live_floor\": $lease_floor, \"gateways\": $(echo "$lease_d" | lg_py - '{g: {"live": d[g]["lease_live"], "missing": d[g]["lease_missing"], "error": d[g]["lease_error"]} for g in ("gw-0", "gw-1")}'), \"logic_lease_error\": $(echo "$lease_d" | lg_py - 'd["logic"]["lease_error"]')"
 down calibrate
 t2_duration calibrate $((SECONDS - t0))
 for f in cal_before/logic cal_after/logic; do
@@ -331,7 +338,7 @@ slo=$STACK_DIR/artifacts/slo-death.json
 t2_check storm_busy "$(echo "$gw_d" | lg_true - '(d["logins_busy"] or 0) >= 0.1 * '"$victims")" \
   "\"busy\": $(echo "$gw_d" | lg_py - 'd["logins_busy"]'), \"floor\": $((victims / 10)), \"rejects_login_queue\": $(echo "$gw_d" | lg_py - 'd["rejects_login_queue"]'), \"queue_cap\": $qcap"
 t2_check storm_expired "$(echo "$gw_d" | lg_true - '(d["logins_expired"] or 0) + (d["logins_expired_queued"] or 0) <= 0.001 * d["logins_ok"]')" \
-  "\"expired\": $(echo "$gw_d" | lg_py - 'd["logins_expired"]'), \"expired_queued\": $(echo "$gw_d" | lg_py - 'd["logins_expired_queued"]'), \"ok\": $(echo "$gw_d" | lg_py - 'd["logins_ok"]'), \"logic_expired\": $(echo "$logic_d" | lg_py - 'd["logins_expired"]')"
+  "\"expired\": $(echo "$gw_d" | lg_py - 'd["logins_expired"]'), \"expired_queued\": $(echo "$gw_d" | lg_py - 'd["logins_expired_queued"]'), \"ok\": $(echo "$gw_d" | lg_py - 'd["logins_ok"]'), \"error\": $(echo "$gw_d" | lg_py - 'd["logins_error"]'), \"logic_expired\": $(echo "$logic_d" | lg_py - 'd["logins_expired"]')"
 pass=false
 [ $dead -eq 0 ] && [ "$back" = true ] && [ "$(echo "$gw_d" | lg_py - 'd["rejects_at_capacity"]')" = 0 ] &&
   pass=$(lg_true "$slo" 'd["population"] == '"$victims"' and d["back"] == d["population"]')
