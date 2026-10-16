@@ -1,6 +1,6 @@
 # 子项目 1：连接与会话核心 —— 设计（第 6 版）
 
-> 本文是 `2026-10-03-connection-session-core-design-rev6.md` 的中文译本。两者不一致时，以英文版为准。标识符、命令、Redis key、指标名和引用标记（如 *(R1-O4)*）保持英文原样。
+> 本文是 `2026-10-03-connection-session-core-design-rev6.md` 的中文译本。两者不一致时，以英文版为准。2026-10-16 就地应用了路线图决定 #115（登录队列上限的余量为 3 秒，引用为 *(#115)*）。标识符、命令、Redis key、指标名和引用标记（如 *(R1-O4)*）保持英文原样。
 
 > 本版是 `2026-10-03-connection-session-core-design-rev5.md` 的第 6 版修订，rev5 保持不变。本版落实了对 rev5 的系统设计评审 `docs/superpowers/objections/connection-session-core-design-rev5-system-design.md` 的全部决议，决议记录在 `docs/superpowers/objections/connection-session-core-design-rev5-dispositions.md`，引用标记为 *(R5S-O1)* … *(R5S-O9)*。本版还原地落实了（2026-10-08）用户评审 Plan 1 存储接口时的后续决议 PI-4，记录在同一份处置文件中，引用标记为 *(PI-4)*。以下说明沿用自 rev5。
 
@@ -199,7 +199,7 @@ Web ─wss (TLS)────┘                 │ gRPC Login/Logout/Reconcile�
 - **准入控制** *(R1-O11, R2-O2)*：
   - **连接上限** *(R2-O2, R3 澄清)*：单网关对打开的 **socket** 设硬上限，从 accept 到关闭计数，覆盖所有状态（可配置，默认 **25 万**；必须介于 20 万运行点和 60 万上限之间）。仅为等待 Logout 而保留在表中的已关闭条目不计入。达到上限时，网关在 accept 时、任何加密运算之前关闭新连接，并计一次 `at_capacity` 拒绝。实现上就是一个计数器加 accept 时的一次检查。上限以下的倾斜无害；主动再均衡不在范围内（子项目 5）。
   - **Noise 握手限流（单网关全局；绝不按 IP）：** 对同时进行的握手计算设并发上限（信号量，大小等于专用于握手的核数），再加一个全网关的每秒握手令牌桶，按实测 NK 开销（约 100µs）设定，避免握手拖垮已建立的连接。令牌桶必须至少允许每秒 2 万的风暴峰值并留有余量；在正常风暴中它起整形作用而非拒绝。任一耗尽时，网关不开始握手：关闭连接并计一次 `handshake_rate` 拒绝。客户端把这种关闭当作一次 `Busy` 重试（见 *客户端 SDK 规则*）*(R3-O5)*。
-  - **登录队列上限：** 限制等待或正在调用 Logic RPC 的 Login 数量（反映 Logic 的背压）。达到上限时，回复 `Busy{retry_after}` 并关闭。**容量设定** *(R4H-O2)*：`login_queue_cap ≤ 每台网关实测的 Logic 登录吞吐 × (login_deadline − 余量)`，使排队中的 Login 无法到达截止时间。这样过载就表现为网关上代价很低的 `Busy`，而不是在 Logic 已经做完工作之后才返回的 `EXPIRED`；`EXPIRED` 只留给少见的停顿（GC 停顿、Redis 故障切换）。
+  - **登录队列上限：** 限制等待或正在调用 Logic RPC 的 Login 数量（反映 Logic 的背压）。达到上限时，回复 `Busy{retry_after}` 并关闭。**容量设定** *(R4H-O2, #115)*：`login_queue_cap ≤ 每台网关实测的 Logic 登录吞吐 × (login_deadline − 3s)`，在 5 秒截止时间下即 2 × 吞吐，使排队中的 Login 无法到达截止时间。排队的 Login 大约等待 上限 ÷ Logic 在接下来几秒内的处理速度，而这个速度会随负载变化：在 Tier 2 中，Logic 受 CPU 配额限制时，每次都要 Kick 一台已死网关的重新登录，速度是新登录实测吞吐的 0.69–1.04 倍，并且会在几秒内跌得更低；余量为 1 秒时，风暴中 2.7–19.6% 的登录返回 `EXPIRED`。3 秒余量吸收了这种波动。按网关实测回复速率动态调整上限的方案推迟处理（路线图 #116）。这样过载就表现为网关上代价很低的 `Busy`，而不是在 Logic 已经做完工作之后才返回的 `EXPIRED`；`EXPIRED` 只留给少见的停顿（GC 停顿、Redis 故障切换）。
   - **仅为内存的待处理上限：** 对 `HANDSHAKE` + `AUTH_PENDING` 连接总数设一个较大的上限，只为保护网关内存。正常风暴中不得触发。
   - `Busy{retry_after}` 使用较短的值，**1–3 秒，均匀分布** *(R4G-O12)*，使被拒客户端仍能落在 SLO 内 *(R1-O7)*。
   - 每条连接只允许一次登录尝试（失败即关闭）。

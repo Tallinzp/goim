@@ -8,14 +8,15 @@
 #       login throughput T is the rate of its ok logins while its CPU sits
 #       at the quota.
 #   storm: each gateway's -login-queue-cap set by the spec's rule for the
-#       gateway that takes the storm, T per gateway x (login_deadline - 1s
-#       margin) = T x 4s, since gw-0 is then alone and Logic serves it at T
-#       (#115, on hold: run 29 at 4T expired 3.5%; the diagnostic below
-#       looks for where the rest of the 1s margin goes);
+#       gateway that takes the storm, T per gateway x (login_deadline - 3s
+#       margin) = T x 2s, since gw-0 is then alone and Logic serves it at T
+#       (#115: at T x 4s, the 1s margin, four of five runs expired
+#       2.7-19.6%: Logic's storm pace ran at 0.69-1.04 T, with dips over a
+#       few seconds to 0.72 T in run 29h; 2T and 2.69T passed);
 #       2 x 30T clients ramped at T/2 per second (Logic at half load), then
 #       gw-1 SIGKILLed: its 30T clients come back over the SDK's 0-20s storm
 #       wait, at 1.5T per second, onto gw-0 (#113). Logins beyond Logic's
-#       pace queue up to the cap (a queued Login waits up to 4s at T, the
+#       pace queue up to the cap (a queued Login waits up to 2s at T, the
 #       rule's bound), and the rest are answered Busy: rejected as Busy, not
 #       EXPIRED (R4H-O2). At 30T, Logic needs >= 30s to serve them, so the
 #       30s SLO is recorded, not gated (#113). Busy needs >= ~27T victims
@@ -56,12 +57,11 @@
 #                          the storm is refused (storm_size): lower SLOWLOGIC_QUOTA
 #   SLOWLOGIC_RATE         storm: clients started per second (default T/2)
 #   SLOWLOGIC_QUEUE_CAP    storm: each gateway's -login-queue-cap (default
-#                          T x 4, the spec's rule for the lone survivor; #115
-#                          on hold)
+#                          T x 2, the spec's rule for the lone survivor, #115)
 #   SLOWLOGIC_LOGIN_RPCS   storm: each gateway's -login-rpcs (default: the gateway's,
 #                          16); with SLOWLOGIC_LOGIN_BATCH (-login-batch, 200) the
 #                          Logins inside Logic at once, ~1s of work at 25%
-#                          (the diagnostic for #115)
+#                          (#115's diagnostic, run 29g)
 #   SLOWLOGIC_BUSY_WINDOW  storm: seconds from the kill over which Logic's own
 #                          pace T' (ok + replaced logins per second) and cores
 #                          are recorded (default 20, the SDK's storm wait)
@@ -387,7 +387,7 @@ t2_check storm_size "$(t2_bool [ "$victims" -ge "$need" ])" "\"throughput_per_s\
 [ "$victims" -ge "$need" ] || { t2_check artifacts "$(t2_bool [ -z "$missing" ])" "\"missing\": $(t2_json_str "${missing# }")"; t2_finish; }
 clients=$((2 * victims))
 rate=${SLOWLOGIC_RATE:-$((T / 2))}
-qcap=${SLOWLOGIC_QUEUE_CAP:-$((T * 4))}
+qcap=${SLOWLOGIC_QUEUE_CAP:-$((T * 2))}
 back_wait=${SLOWLOGIC_BACK_WAIT:-600}
 busy_win=${SLOWLOGIC_BUSY_WINDOW:-20}
 STACK_GATEWAY_ARGS=(-max-conns $((clients + clients / 10)) -login-queue-cap "$qcap"
