@@ -1,9 +1,19 @@
 #!/usr/bin/env bash
-# Tier 2: gwloss (Plans 6b2a-b1 and 6b2a-stress), the spec's load tests (b1)
-# and (b-stress) with SDK clients, each phase on a fresh stack:
+# Tier 2: gwloss (Plans 6b2a-b1, 6b2a-stress and 6b2b-b2), the spec's load
+# tests (b1), (b2) and (b-stress) with SDK clients, each phase on a fresh stack:
 #   (b1) SIGKILL a 200k gateway: 99% logged in again within 30s of T_death
 #        (loadgen records the SIGKILL time; R4M-17); Kick attempts to it are
 #        about one per relogin, with no retries (R2-O6);
+#   (b2) silent node loss of a 200k gateway: iptables DROP on its client and
+#        Kick ports (goim-netdrop, #68), then SIGKILL behind the DROP, so no
+#        FIN or RST reaches a client and its lease ends as in a crash (#112):
+#        99% logged in again within 30s of the client detecting the loss
+#        (Pong timeout); detection within one heartbeat plus the Pong
+#        timeout; the survivor's Login p99 unaffected by the Kicks that time
+#        out; Logic's goroutines bounded (R5S-O2). Its gateways send a 30s
+#        heartbeat: the SDK's Pings keep their login's phase, so at 150s the
+#        relogins would come in one band set by the script's timing, after
+#        the lease and often after the sweep (6b2b-b2 review O1);
 #   (b-stress) kill a 600k gateway: measured, no SLO; includes a 600k-member
 #        gwconns SSCAN + UNLINK (the dead epoch's sweep; R4M-9);
 #   storm: the other gateways never miss a lease renewal.
@@ -25,20 +35,38 @@
 #   per phase with logs, artifacts and loadgen results), plus ONE file to
 #   send back: tier2-results/gwloss-<timestamp>.report.txt
 #   Exit code: 0 if every check passes, 1 if any check fails, 2 if the host is refused.
-#   About 25 minutes (b1 ~8, b_stress ~17; up to ~40 if b_stress's relogins
-#   use their whole wait).
+#   About 32 minutes (b1 ~8, b2 ~7, b_stress ~17; up to ~50 if b_stress's
+#   relogins use their whole wait).
 #
 # Settings:
-#   GWLOSS_PHASES      phases to run, in order (default "b1 b_stress")
-#   GWLOSS_CLIENTS     b1: SDK clients over both gateways (default 400000)
-#   GWLOSS_RATE        b1: clients started per second (default 5000)
-#   GWLOSS_CAP         b1: each gateway's -max-conns (default 450000: the
+#   GWLOSS_PHASES      phases to run, in order (default "b1 b2 b_stress")
+#   GWLOSS_CLIENTS     b1, b2: SDK clients over both gateways (default 400000)
+#   GWLOSS_RATE        b1, b2: clients started per second (default 5000)
+#   GWLOSS_CAP         b1, b2: each gateway's -max-conns (default 450000: the
 #                      survivor's 400k plus room for clients in flight)
-#   GWLOSS_SWEEP_WAIT  b1: seconds after the kill to wait for the dead epoch's
-#                      sweep (default 180: stale 60s after its last renewal,
-#                      then 200k uids at the sweeper's 10k/s)
-#   GWLOSS_SOURCES     b1: loadgen's source addresses (default: loadgen's, one
-#                      per 5,000 connections per gateway, sized for the survivor)
+#   GWLOSS_SWEEP_WAIT  b1, b2: seconds after the kill to wait for the dead
+#                      epoch's sweep (default 180: stale 60s after its last
+#                      renewal, then 200k uids at the sweeper's 10k/s)
+#   GWLOSS_SOURCES     b1, b2: loadgen's source addresses (default: loadgen's,
+#                      one per 5,000 connections per gateway, sized for the
+#                      survivor)
+#   GWLOSS_B2_HEARTBEAT  b2: the gateways' -heartbeat (default 30s, the
+#                      SDK's lowest): Ping phases spread evenly over the 80s
+#                      ramp, so some relogins meet a live lease (review O1)
+#   GWLOSS_B2_BACK_WAIT  b2: seconds after the DROP to wait for every victim
+#                      to log in again (default 120: detection within 45s,
+#                      then the SDK's 0-20s storm wait and the login)
+#   GWLOSS_B2_DETECT_MAX_S  b2: the bound on every victim's detection, from
+#                      the DROP to its Pong timeout (default 45: the 30s
+#                      heartbeat plus the 10s Pong timeout, plus 5s for the
+#                      timers' and loadgen's slack)
+#   GWLOSS_B2_PROFILE_AT  b2: seconds after the DROP that the storm's 30s CPU
+#                      profiles and loadgen-bound reading start (default 15:
+#                      its relogins run from ~10s to ~60s; review O4)
+#   GWLOSS_B2_GOROUTINE_GROWTH  b2: the most Logic's goroutines may grow over
+#                      their count at the DROP while the victims log in again
+#                      (default 500; a goroutine per Kick to the silent
+#                      gateway would be thousands, R5S-O2)
 #   GWLOSS_STRESS_CLIENTS  b_stress: SDK clients, all on the victim (default 600000)
 #   GWLOSS_STRESS_RATE     b_stress: clients started per second (default 5000)
 #   GWLOSS_STRESS_CAP      b_stress: each gateway's -max-conns (default 650000:
@@ -90,7 +118,8 @@
 #                      clients were left to log in); taken only if the
 #                      victims are not back by then.
 #
-# Checks (b1; b_stress has the same with its own prefix, unless noted):
+# Checks (b1; b2 and b_stress have the same with their own prefix, unless
+# noted):
 #   b1_stack           redis, devtoken, Logic and the gateways become Ready
 #   b1_pinning         gateways, Logic + Redis and loadgen on their phase's CPU
 #                      sets (b_stress's differ, #108)
@@ -101,6 +130,24 @@
 #                      in again within 30s of T_death (R4M-17), and the
 #                      survivor rejected none at capacity (SDK clients retry a
 #                      reject without counting it, P6b2a-b1I-2)
+#   b2_netdrop         (b2 only) both of gw-1's DROP rules were in before the
+#                      SIGKILL, and none is left after the storm; without
+#                      them there is no kill and no storm (review O7)
+#   b2_slo             (b2 only) every victim detected the loss, and 99% of them
+#                      logged in again within 30s of their detection (the
+#                      spec's b2 SLO); the survivor rejected none at capacity
+#   b2_detection       (b2 only) every victim's detection, from the DROP mark,
+#                      within GWLOSS_B2_DETECT_MAX_S, and each by Pong timeout
+#                      (loadgen's lost["pong-timeout"]), not by a FIN or RST
+#   b2_login_p99       (b2 only) the survivor's Login p99 in the storm is at
+#                      most one histogram bucket (2x) above its p99 in the
+#                      ramp: Kicks to the silent gateway, each up to Logic's
+#                      1s Kick deadline, never delay a Login (R5S-O2); the
+#                      storm's Redis latency beside it (the sweep may
+#                      overlap the storm's tail, review O2)
+#   b2_goroutines      (b2 only) Logic's goroutines, sampled every second from
+#                      the DROP until the victims are back, never grow more
+#                      than GWLOSS_B2_GOROUTINE_GROWTH over the DROP's count
 #   b_stress_back      (b_stress only) loadgen SIGKILLs gw-0: every one of its
 #                      clients logs in again within GWLOSS_STRESS_BACK_WAIT, and
 #                      the survivors rejected none at capacity; no SLO.
@@ -113,12 +160,22 @@
 #                      gives up as live. A refused Kick is not retried (#97):
 #                      only first attempts that timed out while the victim's
 #                      sockets were torn down are, once each, and refused
-#                      (R2-O6; #97 amended, run 20)
+#                      (R2-O6; #97 amended, run 20). b2: the same bounds (first
+#                      attempts at most 1.1 per relogin, sent or dropped at
+#                      least 0.9), no Kick refused (the DROP answers nothing:
+#                      they time out or fail fast, and keep their retries while
+#                      the lease is live), at most 3 retries per first attempt,
+#                      none gives up as live; and Kicks were exercised: some
+#                      retried, sent or dropped first attempts for at least
+#                      half the relogins (review O1)
 #   b1_cross_check     Logic's dead-epoch cross-check (R1-O7) has a sample for
 #                      at least 0.9 of the relogins whose first Kick was sent
 #                      and did not time out (by Login once the lease is gone,
 #                      or by the refused Kick while it is live, P6b2a-b1I-7),
-#                      and at most 1.1 per relogin
+#                      and at most 1.1 per relogin. b2: no Kick is refused, so
+#                      only Login records it, for the relogins between the
+#                      lease's end and the sweep: at least 0.1 per relogin
+#                      (a cautious floor, review O6), at most 1.1
 #   b1_storm_real      the storm was the spec's, not loadgen's (#106, #107):
 #                      every logged-in client held its next handshake frame
 #                      at the kill (loadgen -precompute); after the kill,
@@ -162,9 +219,9 @@ t2_init gwloss
 t2_need curl taskset sudo python3
 t2_require_host_setup
 
-PHASES=${GWLOSS_PHASES:-b1 b_stress}
+PHASES=${GWLOSS_PHASES:-b1 b2 b_stress}
 for p in $PHASES; do
-  case $p in b1 | b_stress) ;; *) echo "gwloss: unknown phase '$p' (b1, b_stress)" >&2; exit 1 ;; esac
+  case $p in b1 | b2 | b_stress) ;; *) echo "gwloss: unknown phase '$p' (b1, b2, b_stress)" >&2; exit 1 ;; esac
 done
 # The tail profile starts after the storm's own 30s profile: loadgen serves
 # one CPU profile at a time.
@@ -195,6 +252,8 @@ t2_nofile 1048576
 export STACK_PIN=1
 STACK_PORT_BASE=${STACK_PORT_BASE:-17000}
 STACK_REDIS_SERVER=$PWD/.cache/redis/bin/redis-server
+NETDROP=/usr/local/sbin/goim-netdrop
+t2_on_exit "sudo -n $NETDROP flush" # b2's DROP rules, whatever stopped the run
 t2_on_exit 'stack_down'
 t2_on_exit 'lg_stop' # newest first: loadgen stops before the stack
 
@@ -207,6 +266,12 @@ LOGIC_COUNTERS=(
   kick_retry='goim_logic_kick_attempts_total:attempt="retry"'
   kick_first_timeout='goim_logic_kick_attempts_total:attempt="first",result="timeout"'
   kick_retry_refused='goim_logic_kick_attempts_total:attempt="retry",result="refused"'
+  # b2: a silent target refuses nothing; its attempts time out or fail fast
+  # (gRPC's fail-fast RPCs on a connection in TRANSIENT_FAILURE: error).
+  kick_first_refused='goim_logic_kick_attempts_total:attempt="first",result="refused"'
+  kick_first_error='goim_logic_kick_attempts_total:attempt="first",result="error"'
+  kick_retry_timeout='goim_logic_kick_attempts_total:attempt="retry",result="timeout"'
+  kick_retry_error='goim_logic_kick_attempts_total:attempt="retry",result="error"'
   kick_giveups_dead='goim_logic_kick_giveups_total:target_lease="dead"'
   kick_giveups_live='goim_logic_kick_giveups_total:target_lease="live"'
   kick_dropped=goim_logic_kick_dropped_total
@@ -312,13 +377,16 @@ lag_max=${GWLOSS_LAG_P99_MS:-100}
 for name in $PHASES; do
   # Each phase's stack, victim and waits.
   case $name in
-    b1)
+    b1 | b2)
       export STACK_GATEWAYS=2
       export T2_CPUS_GATEWAY=$cpus_gateway T2_CPUS_LOADGEN=$cpus_loadgen T2_CPUS_LOGIC=$cpus_logic
       unset STACK_GATEWAY_PROCS
       clients=${GWLOSS_CLIENTS:-400000} rate=${GWLOSS_RATE:-5000} cap=${GWLOSS_CAP:-450000}
       sweep_wait=${GWLOSS_SWEEP_WAIT:-180} back_wait=60 idle_wait=300 sources=${GWLOSS_SOURCES:-}
-      victim=gw-1 survivors=(gw-0) down="" LG_ENV=()
+      victim=gw-1 survivors=(gw-0) down="" LG_ENV=() mark=death
+      # b2: the loss is the DROP; its clients detect it by Pong timeout,
+      # within one heartbeat (30s, GWLOSS_B2_HEARTBEAT) plus 10s.
+      [ "$name" = b2 ] && back_wait=${GWLOSS_B2_BACK_WAIT:-120} mark=drop
       # Every client up from the start, split by the balancer.
       online_rule='d["online"] == '"$clients"' and min(d["online_by_gateway"].get(g, 0) for g in ("gw-0", "gw-1")) >= '"$clients"' * 0.45'
       ;;
@@ -333,7 +401,7 @@ for name in $PHASES; do
       clients=${GWLOSS_STRESS_CLIENTS:-600000} rate=${GWLOSS_STRESS_RATE:-5000} cap=${GWLOSS_STRESS_CAP:-650000}
       sweep_wait=${GWLOSS_STRESS_SWEEP_WAIT:-300} back_wait=${GWLOSS_STRESS_BACK_WAIT:-900} idle_wait=600
       sources=${GWLOSS_STRESS_SOURCES:-}
-      victim=gw-0 survivors=(gw-1 gw-2) down=gw-1,gw-2 LG_ENV=(GOMEMLIMIT="${GWLOSS_STRESS_LG_MEMLIMIT:-16GiB}")
+      victim=gw-0 survivors=(gw-1 gw-2) down=gw-1,gw-2 LG_ENV=(GOMEMLIMIT="${GWLOSS_STRESS_LG_MEMLIMIT:-16GiB}") mark=death
       # The victim ramped alone (#93).
       online_rule='d["online"] == '"$clients"' and d["online_by_gateway"].get("gw-0") == '"$clients"
       ;;
@@ -345,6 +413,7 @@ for name in $PHASES; do
   STACK_GATEWAY_ARGS=(-max-conns "$cap")
   [ "$name" = b_stress ] && [ -n "${GWLOSS_STRESS_HANDSHAKE_CONCURRENCY:-}" ] &&
     STACK_GATEWAY_ARGS+=(-handshake-concurrency "$GWLOSS_STRESS_HANDSHAKE_CONCURRENCY")
+  [ "$name" = b2 ] && STACK_GATEWAY_ARGS+=(-heartbeat "${GWLOSS_B2_HEARTBEAT:-30s}")
   t0=$SECONDS
 
   busy=$(stack_busy_ports)
@@ -410,6 +479,13 @@ for name in $PHASES; do
 
   # The storm: counters before, SIGKILL, CPU profiles of its first 30s.
   stack_snapshot before
+  # b2: the survivor's Login latency so far (the ramp's; a fresh stack) and
+  # Logic's goroutines, both at the DROP.
+  login_h0=null goroutines0=null
+  if [ "$name" = b2 ]; then
+    login_h0=$(stack_buckets gw-0 goim_gateway_login_seconds)
+    goroutines0=$(stack_metric logic go_goroutines)
+  fi
   # The ramp's backoff (no mark yet: since loadgen started), apart from the
   # storm's, which counts since the death mark (P6b2a-stressI-1).
   backoff_ramp=$(lg_get /stats 'd["backoff_since_mark"]')
@@ -421,7 +497,27 @@ for name in $PHASES; do
   t2_cpustat_snap "$STACK_DIR/cpustat-2"
   t2_tcpstat_snap "$STACK_DIR/tcpstat-2"
   stack_usage_start loadgen="$LG_PID"
-  reply=$(lg_post "/kill?gateway=$victim&pid=${STACK_PIDS[$victim]}&mark=death" | lg_py - d)
+  # b2 (#112): the DROP goes in first, on the victim's client and Kick ports,
+  # so the SIGKILL's FINs and RSTs never reach a client and a Kick's connect
+  # is never refused: the node is silent, then gone, as in a node loss. The
+  # mark is taken at the SIGKILL, a few ms after the DROP.
+  drop_rules=null
+  if [ "$name" = b2 ]; then
+    vport=$((STACK_PORT_BASE + 100 + 10 * ${victim#gw-}))
+    sudo -n "$NETDROP" add "$vport" && sudo -n "$NETDROP" add $((vport + 1))
+    drop_rules=$(sudo -n "$NETDROP" list | wc -l)
+    # Without both rules the storm would be b1's (RSTs reach the clients):
+    # no kill, no storm (review O7).
+    if [ "$drop_rules" != 4 ]; then
+      t2_check "${name}_netdrop" false "\"ports\": [$vport, $((vport + 1))], \"rules_at_kill\": $drop_rules, \"rules_left\": null"
+      sudo -n "$NETDROP" flush
+      lg_stop
+      stack_down
+      t2_duration "$name" $((SECONDS - t0))
+      continue
+    fi
+  fi
+  reply=$(lg_post "/kill?gateway=$victim&pid=${STACK_PIDS[$victim]}&mark=$mark" | lg_py - d)
   kill_t=$SECONDS
   # In this shell: it reaps and forgets the victim. 60s: a 600k gateway
   # exits only once the kernel has closed its sockets (~5.3s in run 25).
@@ -430,7 +526,12 @@ for name in $PHASES; do
   # The storm's first 30s, where its relogins peak: loadgen's cores there
   # say whether the storm was loadgen-bound (#102); the whole storm's average
   # hid it in run 22 (3.2 of 8 cores, 7.9 in the first 30s).
-  (stack_profile storm 30 & lg_profile storm 30 & { sleep 30; stack_usage_json >"$STACK_DIR/storm30.json"; }; wait) >/dev/null 2>&1 &
+  # b2: from GWLOSS_B2_PROFILE_AT after the mark, its relogins starting at
+  # the first Pong timeouts (review O4).
+  prof_at=0
+  [ "$name" = b2 ] && prof_at=${GWLOSS_B2_PROFILE_AT:-15}
+  (sleep "$prof_at"; [ "$prof_at" = 0 ] || stack_usage_start loadgen="$LG_PID"
+    stack_profile storm 30 & lg_profile storm 30 & { sleep 30; stack_usage_json >"$STACK_DIR/storm30.json"; }; wait) >/dev/null 2>&1 &
   prof=$!
   # GWLOSS_TAIL_PROFILE_AT: loadgen's CPU in the storm's tail (run 27), if
   # the victims are not back by then; stopped with them.
@@ -462,8 +563,25 @@ for name in $PHASES; do
     echo "false $((SECONDS - kill_t))"
   ) >"$STACK_DIR/sweep.out" 2>/dev/null &
   sweeping=$!
-  back=$(t2_bool lg_wait_back death "$back_wait")
+  # b2: Logic's goroutines every second until the victims are back (R5S-O2),
+  # on the Logic CPU set.
+  counting=""
+  if [ "$name" = b2 ]; then
+    (while :; do stack_metric logic go_goroutines; sleep 1; done) >"$STACK_DIR/goroutines.txt" 2>/dev/null &
+    counting=$!
+    taskset -a -p -c "$T2_CPUS_LOGIC" "$counting" >/dev/null 2>&1
+  fi
+  back=$(t2_bool lg_wait_back "$mark" "$back_wait")
   back_s=$((SECONDS - kill_t))
+  goroutines=null
+  if [ -n "$counting" ]; then
+    kill "$counting" 2>/dev/null
+    wait "$counting" 2>/dev/null
+    goroutines=$(python3 -c 'import json, sys
+n = [int(l) for l in open(sys.argv[1]) if l.strip().isdigit()]
+print(json.dumps({"at_drop": int(sys.argv[2]) if sys.argv[2].isdigit() else None, "max": max(n) if n else None, "samples": len(n)}))' \
+      "$STACK_DIR/goroutines.txt" "$goroutines0" 2>/dev/null || echo null)
+  fi
   # Loadgen's runtime once the victims are back (or the wait ran out), even
   # with GWLOSS_SS_EVERY off: its memory against GOMEMLIMIT and the GC
   # limiter at the storm's end (P6b2a-pingerI-1). Recorded, not a check.
@@ -488,7 +606,7 @@ print(json.dumps(out))' "$STACK_DIR/artifacts/ss-storm.jsonl" 2>/dev/null || ech
     [ $((SECONDS - kill_t)) -lt "$tail_at" ] && { pkill -P "$tailprof" 2>/dev/null; kill "$tailprof" 2>/dev/null; }
     wait "$tailprof" 2>/dev/null
   fi
-  lg_get "/slo?mark=death&within=30s" d >"$STACK_DIR/artifacts/slo-death.json"
+  lg_get "/slo?mark=$mark&within=30s" d >"$STACK_DIR/artifacts/slo-$mark.json"
   wait "$sweeping"
   read -r swept sweep_s <"$STACK_DIR/sweep.out" || { swept=false sweep_s=null; }
   wait "$prof"
@@ -503,6 +621,15 @@ print(json.dumps(out))' "$STACK_DIR/artifacts/ss-storm.jsonl" 2>/dev/null || ech
   t2_tcpstat_snap "$STACK_DIR/tcpstat-3"
   t2_record_end "$name"
   lo1=$(lo_dropped)
+  # b2: the survivor's Login latency in the storm; then the DROP rules come
+  # out, so the dead port's leftover sockets on both sides end by RST.
+  login_h1=null drop_left=null
+  if [ "$name" = b2 ]; then
+    login_h1=$(stack_buckets gw-0 goim_gateway_login_seconds)
+    sudo -n "$NETDROP" del "$vport"
+    sudo -n "$NETDROP" del $((vport + 1))
+    drop_left=$(sudo -n "$NETDROP" list | wc -l)
+  fi
   stack_snapshot after
   logic_d=$(stack_counters_delta "$logic0" "$logic1")
   sv_d=""
@@ -511,7 +638,7 @@ print(json.dumps(out))' "$STACK_DIR/artifacts/ss-storm.jsonl" 2>/dev/null || ech
   window_s=$(echo "$storm" | lg_py - 'd["window_s"]')
   backoff="{\"ramp\": $backoff_ramp, \"storm\": $(lg_get /stats 'd["backoff_since_mark"]'), \"run\": $(lg_get /stats '{"clients": d["backoff_clients"], "waits": d["backoff_waits"]}')}"
 
-  slo=$STACK_DIR/artifacts/slo-death.json
+  slo=$STACK_DIR/artifacts/slo-$mark.json
   pop=$(lg_py "$slo" 'd["population"]')
   # Rejects at capacity over every survivor; null if any reading failed.
   rejects=$(echo "$sv_d" | lg_py - 'sum(v["rejects_at_capacity"] for v in d.values())')
@@ -519,15 +646,47 @@ print(json.dumps(out))' "$STACK_DIR/artifacts/ss-storm.jsonl" 2>/dev/null || ech
   if [ "$name" = b1 ]; then
     [ $dead -eq 0 ] && [ "$rejects" = 0 ] && pass=$(lg_true "$slo" 'd["pass_from_mark"] and d["population"] >= '"$clients"' * 0.45')
     t2_check "${name}_slo" "$pass" "\"kill\": ${reply:-null}, \"back_all\": $back, \"back_s\": $back_s, \"rejects_at_capacity\": ${rejects:-null}, \"slo\": $(cat "$slo")"
+  elif [ "$name" = b2 ]; then
+    t2_check "${name}_netdrop" "$(t2_bool [ "$drop_rules:$drop_left" = 4:0 ])" "\"ports\": [$vport, $((vport + 1))], \"rules_at_kill\": $drop_rules, \"rules_left\": $drop_left"
+    # The spec's b2 SLO: from each client's detection; every victim detected.
+    [ $dead -eq 0 ] && [ "$rejects" = 0 ] && pass=$(lg_true "$slo" 'd["pass_from_detection"] and d["lost"] == d["population"] and d["population"] >= '"$clients"' * 0.45')
+    t2_check "${name}_slo" "$pass" "\"kill\": ${reply:-null}, \"back_all\": $back, \"back_s\": $back_s, \"wait_s\": $back_wait, \"rejects_at_capacity\": ${rejects:-null}, \"slo\": $(cat "$slo")"
+    lost=$(lg_get /stats 'd["lost"]')
+    detect_max=${GWLOSS_B2_DETECT_MAX_S:-45}
+    t2_check "${name}_detection" "$(echo "{\"s\": $(cat "$slo"), \"lost\": $lost}" | lg_true - 'd["s"]["detection"]["n"] == d["s"]["population"] and 0 <= d["s"]["detection"]["max_ms"] <= '"$detect_max"' * 1000 and d["lost"].get("pong-timeout", 0) >= d["s"]["population"]')" \
+      "\"max_s\": $detect_max, \"detection\": $(lg_py "$slo" 'd["detection"]'), \"lost\": $lost"
+    p99_ramp=$(stack_hist_quantile '{}' "$login_h0" 0.99) p99_storm=$(stack_hist_quantile "$login_h0" "$login_h1" 0.99)
+    t2_check "${name}_login_p99" "$(echo "{\"r\": $p99_ramp, \"s\": $p99_storm}" | lg_true - 'd["r"] is not None and d["s"] is not None and d["s"] <= 2 * d["r"]')" \
+      "\"ramp_p99_ms\": $p99_ramp, \"storm_p99_ms\": $p99_storm, \"bucket_bounds\": true, \"redis_latency_storm\": $redis_storm"
+    growth=${GWLOSS_B2_GOROUTINE_GROWTH:-500}
+    t2_check "${name}_goroutines" "$(echo "$goroutines" | lg_true - 'd is not None and d["at_drop"] is not None and d["max"] is not None and d["max"] - d["at_drop"] <= '"$growth")" \
+      "\"max_growth\": $growth, \"logic\": $goroutines"
   else
     [ $dead -eq 0 ] && [ "$rejects" = 0 ] && [ "$back" = true ] && pass=$(lg_true "$slo" 'd["population"] == '"$clients")
     t2_check "${name}_back" "$pass" "\"kill\": ${reply:-null}, \"back_all\": $back, \"back_s\": $back_s, \"wait_s\": $back_wait, \"loadgen_bound\": $loadgen_bound, \"rejects_at_capacity\": ${rejects:-null}, \"backoff\": $backoff, \"slo\": $(cat "$slo")"
   fi
-  t2_check "${name}_kicks" "$(echo "{\"d\": $logic_d, \"pop\": $pop}" | lg_true - 'd["d"]["kick_retry"] <= d["d"]["kick_first_timeout"] and d["d"]["kick_retry_refused"] == d["d"]["kick_retry"] and d["d"]["kick_giveups_live"] == 0 and 0.9 * (d["pop"] - (d["d"]["sweep_deleted"] or 0)) <= d["d"]["kick_first"] + (d["d"]["kick_dropped"] or 0) <= 1.1 * d["pop"]')" \
-    "\"relogins\": $pop, \"swept_first\": $(echo "$logic_d" | lg_py - 'd["sweep_deleted"]'), \"first\": $(echo "$logic_d" | lg_py - 'd["kick_first"]'), \"retries\": $(echo "$logic_d" | lg_py - 'd["kick_retry"]'), \"first_timeouts\": $(echo "$logic_d" | lg_py - 'd["kick_first_timeout"]'), \"retries_refused\": $(echo "$logic_d" | lg_py - 'd["kick_retry_refused"]'), \"giveups_dead\": $(echo "$logic_d" | lg_py - 'd["kick_giveups_dead"]'), \"giveups_live\": $(echo "$logic_d" | lg_py - 'd["kick_giveups_live"]'), \"dropped\": $(echo "$logic_d" | lg_py - 'd["kick_dropped"]')"
-  # R1-O7: one sample per relogin whose first Kick was sent and did not time
-  # out, by Login (lease gone) or by the refused Kick (lease live).
-  t2_check "${name}_cross_check" "$(echo "{\"d\": $logic_d, \"pop\": $pop}" | lg_true - '0.9 * (d["d"]["kick_first"] - d["d"]["kick_first_timeout"]) <= d["d"]["dead_epoch_relogins"] <= 1.1 * d["pop"]')" \
+  if [ "$name" = b2 ]; then
+    # A silent target (#112): no Kick refused; retries kept while the lease
+    # is live, at most 3 per first attempt (R2-O6); the sent-or-dropped
+    # bounds as b1's (dropped also counts retries a full queue dropped, so
+    # only the first attempts have the upper bound). Kicks were exercised
+    # (review O1): some retried while the lease was live, and first attempts
+    # sent or dropped for at least half the relogins (at a 30s heartbeat
+    # nearly all relogins come before the sweep).
+    kicks_rule='d["d"]["kick_first_refused"] == 0 and d["d"]["kick_retry_refused"] == 0 and d["d"]["kick_giveups_live"] == 0 and 0 < d["d"]["kick_retry"] <= 3 * d["d"]["kick_first"] and d["d"]["kick_first"] <= 1.1 * d["pop"] and max(0.5 * d["pop"], 0.9 * (d["pop"] - (d["d"]["sweep_deleted"] or 0))) <= d["d"]["kick_first"] + (d["d"]["kick_dropped"] or 0)'
+    # R1-O7: only Login records the cross-check here (no refused Kick), for
+    # relogins between the lease's end and the sweep: most of them at a 30s
+    # heartbeat; 0.1 per relogin is a cautious floor (review O6).
+    cross_rule='0.1 * d["pop"] <= d["d"]["dead_epoch_relogins"] <= 1.1 * d["pop"]'
+  else
+    kicks_rule='d["d"]["kick_retry"] <= d["d"]["kick_first_timeout"] and d["d"]["kick_retry_refused"] == d["d"]["kick_retry"] and d["d"]["kick_giveups_live"] == 0 and 0.9 * (d["pop"] - (d["d"]["sweep_deleted"] or 0)) <= d["d"]["kick_first"] + (d["d"]["kick_dropped"] or 0) <= 1.1 * d["pop"]'
+    # R1-O7: one sample per relogin whose first Kick was sent and did not time
+    # out, by Login (lease gone) or by the refused Kick (lease live).
+    cross_rule='0.9 * (d["d"]["kick_first"] - d["d"]["kick_first_timeout"]) <= d["d"]["dead_epoch_relogins"] <= 1.1 * d["pop"]'
+  fi
+  t2_check "${name}_kicks" "$(echo "{\"d\": $logic_d, \"pop\": $pop}" | lg_true - "$kicks_rule")" \
+    "\"relogins\": $pop, \"swept_first\": $(echo "$logic_d" | lg_py - 'd["sweep_deleted"]'), \"first\": $(echo "$logic_d" | lg_py - 'd["kick_first"]'), \"retries\": $(echo "$logic_d" | lg_py - 'd["kick_retry"]'), \"first_timeouts\": $(echo "$logic_d" | lg_py - 'd["kick_first_timeout"]'), \"first_errors\": $(echo "$logic_d" | lg_py - 'd["kick_first_error"]'), \"first_refused\": $(echo "$logic_d" | lg_py - 'd["kick_first_refused"]'), \"retries_refused\": $(echo "$logic_d" | lg_py - 'd["kick_retry_refused"]'), \"retries_timeout\": $(echo "$logic_d" | lg_py - 'd["kick_retry_timeout"]'), \"retries_error\": $(echo "$logic_d" | lg_py - 'd["kick_retry_error"]'), \"giveups_dead\": $(echo "$logic_d" | lg_py - 'd["kick_giveups_dead"]'), \"giveups_live\": $(echo "$logic_d" | lg_py - 'd["kick_giveups_live"]'), \"dropped\": $(echo "$logic_d" | lg_py - 'd["kick_dropped"]')"
+  t2_check "${name}_cross_check" "$(echo "{\"d\": $logic_d, \"pop\": $pop}" | lg_true - "$cross_rule")" \
     "\"relogins\": $pop, \"samples\": $(echo "$logic_d" | lg_py - 'd["dead_epoch_relogins"]'), \"mean_s\": $(echo "$logic_d" | lg_py - 'round(d["dead_epoch_relogin_s"] / d["dead_epoch_relogins"], 1)')"
   # #107: the storm was the spec's: every logged-in client was prepared at
   # the kill, and after it loadgen started each attempt, got each dial back
@@ -586,7 +745,7 @@ print(json.dumps(out))' "$STACK_DIR/artifacts/ss-storm.jsonl" 2>/dev/null || ech
 
   cpu_sets="{\"ramp\": $(t2_cpusets_json "$STACK_DIR/cpustat-0" "$STACK_DIR/cpustat-1"), \"storm\": $(t2_cpusets_json "$STACK_DIR/cpustat-2" "$STACK_DIR/cpustat-3")}"
   tcp="{\"ramp\": $(t2_tcpstat_json "$STACK_DIR/tcpstat-0" "$STACK_DIR/tcpstat-1"), \"storm\": $(t2_tcpstat_json "$STACK_DIR/tcpstat-2" "$STACK_DIR/tcpstat-3")}"
-  t2_field "$name" "{\"clients\": $clients, \"victim\": \"$victim\", \"by_gateway_at_kill\": $by_gateway, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"loadgen_env\": $(t2_json_str "${LG_ENV[*]}"), \"ramp_s\": $ramp_s, \"ramp\": $ramp, \"loadgen_heap\": {\"ramp\": $heap_ramp, \"at_kill\": $heap_kill}, \"storm\": $storm, \"storm_first30\": $storm30, \"loadgen_bound\": $loadgen_bound, \"precompute_at_kill\": $precompute, \"storm_since_mark\": $storm_d, \"back_s\": $back_s, \"loadgen_at_back\": $rt_back, \"sweep_s\": $sweep_s, \"logic\": $logic_d, \"survivors\": $sv_d, \"redis_latency\": {\"ramp\": $redis_ramp, \"storm\": $redis_storm, \"reset\": {\"ramp\": $reset_ramp, \"storm\": $reset_storm}}, \"backoff\": $backoff, \"cpu_sets\": $cpu_sets, \"tcp\": $tcp, \"profile_in_storm_s\": 30, \"stop_s\": $stop_s, \"loadgen_exit\": $LG_STATUS, \"login_latency\": $(lg_json 'd["login_latency"]'), \"failed\": $(lg_json 'd["failed"]'), \"lost\": $(lg_json 'd["lost"]'), \"sources\": $(lg_json 'd["sources"]')}"
+  t2_field "$name" "{\"clients\": $clients, \"victim\": \"$victim\", \"by_gateway_at_kill\": $by_gateway, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"loadgen_env\": $(t2_json_str "${LG_ENV[*]}"), \"ramp_s\": $ramp_s, \"ramp\": $ramp, \"loadgen_heap\": {\"ramp\": $heap_ramp, \"at_kill\": $heap_kill}, \"storm\": $storm, \"storm_first30\": $storm30, \"loadgen_bound\": $loadgen_bound, \"precompute_at_kill\": $precompute, \"storm_since_mark\": $storm_d, \"back_s\": $back_s, \"loadgen_at_back\": $rt_back, \"sweep_s\": $sweep_s, \"logic\": $logic_d, \"survivors\": $sv_d, \"redis_latency\": {\"ramp\": $redis_ramp, \"storm\": $redis_storm, \"reset\": {\"ramp\": $reset_ramp, \"storm\": $reset_storm}}, \"backoff\": $backoff, \"cpu_sets\": $cpu_sets, \"tcp\": $tcp, \"profile_in_storm_s\": 30, \"profile_at_s\": $prof_at, \"stop_s\": $stop_s, \"goroutines\": $goroutines, \"loadgen_exit\": $LG_STATUS, \"login_latency\": $(lg_json 'd["login_latency"]'), \"failed\": $(lg_json 'd["failed"]'), \"lost\": $(lg_json 'd["lost"]'), \"sources\": $(lg_json 'd["sources"]')}"
   t2_duration "$name" $((SECONDS - t0))
 
   # Artifacts: metrics before and after the storm, its CPU profiles, the SLO
@@ -604,12 +763,13 @@ print(json.dumps(out))' "$STACK_DIR/artifacts/ss-storm.jsonl" 2>/dev/null || ech
   for w in ramp at_kill; do
     grep -q '^# HeapAlloc = ' "$a/$w/loadgen.heap.txt" 2>/dev/null || missing+=" $name/$w/loadgen.heap.txt"
   done
-  [ "$(lg_true "$a/slo-death.json" '"population" in d')" = true ] || missing+=" $name/slo-death.json"
+  [ "$(lg_true "$a/slo-$mark.json" '"population" in d')" = true ] || missing+=" $name/slo-$mark.json"
   [ "$(lg_true "$res" '"mode" in d')" = true ] || missing+=" $name/loadgen-$name.json"
 done
 t2_check artifacts "$(t2_bool [ -z "$missing" ])" "\"missing\": $(t2_json_str "${missing# }")"
 
 t2_not_covered "per-shard Redis CPU and p99 with the gwconns shards marked (one redis-server; Redis Cluster in Plan 6c)" \
   "b_stress's survivors start empty: no survivor carries its own load through the 600k storm (#93)" \
-  "b2 and slowed Logic (Plan 6b2b)"
+  "b2: the lost node's recovery (out-of-service taint, gw-k recreated elsewhere, R5S-O3) is Tier 3 (Plan 6d)" \
+  "slowed Logic (scenario slowlogic, Plan 6b2b-slow)"
 t2_finish
