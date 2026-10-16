@@ -31,7 +31,7 @@ type Metrics struct {
 	Logins       *prometheus.CounterVec // result
 	LoginQueue   prometheus.Gauge       // Logins waiting for or inside a Login RPC
 	LoginSeconds prometheus.Histogram   // LoginResp sent − recv_ms
-	// The slowlogic tail diagnostic (#115 on hold): an entry's wait split at
+	// The slowlogic tail diagnostic (#115): an entry's wait split at
 	// the Login RPC's send.
 	LoginQueueSeconds prometheus.Histogram // send − recv_ms, per entry sent
 	LoginLogicSeconds prometheus.Histogram // definitive reply − send, per entry

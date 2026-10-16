@@ -178,7 +178,7 @@ func TestQueuedLoginPastTheDeadlineIsDroppedBeforeSending(t *testing.T) {
 }
 
 // An entry's wait is split at its RPC's send (the slowlogic tail diagnostic,
-// #115 on hold): the gateway queue, then inside Logic until its reply.
+// #115): the gateway queue, then inside Logic until its reply.
 func TestLoginObservesQueueAndLogicWait(t *testing.T) {
 	l := newLive(t, nil)
 	l.logic.set(func() {

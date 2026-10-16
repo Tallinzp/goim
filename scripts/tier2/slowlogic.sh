@@ -211,14 +211,15 @@ gw_wait_json() {
 }
 
 # login_sampler NAME FILE: appends "unix_ms done queue" every second, from
-# NAME's metrics: its Logins with a reply (every logins_total result but
-# busy) and its login_queue gauge (#115 tail diagnostic: Logic's pace second
-# by second, and the queue it drains).
+# NAME's metrics: its Logins with Logic's reply (every logins_total result but
+# busy, expired_queued, which never reached Logic, and error, a timeout or a
+# failed RPC) and its login_queue gauge (#115 tail diagnostic: Logic's pace
+# second by second, and the queue it drains).
 login_sampler() {
   local body
   while :; do
     body=$(stack_metrics "$1") && awk -v t="$(date +%s%3N)" '
-      index($1, "goim_gateway_logins_total{") == 1 && $1 !~ /result="busy"/ { d += $NF }
+      index($1, "goim_gateway_logins_total{") == 1 && $1 !~ /result="(busy|expired_queued|error)"/ { d += $NF }
       $1 == "goim_gateway_login_queue" { q = $NF }
       END { printf "%s %.0f %.0f\n", t, d, q }' <<<"$body" >>"$2"
     sleep 1

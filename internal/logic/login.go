@@ -55,7 +55,7 @@ func (s *Service) Login(b *pb.LoginBatch, stream grpc.ServerStreamingServer[pb.L
 	}
 
 	// Where a Login's time goes before Redis (the slowlogic diagnostic,
-	// #115 on hold): the batch's token checks, then each entry's age from
+	// #115): the batch's token checks, then each entry's age from
 	// the gateway's recv_ms as the batch goes to the store.
 	s.m.LoginPrepare.Observe(time.Since(prepStart).Seconds())
 	nowMs := s.now().UnixMilli()

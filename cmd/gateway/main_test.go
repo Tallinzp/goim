@@ -289,7 +289,7 @@ func TestRunServesThenDrainsOnSIGTERM(t *testing.T) {
 	}
 }
 
-// The Login RPC window is settable (the slowlogic diagnostic, #115 on hold):
+// The Login RPC window is settable (the slowlogic diagnostic, #115):
 // LoginRPCs × LoginBatch Logins sit inside Logic at once, ~1s of work for a
 // Logic slowed to 25% of a CPU.
 func TestLoginWindowFlags(t *testing.T) {

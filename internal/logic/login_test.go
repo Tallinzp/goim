@@ -404,7 +404,7 @@ func TestLoginFollowUpsOutliveTheStream(t *testing.T) {
 }
 
 // The age of each entry when its batch reaches the store, and the batch's
-// token checks, are observed (the slowlogic diagnostic, #115 on hold): under
+// token checks, are observed (the slowlogic diagnostic, #115): under
 // a CPU quota they show where a Login's time goes before Redis.
 func TestLoginObservesEntryAgeAndPrepare(t *testing.T) {
 	e := newEnv(t)
