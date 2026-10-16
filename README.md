@@ -20,6 +20,7 @@ From the recorded Tier 2 benchmark runs (24-core host, all processes on one mach
 | Four gateways | 100,000 connections: login p99 24 ms, heartbeat round trip p99 4 ms |
 | A 200k gateway SIGKILLed | all 200,000 SDK clients back online on the survivor, p99 22.7 s from the kill (SLO: 30 s); the survivor (400k) missed no lease renewal; one Kick per relogin, none retried once the process was gone; the dead epoch swept 82 s after the kill |
 | A 200k gateway silently lost (iptables DROP on its ports, then SIGKILL; 30 s heartbeat) | all 200,000 SDK clients detected the loss by Pong timeout (no FIN or RST got through; detection p50 23.3 s, p99 39.7 s, max 40.0 s: one heartbeat plus the 10 s Pong timeout), and were back on the survivor within p99 20.7 s of detecting it (SLO: 30 s); the survivor's Login p99 stayed in the same 32 ms bucket as in the ramp while Kicks to the silent gateway timed out or failed fast (132k sent, 68.5k dropped by the full queue, none refused, none given up as live); Logic's goroutines 25 → 93; the survivor missed no lease renewal; the dead epoch swept 80 s after the kill |
+| Logic slowed to a 25% CPU quota (one process) | measured login throughput 3,443/s on fresh logins (3,443–3,710 over three runs) and 2,970/s in a kill storm of relogins that each Kick the dead gateway; with each gateway's Login-queue cap at 2.69 × that throughput, a 103k-client storm onto one survivor was answered 128,001 times with `Busy` and never `EXPIRED` (login p99 3.96 s, max 4.8 s against the 5 s deadline); all clients back in 46 s (p99 34.5 s from the kill; no SLO gate at 30 × throughput); no lease renewal missed while Logic was throttled in 83% of 100 ms periods. At 4 × throughput (the spec's first rule, 1 s margin) 3.5% came back `EXPIRED`, so the rule's margin is now 3 s |
 | A 600k gateway SIGKILLed | all 600,000 SDK clients back on two empty survivors in 179 s (from the kill p50 39 s, p99 98 s; no SLO at this size), with no swap; the survivors' handshake limiter turned ~3.9M handshake attempts away and never refused one at capacity; no lease renewal missed; the dead epoch swept 120 s after the kill. These times are an upper bound: on one host the load generator's 600k SDK clients used 12 of its 14 cores in the storm's first 30 s |
 | Race test suite | 58 fault-injection scenarios against real processes and a real redis-server, plus mutation checks |
 | Tests | 467 Go tests, about half of the ~32k lines of Go |
@@ -82,7 +83,7 @@ GOIM_TEST_TIER=2 make test-tier2 SCENARIO=smoke
 
 ## Status
 
-This is sub-project 1 (connection and session core) of a larger IM system. Done: gateway, Logic, session store, TCP transport, client SDK, race suite, load generator, the Tier 2 benchmark foundation, the single-gateway capacity and heartbeat-cost benchmarks (600k connections), gateway loss with SDK clients at 200k and 600k, and silent loss of a 200k gateway. Next: slowed Logic, floods, Redis Cluster failover, and Kubernetes rolling restarts. Messaging, push and the WebSocket transport are later sub-projects.
+This is sub-project 1 (connection and session core) of a larger IM system. Done: gateway, Logic, session store, TCP transport, client SDK, race suite, load generator, the Tier 2 benchmark foundation, the single-gateway capacity and heartbeat-cost benchmarks (600k connections), gateway loss with SDK clients at 200k and 600k, silent loss of a 200k gateway, and a slowed Logic (a CPU quota). Next: floods, Redis Cluster failover, and Kubernetes rolling restarts. Messaging, push and the WebSocket transport are later sub-projects.
 
 ---
 
@@ -108,6 +109,7 @@ This is sub-project 1 (connection and session core) of a larger IM system. Done:
 | 四个网关 | 10 万连接：登录 p99 24 ms，心跳往返 p99 4 ms |
 | SIGKILL 一个 20 万连接的网关 | 20 万个 SDK 客户端全部在存活网关上重新上线，从 kill 起 p99 22.7 s（SLO：30 s）；存活网关（40 万连接）没有错过任何一次租约续期；每次重新登录一次 Kick，进程消失后不再重试；死亡 epoch 在 kill 后 82 s 清扫完毕 |
 | 静默丢失一个 20 万连接的网关（iptables DROP 其端口后 SIGKILL；30 s 心跳） | 20 万个 SDK 客户端全部通过 Pong 超时发现故障（没有 FIN 或 RST 漏过；发现时间 p50 23.3 s、p99 39.7 s、最大 40.0 s：一个心跳周期加 10 s Pong 超时），从发现起 p99 20.7 s 内在存活网关上重新上线（SLO：30 s）；发往静默网关的 Kick 超时或快速失败（发出 13.2 万次，队列满丢弃 6.85 万次，无拒绝，无以存活租约放弃），存活网关的 Login p99 仍与爬坡阶段同在 32 ms 桶内；Logic 的 goroutine 数 25 → 93；存活网关没有错过任何一次租约续期；死亡 epoch 在 kill 后 80 s 清扫完毕 |
+| Logic 限制在 25% CPU 配额（单进程） | 新登录实测吞吐 3,443/s（三次运行 3,443–3,710），在重新登录风暴中（每次登录都要向死亡网关发 Kick）为 2,970/s；每个网关的 Login 队列上限设为该吞吐的 2.69 倍时，10.3 万客户端涌向一个存活网关，被回复 `Busy` 128,001 次，没有一次 `EXPIRED`（登录 p99 3.96 s，最大 4.8 s，期限 5 s）；全部客户端 46 s 内重新上线（从 kill 起 p99 34.5 s；30 倍吞吐的规模不设 SLO 门限）；Logic 在 83% 的 100 ms 周期被限流，仍没有错过任何一次租约续期。上限为 4 倍吞吐（规格最初的规则，1 s 余量）时 3.5% 返回 `EXPIRED`，因此规则的余量改为 3 s |
 | SIGKILL 一个 60 万连接的网关 | 60 万个 SDK 客户端全部在两个空的存活网关上重新上线，用时 179 s（从 kill 起 p50 39 s、p99 98 s；此规模不设 SLO），无 swap；存活网关的握手限流拒绝了约 390 万次握手尝试，从未因容量满而拒绝；没有错过任何一次租约续期；死亡 epoch 在 kill 后 120 s 清扫完毕。这些时间是上界：在单台主机上，压测工具的 60 万个 SDK 客户端在风暴的前 30 s 用掉了其 14 核中的 12 核 |
 | 竞态测试集 | 58 个故障注入场景，运行在真实进程和真实 redis-server 上，并带变异测试 |
 | 测试 | 467 个 Go 测试，约占 3.2 万行 Go 代码的一半 |
@@ -170,6 +172,6 @@ GOIM_TEST_TIER=2 make test-tier2 SCENARIO=smoke
 
 ### 当前状态
 
-这是一个更大 IM 系统中的子项目 1（连接与会话核心）。已完成：网关、Logic、会话存储、TCP 传输、客户端 SDK、竞态测试集、压测工具、Tier 2 压测基础设施，单网关容量和心跳开销压测（60 万连接），使用 SDK 客户端的 20 万和 60 万连接网关故障，以及静默丢失一个 20 万连接的网关。下一步：变慢的 Logic、洪泛、Redis Cluster 故障转移，以及 Kubernetes 滚动重启。消息、推送和 WebSocket 传输属于后续子项目。
+这是一个更大 IM 系统中的子项目 1（连接与会话核心）。已完成：网关、Logic、会话存储、TCP 传输、客户端 SDK、竞态测试集、压测工具、Tier 2 压测基础设施，单网关容量和心跳开销压测（60 万连接），使用 SDK 客户端的 20 万和 60 万连接网关故障，静默丢失一个 20 万连接的网关，以及变慢的 Logic（CPU 配额）。下一步：洪泛、Redis Cluster 故障转移，以及 Kubernetes 滚动重启。消息、推送和 WebSocket 传输属于后续子项目。
 
 [回到 English](#goim)

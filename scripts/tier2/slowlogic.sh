@@ -8,12 +8,14 @@
 #       login throughput T is the rate of its ok logins while its CPU sits
 #       at the quota.
 #   storm: each gateway's -login-queue-cap set by the spec's rule for the
-#       gateway that takes the storm, T per gateway x (login_deadline - 1s
-#       margin) = T x 4s, since gw-0 is then alone and Logic serves it at T;
+#       gateway that takes the storm, T per gateway x (login_deadline - 3s
+#       margin) = T x 2s, since gw-0 is then alone and Logic serves it at T
+#       (#115: run 29 at T x 4s, 1s margin, and a run at ~T' x 4s both
+#       expired 2.5-3.5%; 2.69T passed);
 #       2 x 30T clients ramped at T/2 per second (Logic at half load), then
 #       gw-1 SIGKILLed: its 30T clients come back over the SDK's 0-20s storm
 #       wait, at 1.5T per second, onto gw-0 (#113). Logins beyond Logic's
-#       pace queue up to the cap (~8s in; a queued Login waits up to 4s, the
+#       pace queue up to the cap (a queued Login waits up to 2s at T, the
 #       rule's bound), and the rest are answered Busy: rejected as Busy, not
 #       EXPIRED (R4H-O2). At 30T, Logic needs >= 30s to serve them, so the
 #       30s SLO is recorded, not gated (#113). Busy needs >= ~27T victims
@@ -54,7 +56,7 @@
 #                          the storm is refused (storm_size): lower SLOWLOGIC_QUOTA
 #   SLOWLOGIC_RATE         storm: clients started per second (default T/2)
 #   SLOWLOGIC_QUEUE_CAP    storm: each gateway's -login-queue-cap (default
-#                          T x 4, the spec's rule for the lone survivor)
+#                          T x 2, the spec's rule for the lone survivor, #115)
 #   SLOWLOGIC_BUSY_WINDOW  storm: seconds from the kill over which Logic's own
 #                          pace T' (ok + replaced logins per second) and cores
 #                          are recorded (default 20, the SDK's storm wait)
@@ -305,9 +307,10 @@ done
 t0=$SECONDS
 # The population, capped by the memory budget (SLOWLOGIC_MAX_VICTIMS). Busy
 # reaches its floor only from ~27T victims: over the 0-20s storm wait they
-# arrive at V/20 per second against a drain of T, the 4T queue fills after
+# arrive at V/20 per second against a drain of T, a 4T queue fills after
 # 4T / (V/20 - T) seconds, and first attempts turned away after that come
-# to 20T(V/20T - 1) - 4T >= 0.1V for V >= ~26.7T.
+# to 20T(V/20T - 1) - 4T >= 0.1V for V >= ~26.7T. The 2T cap (#115) needs
+# only ~24.4T, so 27T keeps the floor for any cap up to 4T.
 max_victims=${SLOWLOGIC_MAX_VICTIMS:-120000} clamped=false
 victims=${SLOWLOGIC_VICTIMS:-$((30 * T))}
 [ -z "${SLOWLOGIC_VICTIMS:-}" ] && [ "$victims" -gt "$max_victims" ] && victims=$max_victims clamped=true
@@ -316,7 +319,7 @@ t2_check storm_size "$(t2_bool [ "$victims" -ge "$need" ])" "\"throughput_per_s\
 [ "$victims" -ge "$need" ] || { t2_check artifacts "$(t2_bool [ -z "$missing" ])" "\"missing\": $(t2_json_str "${missing# }")"; t2_finish; }
 clients=$((2 * victims))
 rate=${SLOWLOGIC_RATE:-$((T / 2))}
-qcap=${SLOWLOGIC_QUEUE_CAP:-$((T * 4))}
+qcap=${SLOWLOGIC_QUEUE_CAP:-$((T * 2))}
 back_wait=${SLOWLOGIC_BACK_WAIT:-600}
 busy_win=${SLOWLOGIC_BUSY_WINDOW:-20}
 STACK_GATEWAY_ARGS=(-max-conns $((clients + clients / 10)) -login-queue-cap "$qcap")

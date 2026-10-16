@@ -82,3 +82,21 @@ Objections: `connection-session-core-06b2b-slow-logic.md`. Decided by the user, 
 **Decision:** keep the 4T cap and the gates. The plan records the dry run as the expected result: `storm_expired` may fail in run 29, which is a finding against R4H-O2 (the rule's "measured Logic login throughput" must be relogin throughput, or the margin must be larger), not a harness bug. The spec question is decided after run 29.
 
 **Rejected:** calibrating on relogins (a small kill storm), which costs more script, a longer run and a re-prototype; and reverting to 2T, which hides the gap behind half the rule's budget (O1).
+
+## Follow-up F2 — run 29: the rule's 1s margin is too small; margin 3s (#115)
+
+**Finding (Tier 2, 2026-10-16, `04dc99a`, three runs):**
+
+| run | T (fresh) | T' (storm) | cap | cap / T' | EXPIRED | latency max |
+|---|---|---|---|---|---|---|
+| 29 | 3,550 | 3,116 (88%) | 14,200 (4T) | 4.56s | 3,701 (3.5%) | 5.9s |
+| 29b | 3,710 | 2,814 (76%) | 12,464 (≈ run 29's T' × 4) | 4.43s | 2,775 (2.5%) | 5.75s |
+| 29c | 3,443 | 2,970 (86%) | 9,275 (2.69T) | 3.12s | 0 | 4.8s |
+
+Every EXPIRED was Logic's (the login reached Redis more than 5s after the gateway received it); the gateway queue expired none. Two things break the 1s margin: T' (relogins that each Kick a dead gateway) is 76–88% of T and varies by 12 points between runs, so sizing on a measured T' is fragile; and logins wait 1.3–1.7s beyond cap / T' (Logic's pipeline under CFS throttling).
+
+**Decision (the user):** margin 3s: `login_queue_cap ≤ T × (login_deadline − 3s)`, 2T at the spec's 5s deadline, with T measured on fresh logins. Worst seen: 2.6s nominal + 1.7s ≈ 4.3s. `slowlogic`'s default cap becomes T × 2 (#115).
+
+**Rejected:** (a) T measured on relogins with the 1s margin (run 29b failed; T' moves); 2.5T, 2.5s margin (worst seen ≈ 4.97s, at the deadline); keeping the rule and accepting EXPIRED.
+
+**Spec changes to apply** (rev6, *Gateway → Admission control*, Login-queue cap, **Sizing** *(R4H-O2)*): `login_queue_cap ≤ measured Logic login throughput per gateway × (login_deadline − margin)` gains: the margin is 3s at the 5s `login_deadline` (2 × throughput), since under a CPU limit relogins with Kicks run at 76–88% of fresh logins and queued logins wait 1.3–1.7s beyond the queue's nominal drain (Tier 2 run 29, #115). Not applied to the spec yet (the user decides).
