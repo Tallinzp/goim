@@ -13,8 +13,10 @@
 #   stack_expect_dead NAME [SECONDS]  # NAME was killed on purpose (loadgen /kill): reap and record it
 #   stack_metric NAME METRIC [MATCH]  # sum of METRIC's samples (with MATCH in the line) on NAME's /metrics
 #   stack_metrics NAME          # NAME's /metrics once; stack_metric_in BODY METRIC [MATCH] reads it
-#   stack_wait_idle SECONDS     # phase boundary: every gateway at 0 connections, 0 awaiting Logout,
-#                               #   its Logouts settled (one done per login, none dropped)
+#   stack_wait_idle SECONDS [dropped-ok]  # phase boundary: every gateway at 0 connections, 0 awaiting
+#                               #   Logout, its Logouts settled (one done per login, none dropped;
+#                               #   dropped-ok: a dropped Logout counts as settled)
+#   stack_cpu_max NAME          # NAME's cgroup cpu.max, e.g. "25000 100000" (null: unreadable)
 #   stack_usage_start [N=PID..] # start a CPU window over the stack's processes (and N=PID extras)
 #   stack_usage_json            # {"window_s", NAME: {"cpu_s", "cores", "rss_mb", "rss_peak_mb"}...} since the start
 #   stack_counters NAME KEY=METRIC[:MATCH]...  # {"KEY": sum, ...} from one scrape of NAME (null: no answer)
@@ -38,6 +40,9 @@
 #   STACK_GATEWAY_PROCS  each gateway's GOMAXPROCS (default: max(1, CPUs / STACK_GATEWAYS),
 #                        CPUs = T2_CPUS_GATEWAY when pinned, else all online; #79)
 #   STACK_GATEWAY_ARGS, STACK_LOGIC_ARGS   arrays of extra flags
+#   STACK_LOGIC_CPU_QUOTA  e.g. 25%: Logic runs in a transient systemd user scope with
+#                        that CPUQuota (cgroup cpu.max, as a Kubernetes CPU limit; Plan
+#                        6b2b-slow); needs the user manager to delegate the cpu controller
 #   STACK_GATEWAY_ENV    array of VAR=VALUE for every gateway, e.g. (GOGC=off GOMEMLIMIT=4GiB) (#88)
 #   STACK_DRAIN_WINDOW   gateway -drain-window (default 1s, so stack_down's drain ends and
 #                        exits 0 well inside STACK_DOWN_WAIT; a measured drain sets 60s)
@@ -185,7 +190,13 @@ stack_up() {
   fi
   stack_start devtoken "$logic_cpus" "$bin/devtoken" serve -addr "$devtoken" -jwks "$STACK_DIR/keys/jwks.json"
   stack_wait devtoken "http://$devtoken/" || return 1
-  stack_start logic "$logic_cpus" "$bin/logic" -redis "$redis_addr" -redis-cluster=false \
+  # A CPU quota (Plan 6b2b-slow): systemd-run --scope moves itself into a
+  # new scope and execs Logic, so the PID, the process group and the
+  # affinity stay as stack_start set them.
+  local logic=("$bin/logic")
+  [ -n "${STACK_LOGIC_CPU_QUOTA:-}" ] &&
+    logic=(systemd-run --user --scope --quiet -p "CPUQuota=$STACK_LOGIC_CPU_QUOTA" -- "$bin/logic")
+  stack_start logic "$logic_cpus" "${logic[@]}" -redis "$redis_addr" -redis-cluster=false \
     -grpc-addr "$grpc" -lease-addr "$lease" -admin-addr "$admin" \
     -jwks-url "http://$devtoken/" -jwks-fallback "$STACK_DIR/keys/jwks.json" \
     -kick-addr-file "$STACK_DIR/kick.json" "${STACK_LOGIC_ARGS[@]}"
@@ -328,9 +339,12 @@ stack_metric_in() {
 # answer counts as busy. Only running gateways count: a killed one's
 # sessions end by EpochEnded, not Logouts, and it is gone from stack_admins
 # (stack_expect_dead). Fails, naming what is left, after SECONDS, or at once
-# on a dropped Logout, which never settles.
+# on a dropped Logout, which never settles. With dropped-ok, a dropped
+# Logout counts as settled instead (done + dropped >= logins): a slowed
+# Logic may fill a gateway's Logout queue, which the spec allows, Reconcile
+# repairing the session (R1-O3, R3-O1; roadmap #94, P6b2a-stressI-2).
 stack_wait_idle() {
-  local end=$((SECONDS + $1)) name admin busy body c a ldone logins dropped
+  local end=$((SECONDS + $1)) ok=${2:-} name admin busy body c a ldone logins dropped
   while :; do
     busy=""
     while read -r name admin; do
@@ -344,12 +358,13 @@ stack_wait_idle() {
       [ "$ldone" = null ] && ldone=0
       [ "$logins" = null ] && logins=0
       [ "$dropped" = null ] && dropped=0
-      if [ "$dropped" != 0 ]; then
+      if [ "$dropped" != 0 ] && [ "$ok" != dropped-ok ]; then
         echo "stack: $name dropped $dropped Logouts: they never settle (logouts done $ldone of $logins logins, dropped $dropped)" >&2
         return 1
       fi
-      [ "$c" = 0 ] && [ "$a" = 0 ] && [ "$ldone" -ge "$logins" ] ||
-        busy+=" $name: connections $c, awaiting_logout $a, logouts done $ldone of $logins logins;"
+      [ "$ok" = dropped-ok ] || dropped=0
+      [ "$c" = 0 ] && [ "$a" = 0 ] && [ $((ldone + dropped)) -ge "$logins" ] ||
+        busy+=" $name: connections $c, awaiting_logout $a, logouts done $ldone$([ "$dropped" = 0 ] || echo " + dropped $dropped") of $logins logins;"
     done < <(stack_admins)
     [ -z "$busy" ] && return 0
     if [ $SECONDS -ge $end ]; then
@@ -488,6 +503,16 @@ for le in les:
         break
 else:
     print("null") # Q above 1 (P6b2b-b2I-5)' "$1" "$2" "$3" 2>/dev/null || echo null
+}
+
+# stack_cpu_max NAME: the cpu.max of NAME's cgroup (cgroup v2), e.g.
+# "25000 100000" for a 25% quota, "max 100000" for none; null if NAME is
+# not running or its cgroup has no cpu.max (the cpu controller is not
+# enabled there).
+stack_cpu_max() {
+  local pid=${STACK_PIDS[$1]:-} path
+  path=$(awk -F: '$1 == "0" { print $3 }' "/proc/$pid/cgroup" 2>/dev/null)
+  [ -n "$pid" ] && [ -n "$path" ] && cat "/sys/fs/cgroup$path/cpu.max" 2>/dev/null || echo null
 }
 
 # stack_pinned NAME CPUS: the process's affinity is exactly CPUS.

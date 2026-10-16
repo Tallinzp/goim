@@ -75,6 +75,11 @@ fi
   out=$(stack_wait_idle 10 2>&1) && bad "idle: a dropped Logout must fail" || ok "idle: a dropped Logout fails"
   [ $((SECONDS - start)) -lt 3 ] && ok "idle: a dropped Logout fails at once" || bad "idle: a dropped Logout waited $((SECONDS - start))s"
   case $out in *"dropped 1"*) ok "idle: names the dropped Logout" ;; *) bad "idle: dropped not named: [$out]" ;; esac
+  # dropped-ok (Plan 6b2b-slow): a dropped Logout counts as settled.
+  stack_wait_idle 2 dropped-ok && ok "idle: dropped-ok settles done + dropped" || bad "idle: dropped-ok, done 4 + dropped 1 of 5"
+  fake 'goim_gateway_logins_total{result="ok"} 5' 'goim_gateway_logouts_total{result="done"} 3' 'goim_gateway_logouts_total{result="dropped"} 1'
+  out=$(stack_wait_idle 1 dropped-ok 2>&1) && bad "idle: dropped-ok, a Logout short must keep it busy" || ok "idle: dropped-ok, a Logout short keeps it busy"
+  case $out in *"logouts done 3 + dropped 1 of 5 logins"*) ok "idle: dropped-ok names done and dropped" ;; *) bad "idle: dropped-ok not named: [$out]" ;; esac
   # A gateway that does not answer is busy, never idle.
   kill $srv; wait $srv 2>/dev/null
   out=$(stack_wait_idle 1 2>&1) && bad "idle: a silent gateway must keep it busy" || ok "idle: a silent gateway keeps it busy"
@@ -283,12 +288,25 @@ for name in gw-0 gw-1; do
 done
 
 # STACK_GATEWAY_PROCS overrides the share (one gateway alone would get every CPU).
-STACK_GATEWAYS=1 STACK_GATEWAY_PROCS=1
+# STACK_LOGIC_CPU_QUOTA runs Logic under a CPU quota (Plan 6b2b-slow), where
+# a systemd user manager delegates the cpu controller.
+quota=""
+systemd-run --user --scope --quiet -p CPUQuota=50% true 2>/dev/null && quota=50%
+STACK_GATEWAYS=1 STACK_GATEWAY_PROCS=1 STACK_LOGIC_CPU_QUOTA=$quota
 if stack_up; then
   grep -q " loops=1 " "$STACK_DIR/logs/gw-0.log" && ok "procs: STACK_GATEWAY_PROCS=1 runs 1 loop" || bad "procs: override: $(grep -o ' loops=[0-9]* ' "$STACK_DIR/logs/gw-0.log")"
+  if [ -n "$quota" ]; then
+    expect "quota: Logic's cpu.max" "$(stack_cpu_max logic)" "50000 100000"
+    expect "quota: the PID is Logic's" "$(cat "/proc/${STACK_PIDS[logic]}/comm")" logic
+    stack_pinned logic "$T2_CPUS_LOGIC" && ok "quota: Logic still pinned" || bad "quota: Logic not pinned"
+  else
+    echo "skip quota: no systemd user manager delegating the cpu controller"
+  fi
 else
   bad "up: second stack"
 fi
+STACK_LOGIC_CPU_QUOTA=
+expect "quota: no such process" "$(stack_cpu_max gw-9)" null
 # A gateway that dies during the run is reported, and stays reported after the stop.
 kill -KILL "${STACK_PIDS[gw-0]}"
 sleep 0.2
