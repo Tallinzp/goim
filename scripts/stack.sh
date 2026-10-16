@@ -17,6 +17,8 @@
 #                               #   Logout, its Logouts settled (one done per login, none dropped;
 #                               #   dropped-ok: a dropped Logout counts as settled)
 #   stack_cpu_max NAME          # NAME's cgroup cpu.max, e.g. "25000 100000" (null: unreadable)
+#   stack_cpu_stat NAME         # NAME's cgroup cpu.stat {"usage_usec", "nr_periods", "nr_throttled",
+#                               #   "throttled_usec"} (null: unreadable), for stack_counters_delta
 #   stack_usage_start [N=PID..] # start a CPU window over the stack's processes (and N=PID extras)
 #   stack_usage_json            # {"window_s", NAME: {"cpu_s", "cores", "rss_mb", "rss_peak_mb"}...} since the start
 #   stack_counters NAME KEY=METRIC[:MATCH]...  # {"KEY": sum, ...} from one scrape of NAME (null: no answer)
@@ -513,6 +515,22 @@ stack_cpu_max() {
   local pid=${STACK_PIDS[$1]:-} path
   path=$(awk -F: '$1 == "0" { print $3 }' "/proc/$pid/cgroup" 2>/dev/null)
   [ -n "$pid" ] && [ -n "$path" ] && cat "/sys/fs/cgroup$path/cpu.max" 2>/dev/null || echo null
+}
+
+# stack_cpu_stat NAME: the cpu.stat of NAME's cgroup as {"usage_usec",
+# "nr_periods", "nr_throttled", "throttled_usec"}, for stack_counters_delta
+# around a window: how often a CPU quota throttled NAME (P6b2b-slowI-1).
+# null as for stack_cpu_max; the nr_* keys are null without a quota's
+# accounting (the cpu controller is not enabled there).
+stack_cpu_stat() {
+  local pid=${STACK_PIDS[$1]:-} path
+  path=$(awk -F: '$1 == "0" { print $3 }' "/proc/$pid/cgroup" 2>/dev/null)
+  { [ -n "$pid" ] && [ -n "$path" ] && [ -r "/sys/fs/cgroup$path/cpu.stat" ]; } || { echo null; return; }
+  awk 'BEGIN { split("usage_usec nr_periods nr_throttled throttled_usec", k, " ") }
+    { v[$1] = $2 }
+    END { out = ""
+          for (i = 1; i <= 4; i++) out = out (i > 1 ? ", " : "") "\"" k[i] "\": " (k[i] in v ? v[k[i]] : "null")
+          print "{" out "}" }' "/sys/fs/cgroup$path/cpu.stat"
 }
 
 # stack_pinned NAME CPUS: the process's affinity is exactly CPUS.

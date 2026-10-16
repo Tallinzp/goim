@@ -299,6 +299,7 @@ if stack_up; then
     expect "quota: Logic's cpu.max" "$(stack_cpu_max logic)" "50000 100000"
     expect "quota: the PID is Logic's" "$(cat "/proc/${STACK_PIDS[logic]}/comm")" logic
     stack_pinned logic "$T2_CPUS_LOGIC" && ok "quota: Logic still pinned" || bad "quota: Logic not pinned"
+    expect "quota: Logic's cpu.stat" "$(stack_cpu_stat logic | lg_py - 'all(isinstance(d[k], int) for k in ("usage_usec", "nr_periods", "nr_throttled", "throttled_usec"))')" true
   else
     echo "skip quota: no systemd user manager delegating the cpu controller"
   fi
@@ -307,6 +308,7 @@ else
 fi
 STACK_LOGIC_CPU_QUOTA=
 expect "quota: no such process" "$(stack_cpu_max gw-9)" null
+expect "quota: no such process's cpu.stat" "$(stack_cpu_stat gw-9)" null
 # A gateway that dies during the run is reported, and stays reported after the stop.
 kill -KILL "${STACK_PIDS[gw-0]}"
 sleep 0.2

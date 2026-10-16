@@ -61,6 +61,8 @@
 #   SLOWLOGIC_BACK_WAIT    storm: seconds after the kill to wait for every victim
 #                          (default 600: Busy 5 times in a row hands a client to
 #                          the SDK's exponential backoff, capped at 5 min)
+#   Every number setting is whole (SLOWLOGIC_CAL_SKIP may be 0, the rest
+#   positive), refused otherwise before anything starts (P6b2b-slowI-2).
 #
 # Checks:
 #   calibrate_stack     redis, devtoken, Logic and both gateways become Ready
@@ -70,11 +72,15 @@
 #   calibrate_saturated Logic's CPU in the window was at least 0.9 x the
 #                       quota, so T is Logic's pace, not the offered load's,
 #                       and wasted logins (Logic's expired, the gateways'
-#                       expired_queued and error) were at most 1% of its ok
+#                       expired_queued and error) were at most 1% of its ok;
+#                       Logic's cgroup cpu.stat over the window (throttling)
+#                       and its other login results are recorded; fails if
+#                       loadgen did not start
 #   calibrate_lease     both gateways renewed their leases every interval
 #                       while Logic was saturated (no missing or error; the
 #                       5s call timeout is the bound, latency not measured),
-#                       and Logic saw no renewal error
+#                       and Logic saw no renewal error; ~16-19s, so one
+#                       renewal each (storm_lease covers gw-0 longer)
 #   calibrate_idle      after loadgen stops, every gateway reaches 0
 #                       connections and settles its Logouts; dropped Logouts
 #                       count as settled and are recorded (roadmap #94)
@@ -96,8 +102,9 @@
 #                       the kill is recorded (#113)
 #   storm_lease         gw-0 renews its lease every interval through the
 #                       storm (own connection and worker pool, same quota,
-#                       R1-O2; the 5s call timeout is the bound), and Logic
-#                       saw no renewal error
+#                       R1-O2; the 5s call timeout is the bound; the same
+#                       floor as calibrate_lease), and Logic saw no renewal
+#                       error
 #   no_swap_in_storm    no page swapped in from the kill to the last victim (#70)
 #   storm_idle          as calibrate_idle
 #   storm_processes     as calibrate_processes
@@ -121,6 +128,14 @@ esac
 # host's does: user@UID.service/cgroup.controllers lists cpu).
 systemd-run --user --scope --quiet -p "CPUQuota=$QUOTA" true 2>/dev/null ||
   t2_refuse "refused: systemd-run --user --scope cannot set CPUQuota=$QUOTA (does /sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers list cpu?)"
+# Every number setting lands in arithmetic and in result.json unquoted
+# (P6b2b-slowI-2, as gwloss's P6b2b-b2I-2).
+for v in SLOWLOGIC_CAL_CLIENTS SLOWLOGIC_CAL_RATE SLOWLOGIC_CAL_QUEUE_CAP SLOWLOGIC_CAL_WINDOW \
+  SLOWLOGIC_VICTIMS SLOWLOGIC_MAX_VICTIMS SLOWLOGIC_RATE SLOWLOGIC_QUEUE_CAP \
+  SLOWLOGIC_BUSY_WINDOW SLOWLOGIC_BACK_WAIT; do
+  case ${!v-1} in ''|*[!0-9]*|0) echo "slowlogic: $v must be a positive whole number" >&2; exit 1 ;; esac
+done
+case ${SLOWLOGIC_CAL_SKIP-0} in ''|*[!0-9]*) echo "slowlogic: SLOWLOGIC_CAL_SKIP must be whole seconds" >&2; exit 1 ;; esac
 t2_mem_budget 10
 t2_nofile 1048576
 
@@ -146,10 +161,25 @@ LOGIC_COUNTERS=(
   logins_ok='goim_logic_logins_total:result="ok"'
   logins_replaced='goim_logic_logins_total:result="replaced"'
   logins_expired='goim_logic_logins_total:result="expired"'
+  logins_all='goim_logic_logins_total' # every result: logins_other (P6b2b-slowI-4)
   lease_error='goim_logic_lease_renewals_total:result="error"'
   kick_attempts='goim_logic_kick_attempts_total'
   kick_dropped='goim_logic_kick_dropped_total'
 )
+
+# lease_floor SECONDS: the fewest renewals a window of SECONDS (whole) must
+# hold. A renewal counts when its call ends, at most 5s (the call timeout)
+# after its 10s tick, so (SECONDS - 6) // 10 of them (1s for SECONDS'
+# resolution), and never fewer than SECONDS // 10 - 1 (P6b2b-slowI-5).
+lease_floor() {
+  local s=$1
+  echo $((s / 10 - 1 > (s - 6) / 10 ? s / 10 - 1 : (s - 6) / 10))
+}
+
+# The other Logic login results (superseded, stale, kicked, error...) in a
+# stack_counters_delta of LOGIC_COUNTERS: Logic work that is neither T's nor
+# T''s (P6b2b-slowI-4).
+LOGINS_OTHER='None if d["logins_all"] is None else d["logins_all"] - sum(d[k] or 0 for k in ("logins_ok", "logins_replaced", "logins_expired"))'
 
 t2_report_extra() {
   local f
@@ -225,15 +255,23 @@ t2_check slow_scope "$scope" \
 lease0=$(stack_counters logic "${LOGIC_COUNTERS[@]}") lease_t=$SECONDS
 declare -A lg0=() lg1=() g0=() g1=()
 for g in gw-0 gw-1; do lg0[$g]=$(stack_counters "$g" "${GW_COUNTERS[@]}"); done
-lg_start calibrate -mode sdk -clients "$cal_clients" -rate "$cal_rate" -uid-prefix cal
+if ! lg_start calibrate -mode sdk -clients "$cal_clients" -rate "$cal_rate" -uid-prefix cal; then
+  t2_check calibrate_saturated false "\"error\": \"loadgen did not start, see calibrate/logs/loadgen-calibrate.log\""
+  down calibrate
+  t2_finish
+fi
 sleep "$skip"
 stack_snapshot cal_before
-l0=$(stack_counters logic "${LOGIC_COUNTERS[@]}")
+# Logic's counters and cpu.stat right around the usage window, so T's count
+# and its window_s cover the same span; the gateways first (P6b2b-slowI-3).
 for g in gw-0 gw-1; do g0[$g]=$(stack_counters "$g" "${GW_COUNTERS[@]}"); done
+cs0=$(stack_cpu_stat logic)
+l0=$(stack_counters logic "${LOGIC_COUNTERS[@]}")
 stack_usage_start loadgen="$LG_PID"
 sleep "$win"
 usage=$(stack_usage_json)
 l1=$(stack_counters logic "${LOGIC_COUNTERS[@]}")
+cs1=$(stack_cpu_stat logic)
 for g in gw-0 gw-1; do g1[$g]=$(stack_counters "$g" "${GW_COUNTERS[@]}"); done
 stack_snapshot cal_after
 logic_d=$(stack_counters_delta "$l0" "$l1")
@@ -247,15 +285,12 @@ logic_cores=$(echo "$usage" | lg_py - 'd["logic"]["cores"]' 2>/dev/null)
 waste=$(echo "{\"l\": $logic_d, \"g\": $gws_d}" | lg_py - '{"logic_expired": d["l"]["logins_expired"] or 0, "expired_queued": sum(d["g"][g]["logins_expired_queued"] or 0 for g in d["g"]), "error": sum(d["g"][g]["logins_error"] or 0 for g in d["g"])}' 2>/dev/null)
 saturated=$(echo "{\"c\": ${logic_cores:-null}, \"w\": ${waste:-null}, \"l\": $logic_d}" | lg_true - 'd["c"] is not None and d["c"] >= 0.9 * '"$quota_cores"' and d["w"] is not None and sum(d["w"].values()) <= 0.01 * (d["l"]["logins_ok"] or 0)')
 [ -n "$T" ] && [ "$T" -gt 0 ] 2>/dev/null || { T=null saturated=false; }
-t2_check calibrate_saturated "$saturated" "\"throughput_per_s\": $T, \"logic_cores\": ${logic_cores:-null}, \"quota_cores\": $quota_cores, \"waste\": ${waste:-null}, \"waste_max\": $(echo "$logic_d" | lg_py - '0.01 * (d["logins_ok"] or 0)'), \"window_s\": $(echo "$usage" | lg_py - 'd["window_s"]')"
-t2_field calibrate "{\"clients\": $cal_clients, \"rate\": $cal_rate, \"queue_cap\": $cal_cap, \"skip_s\": $skip, \"throughput_per_s\": $T, \"logic_gomaxprocs\": $gomaxprocs, \"usage\": $usage, \"logic\": $logic_d, \"gateways\": $gws_d, \"loadgen_online\": $(lg_get /stats 'd["online"]'), \"failed\": $(lg_get /stats 'd["failed"]')}"
+t2_check calibrate_saturated "$saturated" "\"throughput_per_s\": $T, \"logic_cores\": ${logic_cores:-null}, \"quota_cores\": $quota_cores, \"waste\": ${waste:-null}, \"waste_max\": $(echo "$logic_d" | lg_py - '0.01 * (d["logins_ok"] or 0)'), \"window_s\": $(echo "$usage" | lg_py - 'd["window_s"]'), \"logins_other\": $(echo "$logic_d" | lg_py - "$LOGINS_OTHER"), \"cpu_stat\": $(stack_counters_delta "$cs0" "$cs1")"
+t2_field calibrate "{\"clients\": $cal_clients, \"rate\": $cal_rate, \"queue_cap\": $cal_cap, \"skip_s\": $skip, \"throughput_per_s\": $T, \"logic_gomaxprocs\": $gomaxprocs, \"usage\": $usage, \"logic\": $logic_d, \"cpu_stat\": $(stack_counters_delta "$cs0" "$cs1"), \"gateways\": $gws_d, \"loadgen_online\": $(lg_get /stats 'd["online"]'), \"failed\": $(lg_get /stats 'd["failed"]')}"
 lease1=$(stack_counters logic "${LOGIC_COUNTERS[@]}") lease_s=$((SECONDS - lease_t))
 for g in gw-0 gw-1; do lg1[$g]=$(stack_counters "$g" "${GW_COUNTERS[@]}"); done
-# The renewal floor: a renewal counts when its call ends, at most 5s (the
-# call timeout) after its 10s tick, so a window of lease_s seconds holds at
-# least (lease_s - 6) // 10 of them (1s for SECONDS' resolution): 1 over the
-# ~16s calibration, where lease_s // 10 - 1 alone would be 0.
-lease_floor=$(( lease_s / 10 - 1 > (lease_s - 6) / 10 ? lease_s / 10 - 1 : (lease_s - 6) / 10 ))
+# 1 over the ~16s calibration, where lease_s // 10 - 1 alone would be 0.
+lease_floor=$(lease_floor "$lease_s")
 lease_d="{\"gw-0\": $(stack_counters_delta "${lg0[gw-0]}" "${lg1[gw-0]}"), \"gw-1\": $(stack_counters_delta "${lg0[gw-1]}" "${lg1[gw-1]}"), \"logic\": $(stack_counters_delta "$lease0" "$lease1")}"
 t2_check calibrate_lease "$(echo "$lease_d" | lg_true - 'all(d[g]["lease_error"] == 0 and d[g]["lease_missing"] == 0 and d[g]["lease_live"] >= '"$lease_floor"' for g in ("gw-0", "gw-1")) and d["logic"]["lease_error"] == 0')" \
   "\"elapsed_s\": $lease_s, \"live_floor\": $lease_floor, \"gateways\": $(echo "$lease_d" | lg_py - '{g: {"live": d[g]["lease_live"], "missing": d[g]["lease_missing"], "error": d[g]["lease_error"]} for g in ("gw-0", "gw-1")}'), \"logic_lease_error\": $(echo "$lease_d" | lg_py - 'd["logic"]["lease_error"]')"
@@ -301,8 +336,10 @@ if [ "$online" != true ]; then
 fi
 
 stack_snapshot before
-l0=$(stack_counters logic "${LOGIC_COUNTERS[@]}")
 s0=$(stack_counters gw-0 "${GW_COUNTERS[@]}")
+storm_cpu_max=$(stack_cpu_max logic)
+cs0=$(stack_cpu_stat logic)
+l0=$(stack_counters logic "${LOGIC_COUNTERS[@]}")
 t2_record_start storm
 stack_usage_start loadgen="$LG_PID"
 reply=$(lg_post "/kill?gateway=gw-1&pid=${STACK_PIDS[gw-1]}&mark=death" | lg_py - d)
@@ -311,9 +348,9 @@ kill_t=$SECONDS
 # replace gw-1's entries, each with a Kick to the dead address), against the
 # calibration's fresh logins. Its own usage window, in a subshell, leaves
 # the storm's whole-window reading alone.
-(b0=$(stack_counters logic "${LOGIC_COUNTERS[@]}"); stack_usage_start; sleep "$busy_win"
-  u=$(stack_usage_json); b1=$(stack_counters logic "${LOGIC_COUNTERS[@]}")
-  echo "{\"u\": $u, \"d\": $(stack_counters_delta "$b0" "$b1")}" >"$STACK_DIR/busy.json") >/dev/null 2>&1 &
+(c0=$(stack_cpu_stat logic); b0=$(stack_counters logic "${LOGIC_COUNTERS[@]}"); stack_usage_start; sleep "$busy_win"
+  u=$(stack_usage_json); b1=$(stack_counters logic "${LOGIC_COUNTERS[@]}"); c1=$(stack_cpu_stat logic)
+  echo "{\"u\": $u, \"d\": $(stack_counters_delta "$b0" "$b1"), \"c\": $(stack_counters_delta "$c0" "$c1")}" >"$STACK_DIR/busy.json") >/dev/null 2>&1 &
 busy_pid=$!
 stack_expect_dead gw-1 60
 dead=$?
@@ -324,9 +361,10 @@ back_s=$((SECONDS - kill_t))
 lg_get "/slo?mark=death&within=30s" d >"$STACK_DIR/artifacts/slo-death.json"
 wait "$prof" "$busy_pid"
 usage=$(stack_usage_json)
-busy_window=$(lg_py "$STACK_DIR/busy.json" '{"window_s": d["u"]["window_s"], "throughput_per_s": int(((d["d"]["logins_ok"] or 0) + (d["d"]["logins_replaced"] or 0)) / d["u"]["window_s"]), "logic_cores": d["u"]["logic"]["cores"], "logic": d["d"]}' 2>/dev/null) || busy_window=null
+busy_window=$(lg_py "$STACK_DIR/busy.json" '{"window_s": d["u"]["window_s"], "throughput_per_s": int(((d["d"]["logins_ok"] or 0) + (d["d"]["logins_replaced"] or 0)) / d["u"]["window_s"]), "logic_cores": d["u"]["logic"]["cores"], "logins_other": (lambda d: '"$LOGINS_OTHER"')(d["d"]), "cpu_stat": d["c"], "logic": d["d"]}' 2>/dev/null) || busy_window=null
 [ -n "$busy_window" ] || busy_window=null
 l1=$(stack_counters logic "${LOGIC_COUNTERS[@]}")
+cs1=$(stack_cpu_stat logic)
 s1=$(stack_counters gw-0 "${GW_COUNTERS[@]}")
 t2_record_end storm
 stack_snapshot after
@@ -334,6 +372,8 @@ logic_d=$(stack_counters_delta "$l0" "$l1")
 gw_d=$(stack_counters_delta "$s0" "$s1")
 window_s=$(echo "$usage" | lg_py - 'd["window_s"]')
 slo=$STACK_DIR/artifacts/slo-death.json
+storm_floor=null # an unreadable window fails storm_lease
+[[ $window_s =~ ^[0-9]+(\.[0-9]+)?$ ]] && storm_floor=$(lease_floor "${window_s%.*}")
 
 t2_check storm_busy "$(echo "$gw_d" | lg_true - '(d["logins_busy"] or 0) >= 0.1 * '"$victims")" \
   "\"busy\": $(echo "$gw_d" | lg_py - 'd["logins_busy"]'), \"floor\": $((victims / 10)), \"rejects_login_queue\": $(echo "$gw_d" | lg_py - 'd["rejects_login_queue"]'), \"queue_cap\": $qcap"
@@ -343,9 +383,9 @@ pass=false
 [ $dead -eq 0 ] && [ "$back" = true ] && [ "$(echo "$gw_d" | lg_py - 'd["rejects_at_capacity"]')" = 0 ] &&
   pass=$(lg_true "$slo" 'd["population"] == '"$victims"' and d["back"] == d["population"]')
 t2_check storm_back "$pass" "\"kill\": ${reply:-null}, \"back_all\": $back, \"back_s\": $back_s, \"wait_s\": $back_wait, \"backoff\": $(lg_get /stats 'd["backoff_since_mark"]'), \"slo\": $(cat "$slo")"
-t2_check storm_lease "$(echo "{\"g\": $gw_d, \"l\": $logic_d, \"w\": $window_s}" | lg_true - 'd["g"]["lease_error"] == 0 and d["g"]["lease_missing"] == 0 and d["g"]["lease_live"] >= d["w"] // 10 - 1 and d["l"]["lease_error"] == 0')" \
-  "\"window_s\": $window_s, \"gw-0\": {\"live\": $(echo "$gw_d" | lg_py - 'd["lease_live"]'), \"missing\": $(echo "$gw_d" | lg_py - 'd["lease_missing"]'), \"error\": $(echo "$gw_d" | lg_py - 'd["lease_error"]')}, \"logic_lease_error\": $(echo "$logic_d" | lg_py - 'd["lease_error"]')"
-t2_field storm "{\"throughput_per_s\": $T, \"busy_window\": $busy_window, \"victims\": $victims, \"clamped\": $clamped, \"clients\": $clients, \"rate\": $rate, \"queue_cap\": $qcap, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"by_gateway_at_kill\": $by_gateway, \"back_s\": $back_s, \"usage\": $usage, \"logic\": $logic_d, \"gw-0\": $gw_d, \"login_latency\": $(lg_get /stats 'd["login_latency"]'), \"failed\": $(lg_get /stats 'd["failed"]'), \"backoff\": $(lg_get /stats '{"clients": d["backoff_clients"], "waits": d["backoff_waits"]}')}"
+t2_check storm_lease "$(echo "{\"g\": $gw_d, \"l\": $logic_d, \"w\": $window_s}" | lg_true - 'd["g"]["lease_error"] == 0 and d["g"]["lease_missing"] == 0 and d["g"]["lease_live"] >= '"$storm_floor"' and d["l"]["lease_error"] == 0')" \
+  "\"window_s\": $window_s, \"live_floor\": $storm_floor, \"gw-0\": {\"live\": $(echo "$gw_d" | lg_py - 'd["lease_live"]'), \"missing\": $(echo "$gw_d" | lg_py - 'd["lease_missing"]'), \"error\": $(echo "$gw_d" | lg_py - 'd["lease_error"]')}, \"logic_lease_error\": $(echo "$logic_d" | lg_py - 'd["lease_error"]')"
+t2_field storm "{\"throughput_per_s\": $T, \"busy_window\": $busy_window, \"victims\": $victims, \"clamped\": $clamped, \"clients\": $clients, \"rate\": $rate, \"queue_cap\": $qcap, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"by_gateway_at_kill\": $by_gateway, \"back_s\": $back_s, \"usage\": $usage, \"cpu_max\": $(t2_json_str "$storm_cpu_max"), \"cpu_stat\": $(stack_counters_delta "$cs0" "$cs1"), \"logins_other\": $(echo "$logic_d" | lg_py - "$LOGINS_OTHER"), \"logic\": $logic_d, \"gw-0\": $gw_d, \"login_latency\": $(lg_get /stats 'd["login_latency"]'), \"failed\": $(lg_get /stats 'd["failed"]'), \"backoff\": $(lg_get /stats '{"clients": d["backoff_clients"], "waits": d["backoff_waits"]}')}"
 down storm
 t2_duration storm $((SECONDS - t0))
 
