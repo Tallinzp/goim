@@ -256,6 +256,13 @@ NETDROP=/usr/local/sbin/goim-netdrop
 t2_on_exit "sudo -n $NETDROP flush" # b2's DROP rules, whatever stopped the run
 t2_on_exit 'stack_down'
 t2_on_exit 'lg_stop' # newest first: loadgen stops before the stack
+# The storm's background helpers (profiles, socket and goroutine samplers,
+# the sweep watch), with their children, if the run stops inside a storm:
+# started from a non-interactive shell they ignore Ctrl-C's SIGINT, and the
+# goroutine count never ends on its own (6b2b-b2 review I-2).
+storm_helpers=()
+kill_tree() { local c; for c in $(pgrep -P "$1"); do kill_tree "$c"; done; kill "$1" 2>/dev/null; }
+t2_on_exit 'for p in "${storm_helpers[@]}"; do kill_tree "$p"; done'
 
 # The storm's counters (Plan 6b2a): Logic's Kicks, lease renewals, sweeps
 # and relogins onto a dead epoch; each survivor's own lease calls and rejects.
@@ -511,6 +518,7 @@ for name in $PHASES; do
     if [ "$drop_rules" != 4 ]; then
       t2_check "${name}_netdrop" false "\"ports\": [$vport, $((vport + 1))], \"rules_at_kill\": $drop_rules, \"rules_left\": null"
       sudo -n "$NETDROP" flush
+      t2_record_end "$name" # the next phase opens its own window (review I-1)
       lg_stop
       stack_down
       t2_duration "$name" $((SECONDS - t0))
@@ -533,12 +541,14 @@ for name in $PHASES; do
   (sleep "$prof_at"; [ "$prof_at" = 0 ] || stack_usage_start loadgen="$LG_PID"
     stack_profile storm 30 & lg_profile storm 30 & { sleep 30; stack_usage_json >"$STACK_DIR/storm30.json"; }; wait) >/dev/null 2>&1 &
   prof=$!
+  storm_helpers=("$prof")
   # GWLOSS_TAIL_PROFILE_AT: loadgen's CPU in the storm's tail (run 27), if
   # the victims are not back by then; stopped with them.
   tail_at=${GWLOSS_TAIL_PROFILE_AT:-0} tailprof=""
   if [ "$tail_at" -gt 0 ]; then
     (sleep "$tail_at"; lg_profile storm_tail 30) >/dev/null 2>&1 &
     tailprof=$!
+    storm_helpers+=("$tailprof")
   fi
   # GWLOSS_SS_EVERY: socket samples from the kill until the victims are back,
   # on the Logic CPU set (a diagnostic, off by default; run 26).
@@ -546,6 +556,7 @@ for name in $PHASES; do
   if [ "$ss_every" -gt 0 ]; then
     (while :; do ss_sample $((SECONDS - kill_t)); sleep "$ss_every"; done) >"$STACK_DIR/artifacts/ss-storm.jsonl" 2>/dev/null &
     sampler=$!
+    storm_helpers+=("$sampler")
     taskset -a -p -c "$T2_CPUS_LOGIC" "$sampler" >/dev/null 2>&1
   fi
   # The dead epoch's sweep (2 x TTL after its last renewal, then its uids at
@@ -563,12 +574,14 @@ for name in $PHASES; do
     echo "false $((SECONDS - kill_t))"
   ) >"$STACK_DIR/sweep.out" 2>/dev/null &
   sweeping=$!
+  storm_helpers+=("$sweeping")
   # b2: Logic's goroutines every second until the victims are back (R5S-O2),
   # on the Logic CPU set.
   counting=""
   if [ "$name" = b2 ]; then
     (while :; do stack_metric logic go_goroutines; sleep 1; done) >"$STACK_DIR/goroutines.txt" 2>/dev/null &
     counting=$!
+    storm_helpers+=("$counting")
     taskset -a -p -c "$T2_CPUS_LOGIC" "$counting" >/dev/null 2>&1
   fi
   back=$(t2_bool lg_wait_back "$mark" "$back_wait")
@@ -610,6 +623,7 @@ print(json.dumps(out))' "$STACK_DIR/artifacts/ss-storm.jsonl" 2>/dev/null || ech
   wait "$sweeping"
   read -r swept sweep_s <"$STACK_DIR/sweep.out" || { swept=false sweep_s=null; }
   wait "$prof"
+  storm_helpers=() # reaped: their pids may be reused before the exit hook runs
   storm30=$(cat "$STACK_DIR/storm30.json" 2>/dev/null) || storm30=null
   loadgen_bound=true
   usage_ok "$storm30" && loadgen_bound=false
