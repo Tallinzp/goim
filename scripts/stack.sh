@@ -19,6 +19,8 @@
 #   stack_usage_json            # {"window_s", NAME: {"cpu_s", "cores", "rss_mb", "rss_peak_mb"}...} since the start
 #   stack_counters NAME KEY=METRIC[:MATCH]...  # {"KEY": sum, ...} from one scrape of NAME (null: no answer)
 #   stack_counters_delta A B    # {"KEY": B - A, ...} of two stack_counters readings
+#   stack_buckets NAME METRIC   # {"LE": cumulative count, ...} of histogram METRIC on NAME (null: no answer)
+#   stack_hist_quantile A B Q   # Q's bucket bound in ms over two stack_buckets readings (null: no sample)
 #   stack_redis_resetstat       # Redis CONFIG RESETSTAT: a latency window starts
 #   stack_redis_latency         # {"CMD": {"calls", "p50_us", "p99_us", "p999_us"}...} since the reset (null: no answer)
 #   stack_down                  # gateways, then Logic, devtoken, Redis (#78); call it from the exit trap
@@ -438,6 +440,49 @@ if a is None or b is None:
     print("null")
 else:
     print(json.dumps({k: None if v is None else round(v - (a.get(k) or 0), 6) for k, v in b.items()}))' "$1" "$2" 2>/dev/null || echo null
+}
+
+# stack_buckets NAME METRIC: histogram METRIC's cumulative bucket counts on
+# NAME from one scrape, as {"LE": count, ...} with LE as Prometheus writes it
+# ("0.0005", ..., "+Inf"), summed over the other labels (Plan 6b2b: the
+# survivor's Login latency before and during b2's storm). Prints null if
+# NAME does not answer or has no METRIC_bucket sample.
+stack_buckets() {
+  local body
+  body=$(stack_metrics "$1") || { echo null; return; }
+  awk -v m="$2_bucket" '
+    index($1, m "{") == 1 && match($1, /le="[^"]*"/) {
+      le = substr($1, RSTART + 4, RLENGTH - 5)
+      if (!(le in s)) order[++n] = le
+      s[le] += $NF }
+    END { if (!n) { print "null"; exit }
+          out = ""
+          for (i = 1; i <= n; i++) out = out (i > 1 ? ", " : "") "\"" order[i] "\": " sprintf("%.0f", s[order[i]])
+          print "{" out "}" }' <<<"$body"
+}
+
+# stack_hist_quantile A B Q: the upper bound, in ms, of the bucket that
+# holds quantile Q (0-1) of the samples between two stack_buckets readings
+# of the same process (B - A); a bucket's bound, not an interpolation, so a
+# p99 reads as one of the histogram's bounds. Prints null when either
+# reading is null, there is no sample between them, or Q falls in +Inf.
+stack_hist_quantile() {
+  python3 -c 'import json, math, sys
+a, b = (json.loads(x) for x in sys.argv[1:3])
+q = float(sys.argv[3])
+if a is None or b is None:
+    print("null"); sys.exit()
+les = sorted(b, key=lambda le: math.inf if le == "+Inf" else float(le))
+d = {le: b[le] - a.get(le, 0) for le in les}
+total = d.get("+Inf", 0)
+if total <= 0:
+    print("null"); sys.exit()
+rank = math.ceil(q * total)
+for le in les:
+    if d[le] >= rank:
+        ms = None if le == "+Inf" else round(float(le) * 1000, 3)
+        print(json.dumps(int(ms) if ms is not None and ms == int(ms) else ms))
+        break' "$1" "$2" "$3" 2>/dev/null || echo null
 }
 
 # stack_pinned NAME CPUS: the process's affinity is exactly CPUS.

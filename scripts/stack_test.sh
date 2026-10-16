@@ -185,6 +185,17 @@ expect "counters: delta, an absent sample before is 0" \
   "$(stack_counters_delta '{"a": 1, "b": null, "c": 2, "d": 0.5}' '{"a": 4, "b": 3, "c": null, "d": 0.75}')" '{"a": 3, "b": 3, "c": null, "d": 0.25}'
 expect "counters: delta of a failed scrape" "$(stack_counters_delta null '{"a": 1}')" null
 
+# A histogram's quantile is the bound of the bucket that holds it, over the
+# samples between two readings (Plan 6b2b: b2's Login p99).
+h0='{"0.0005": 50, "0.001": 50, "0.002": 50, "+Inf": 50}'
+h1='{"0.0005": 90, "0.001": 99, "0.002": 100, "+Inf": 100}'
+expect "hist: p99's bucket bound in ms" "$(stack_hist_quantile '{}' "$h1" 0.99)" 1
+expect "hist: a sub-ms bound" "$(stack_hist_quantile '{}' "$h1" 0.5)" 0.5
+expect "hist: only the samples between the readings" "$(stack_hist_quantile "$h0" "$h1" 0.99)" 2
+expect "hist: no sample between the readings" "$(stack_hist_quantile "$h1" "$h1" 0.99)" null
+expect "hist: a quantile in +Inf" "$(stack_hist_quantile '{}' '{"0.001": 1, "+Inf": 3}' 0.9)" null
+expect "hist: a failed reading" "$(stack_hist_quantile null "$h1" 0.99)" null
+
 # The phase boundary (P6a2bI-3): idle at once on an idle stack; a socket open
 # on gw-0 keeps it busy, named, until the socket closes.
 stack_wait_idle 5 && ok "idle: an idle stack" || bad "idle: an idle stack"
@@ -206,6 +217,12 @@ STACK_PIN=0 # loadgen's CPU set is the Tier 2 host's
 lg_start t -mode light -clients 4 -rate 100 -uid-prefix st && lg_wait_online 4 20 && ok "loadgen: 4 online" || bad "loadgen: not online"
 STACK_PIN=1
 expect "loadgen: runs with LG_ENV" "$(tr '\0' '\n' <"/proc/$LG_PID/environ" | grep '^GOMEMLIMIT=')" GOMEMLIMIT=1GiB
+# Each login is one sample of a gateway's login_seconds histogram, its
+# buckets in Prometheus's order.
+b0=$(stack_buckets gw-0 goim_gateway_login_seconds) b1=$(stack_buckets gw-1 goim_gateway_login_seconds)
+expect "buckets: one sample per login, in order" "$(python3 -c 'import json,sys; a, b = (json.loads(x) for x in sys.argv[1:3]); print(a["+Inf"] + b["+Inf"], list(a)[0], list(a)[-1])' "$b0" "$b1")" "4 0.0005 +Inf"
+expect "buckets: no such histogram" "$(stack_buckets gw-0 goim_gateway_no_such_seconds)" null
+expect "buckets: no such process" "$(stack_buckets gw-9 goim_gateway_login_seconds)" null
 lat=$(stack_redis_latency)
 expect "redis: latency of the logins' commands" "$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(any(v["calls"] > 0 and v["p99_us"] > 0 for v in d.values()), "info" in d, any(k.startswith("config") for k in d))' "$lat")" "True False False"
 expect "redis: no answer is null" "$(STACK_PORT_BASE=1; stack_redis_latency)" null
