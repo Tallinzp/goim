@@ -731,4 +731,7 @@ Push the branch. Fast-forwarding `main` is the user's call.
 
 ## Execution Notes
 
-(none yet)
+- 2026-10-16, executed inline on `feat/plan6b2b-slow` (from `feat/plan6b2b-b2` at 1ce22ea). Task 1: b6aa84c (both patches applied cleanly; RED as Step 2 expects, 4 failed; GREEN; the `dropped=0` mutation caught by 2 checks). Task 2: 4f91d2c (the scenario as given, 357 lines; Makefile comment).
+- Dry run (dev machine, 5% quota, Step 2's settings, at b6aa84c + the uncommitted scenario): `exit 1`, 17 checks, 15 pass. Failures: `storm_expired` (as F1 expects) and `no_swap_in_storm` (1 page in, the dev machine). `slow_scope` cpu_max `5000 100000`, `logic_gomaxprocs` 2. `calibrate_saturated` T 345/s, Logic 0.050 of 0.05 cores, waste 0. `calibrate_lease` both gateways live 1. `storm_size` 10,350 victims ≥ 9,315, not clamped; cap 1,380 (4T). `storm_busy` 18,184 (floor 1,035). `storm_expired`: expired 545, expired_queued 0, ok 10,350, logic_expired 697; gw-0 `logins_error` 267; login latency p99 5.7s. T' (busy_window) 284/s = 82% of T, Logic at its quota, every storm login `replaced` with a Kick (5,331 in 20s). `storm_back` 47s, backoff 872 clients; `slo.from_mark` p50 18.5s, p99 34.0s, max 46.1s. `storm_lease` gw-0 live 4 in 46.4s, missing 0. No Logout dropped; no process left; `SLOWLOGIC_QUOTA=0%` refused.
+- Whole branch: `make test && make test-race-suite && make test-scripts && make test-load-probe && bash -n scripts/tier2/slowlogic.sh` passed.
+- Next: Task 3, Tier 2 run 29 on the host (the user).
