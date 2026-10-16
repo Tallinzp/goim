@@ -15,6 +15,8 @@ type Metrics struct {
 	Undecodable      *prometheus.CounterVec // op: stored entries that did not decode (PI-3)
 	DeadEpochRelogin prometheus.Histogram   // login_ms (or a refused Kick's Kick() call) − dead epoch's last renewal (R1-O7)
 	StoreSeconds     *prometheus.HistogramVec
+	LoginAge         prometheus.Histogram     // now − recv_ms per entry as its batch goes to the store
+	LoginPrepare     prometheus.Histogram     // a batch's token checks
 	RPCSeconds       *prometheus.HistogramVec // method, code
 	Logouts          *prometheus.CounterVec   // result
 	ConnsAddFailures prometheus.Counter       // Login follow-up SADD gwconns failed
@@ -91,7 +93,10 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		Undecodable:      cv("undecodable_entries_total", "Stored sess values that did not decode, by operation.", "op"),
 		DeadEpochRelogin: h("dead_epoch_relogin_seconds", "Relogin login_ms, or the Kick() call of its first Kick refused while the lease was live, minus the dead epoch's last lease renewal.",
 			prometheus.LinearBuckets(0, 5, 24)),
-		StoreSeconds:     hv("store_seconds", "Session store call latency.", lat, "op"),
+		StoreSeconds: hv("store_seconds", "Session store call latency.", lat, "op"),
+		LoginAge: h("login_age_seconds", "Age of a Login entry (now - recv_ms) when its batch goes to the store: the gateway queue, the RPC and the batch's token checks; EXPIRED past login_deadline.",
+			[]float64{0.1, 0.25, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5, 6, 8}),
+		LoginPrepare:     h("login_prepare_seconds", "A Login batch's token checks, before its store call.", lat),
 		RPCSeconds:       hv("rpc_seconds", "gRPC handler latency.", lat, "method", "code"),
 		Logouts:          cv("logouts_total", "Logout entries by result.", "result"),
 		ConnsAddFailures: c("gwconns_add_failures_total", "Login follow-up SADD to gwconns failed."),

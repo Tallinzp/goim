@@ -143,6 +143,8 @@ func parseFlags(args []string) (gateway.Config, gateway.ServerConfig, tcp.Config
 	fs.IntVar(&cfg.MaxConns, "max-conns", cfg.MaxConns, "connection cap: open sockets in any state")
 	fs.IntVar(&cfg.PendingCap, "pending-cap", cfg.PendingCap, "HANDSHAKE + AUTH_PENDING sockets")
 	fs.IntVar(&cfg.LoginQueueCap, "login-queue-cap", cfg.LoginQueueCap, "Logins waiting for or inside a Login RPC")
+	fs.IntVar(&cfg.LoginRPCs, "login-rpcs", cfg.LoginRPCs, "concurrent Login RPCs to Logic")
+	fs.IntVar(&cfg.LoginBatch, "login-batch", cfg.LoginBatch, "entries per Login RPC")
 	fs.IntVar(&cfg.LogoutQueue, "logout-queue", cfg.LogoutQueue, "Logouts queued or waiting for a retry (default: -max-conns)")
 	fs.DurationVar(&cfg.HandshakeTimeout, "handshake-timeout", cfg.HandshakeTimeout, "accept → handshake done (3s–30s)")
 	fs.DurationVar(&cfg.AuthTimeout, "auth-timeout", cfg.AuthTimeout, "handshake done → LoginReq (3s–30s)")

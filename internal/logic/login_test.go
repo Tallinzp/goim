@@ -402,3 +402,25 @@ func TestLoginFollowUpsOutliveTheStream(t *testing.T) {
 		return len(uids) == 1
 	})
 }
+
+// The age of each entry when its batch reaches the store, and the batch's
+// token checks, are observed (the slowlogic diagnostic, #115 on hold): under
+// a CPU quota they show where a Login's time goes before Redis.
+func TestLoginObservesEntryAgeAndPrepare(t *testing.T) {
+	e := newEnv(t)
+	c := e.dial()
+	a := e.loginEntry(testredis.UID(), 1, "d1", 1)
+	a.RecvMs -= 300
+	b := e.loginEntry(testredis.UID(), 2, "d1", 1)
+	b.RecvMs -= 300
+	e.login(c, a, b)
+	if n := sampleCount(t, e.m.LoginAge); n != 2 {
+		t.Fatalf("login_age_seconds count %d, want 2 (one per entry)", n)
+	}
+	if s := sampleSum(t, e.m.LoginAge); s < 0.6 || s > 2 {
+		t.Fatalf("login_age_seconds sum %.3f, want ~0.6 (two entries ~0.3s old)", s)
+	}
+	if n := sampleCount(t, e.m.LoginPrepare); n != 1 {
+		t.Fatalf("login_prepare_seconds count %d, want 1 (one per batch)", n)
+	}
+}

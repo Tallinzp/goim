@@ -38,6 +38,7 @@ func (s *Service) Login(b *pb.LoginBatch, stream grpc.ServerStreamingServer[pb.L
 	}
 
 	entries := b.GetEntries()
+	prepStart := time.Now()
 	reqs := make([]store.LoginReq, 0, len(entries))
 	idx := make([]int, 0, len(entries))
 	for i, e := range entries {
@@ -51,6 +52,15 @@ func (s *Service) Login(b *pb.LoginBatch, stream grpc.ServerStreamingServer[pb.L
 		}
 		reqs = append(reqs, req)
 		idx = append(idx, i)
+	}
+
+	// Where a Login's time goes before Redis (the slowlogic diagnostic,
+	// #115 on hold): the batch's token checks, then each entry's age from
+	// the gateway's recv_ms as the batch goes to the store.
+	s.m.LoginPrepare.Observe(time.Since(prepStart).Seconds())
+	nowMs := s.now().UnixMilli()
+	for _, r := range reqs {
+		s.m.LoginAge.Observe(float64(nowMs-r.Entry.LoginMs) / 1000)
 	}
 
 	var uids []string

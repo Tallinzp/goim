@@ -288,3 +288,21 @@ func TestRunServesThenDrainsOnSIGTERM(t *testing.T) {
 			logic.ended.Load(), logic.endedLoggedIn.Load(), logic.logouts.Load())
 	}
 }
+
+// The Login RPC window is settable (the slowlogic diagnostic, #115 on hold):
+// LoginRPCs × LoginBatch Logins sit inside Logic at once, ~1s of work for a
+// Logic slowed to 25% of a CPU.
+func TestLoginWindowFlags(t *testing.T) {
+	cfg, _, _, _, err := parseFlags([]string{"-id", "gw-0", "-login-rpcs", "4", "-login-batch", "50"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LoginRPCs != 4 || cfg.LoginBatch != 50 {
+		t.Fatalf("login rpcs %d, batch %d, want 4, 50", cfg.LoginRPCs, cfg.LoginBatch)
+	}
+	for _, args := range [][]string{{"-login-rpcs", "0"}, {"-login-batch", "0"}} {
+		if _, _, _, _, err := parseFlags(append([]string{"-id", "gw-0"}, args...)); err == nil {
+			t.Errorf("%v accepted", args)
+		}
+	}
+}

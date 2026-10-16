@@ -8,14 +8,14 @@
 #       login throughput T is the rate of its ok logins while its CPU sits
 #       at the quota.
 #   storm: each gateway's -login-queue-cap set by the spec's rule for the
-#       gateway that takes the storm, T per gateway x (login_deadline - 3s
-#       margin) = T x 2s, since gw-0 is then alone and Logic serves it at T
-#       (#115: run 29 at T x 4s, 1s margin, and a run at ~T' x 4s both
-#       expired 2.5-3.5%; 2.69T passed);
+#       gateway that takes the storm, T per gateway x (login_deadline - 1s
+#       margin) = T x 4s, since gw-0 is then alone and Logic serves it at T
+#       (#115, on hold: run 29 at 4T expired 3.5%; the diagnostic below
+#       looks for where the rest of the 1s margin goes);
 #       2 x 30T clients ramped at T/2 per second (Logic at half load), then
 #       gw-1 SIGKILLed: its 30T clients come back over the SDK's 0-20s storm
 #       wait, at 1.5T per second, onto gw-0 (#113). Logins beyond Logic's
-#       pace queue up to the cap (a queued Login waits up to 2s at T, the
+#       pace queue up to the cap (a queued Login waits up to 4s at T, the
 #       rule's bound), and the rest are answered Busy: rejected as Busy, not
 #       EXPIRED (R4H-O2). At 30T, Logic needs >= 30s to serve them, so the
 #       30s SLO is recorded, not gated (#113). Busy needs >= ~27T victims
@@ -56,7 +56,12 @@
 #                          the storm is refused (storm_size): lower SLOWLOGIC_QUOTA
 #   SLOWLOGIC_RATE         storm: clients started per second (default T/2)
 #   SLOWLOGIC_QUEUE_CAP    storm: each gateway's -login-queue-cap (default
-#                          T x 2, the spec's rule for the lone survivor, #115)
+#                          T x 4, the spec's rule for the lone survivor; #115
+#                          on hold)
+#   SLOWLOGIC_LOGIN_RPCS   storm: each gateway's -login-rpcs (default: the gateway's,
+#                          16); with SLOWLOGIC_LOGIN_BATCH (-login-batch, 200) the
+#                          Logins inside Logic at once, ~1s of work at 25%
+#                          (the diagnostic for #115)
 #   SLOWLOGIC_BUSY_WINDOW  storm: seconds from the kill over which Logic's own
 #                          pace T' (ok + replaced logins per second) and cores
 #                          are recorded (default 20, the SDK's storm wait)
@@ -134,7 +139,7 @@ systemd-run --user --scope --quiet -p "CPUQuota=$QUOTA" true 2>/dev/null ||
 # (P6b2b-slowI-2, as gwloss's P6b2b-b2I-2).
 for v in SLOWLOGIC_CAL_CLIENTS SLOWLOGIC_CAL_RATE SLOWLOGIC_CAL_QUEUE_CAP SLOWLOGIC_CAL_WINDOW \
   SLOWLOGIC_VICTIMS SLOWLOGIC_MAX_VICTIMS SLOWLOGIC_RATE SLOWLOGIC_QUEUE_CAP \
-  SLOWLOGIC_BUSY_WINDOW SLOWLOGIC_BACK_WAIT; do
+  SLOWLOGIC_BUSY_WINDOW SLOWLOGIC_BACK_WAIT SLOWLOGIC_LOGIN_RPCS SLOWLOGIC_LOGIN_BATCH; do
   case ${!v-1} in ''|*[!0-9]*|0) echo "slowlogic: $v must be a positive whole number" >&2; exit 1 ;; esac
 done
 case ${SLOWLOGIC_CAL_SKIP-0} in ''|*[!0-9]*) echo "slowlogic: SLOWLOGIC_CAL_SKIP must be whole seconds" >&2; exit 1 ;; esac
@@ -164,6 +169,8 @@ LOGIC_COUNTERS=(
   logins_replaced='goim_logic_logins_total:result="replaced"'
   logins_expired='goim_logic_logins_total:result="expired"'
   logins_all='goim_logic_logins_total' # every result: logins_other (P6b2b-slowI-4)
+  prepare_s='goim_logic_login_prepare_seconds_sum' # a batch's token checks (#115 diagnostic)
+  prepare_n='goim_logic_login_prepare_seconds_count'
   lease_error='goim_logic_lease_renewals_total:result="error"'
   kick_attempts='goim_logic_kick_attempts_total'
   kick_dropped='goim_logic_kick_dropped_total'
@@ -182,6 +189,15 @@ lease_floor() {
 # stack_counters_delta of LOGIC_COUNTERS: Logic work that is neither T's nor
 # T''s (P6b2b-slowI-4).
 LOGINS_OTHER='None if d["logins_all"] is None else d["logins_all"] - sum(d[k] or 0 for k in ("logins_ok", "logins_replaced", "logins_expired"))'
+
+# login_age A B: Logic's login_age_seconds between two stack_buckets readings
+# (each entry's age from recv_ms as its batch goes to the store) as {"p50_ms",
+# "p99_ms", "max_ms"}, bucket bounds; with the counters' delta D, the batches'
+# mean token-check time: prepare_ms D (#115 diagnostic).
+login_age() {
+  echo "{\"p50_ms\": $(stack_hist_quantile "$1" "$2" 0.5), \"p99_ms\": $(stack_hist_quantile "$1" "$2" 0.99), \"max_ms\": $(stack_hist_quantile "$1" "$2" 1)}"
+}
+prepare_ms() { echo "$1" | lg_py - 'round(1000 * d["prepare_s"] / d["prepare_n"], 1) if d["prepare_n"] else None'; }
 
 t2_report_extra() {
   local f
@@ -268,11 +284,18 @@ stack_snapshot cal_before
 # and its window_s cover the same span; the gateways first (P6b2b-slowI-3).
 for g in gw-0 gw-1; do g0[$g]=$(stack_counters "$g" "${GW_COUNTERS[@]}"); done
 cs0=$(stack_cpu_stat logic)
+age0=$(stack_buckets logic goim_logic_login_age_seconds)
 l0=$(stack_counters logic "${LOGIC_COUNTERS[@]}")
 stack_usage_start loadgen="$LG_PID"
+# The window's CPU clocks: T depends on them (run 29d; #115 diagnostic).
+t2_clock_sampler "$STACK_DIR/clocks-calibrate.tsv" &
+clk=$!
+t2_on_exit '[ -n "${clk:-}" ] && kill "$clk" 2>/dev/null'
 sleep "$win"
 usage=$(stack_usage_json)
 l1=$(stack_counters logic "${LOGIC_COUNTERS[@]}")
+kill "$clk" 2>/dev/null; wait "$clk" 2>/dev/null; clk=""
+age1=$(stack_buckets logic goim_logic_login_age_seconds)
 cs1=$(stack_cpu_stat logic)
 for g in gw-0 gw-1; do g1[$g]=$(stack_counters "$g" "${GW_COUNTERS[@]}"); done
 stack_snapshot cal_after
@@ -287,7 +310,7 @@ logic_cores=$(echo "$usage" | lg_py - 'd["logic"]["cores"]' 2>/dev/null)
 waste=$(echo "{\"l\": $logic_d, \"g\": $gws_d}" | lg_py - '{"logic_expired": d["l"]["logins_expired"] or 0, "expired_queued": sum(d["g"][g]["logins_expired_queued"] or 0 for g in d["g"]), "error": sum(d["g"][g]["logins_error"] or 0 for g in d["g"])}' 2>/dev/null)
 saturated=$(echo "{\"c\": ${logic_cores:-null}, \"w\": ${waste:-null}, \"l\": $logic_d}" | lg_true - 'd["c"] is not None and d["c"] >= 0.9 * '"$quota_cores"' and d["w"] is not None and sum(d["w"].values()) <= 0.01 * (d["l"]["logins_ok"] or 0)')
 [ -n "$T" ] && [ "$T" -gt 0 ] 2>/dev/null || { T=null saturated=false; }
-t2_check calibrate_saturated "$saturated" "\"throughput_per_s\": $T, \"logic_cores\": ${logic_cores:-null}, \"quota_cores\": $quota_cores, \"waste\": ${waste:-null}, \"waste_max\": $(echo "$logic_d" | lg_py - '0.01 * (d["logins_ok"] or 0)'), \"window_s\": $(echo "$usage" | lg_py - 'd["window_s"]'), \"logins_other\": $(echo "$logic_d" | lg_py - "$LOGINS_OTHER"), \"cpu_stat\": $(stack_counters_delta "$cs0" "$cs1")"
+t2_check calibrate_saturated "$saturated" "\"throughput_per_s\": $T, \"logic_cores\": ${logic_cores:-null}, \"quota_cores\": $quota_cores, \"waste\": ${waste:-null}, \"waste_max\": $(echo "$logic_d" | lg_py - '0.01 * (d["logins_ok"] or 0)'), \"window_s\": $(echo "$usage" | lg_py - 'd["window_s"]'), \"logins_other\": $(echo "$logic_d" | lg_py - "$LOGINS_OTHER"), \"cpu_stat\": $(stack_counters_delta "$cs0" "$cs1"), \"cpu_clocks\": $(t2_clock_summary "$STACK_DIR/clocks-calibrate.tsv"), \"login_age\": $(login_age "$age0" "$age1"), \"prepare_ms\": $(prepare_ms "$logic_d")"
 t2_field calibrate "{\"clients\": $cal_clients, \"rate\": $cal_rate, \"queue_cap\": $cal_cap, \"skip_s\": $skip, \"throughput_per_s\": $T, \"logic_gomaxprocs\": $gomaxprocs, \"usage\": $usage, \"logic\": $logic_d, \"cpu_stat\": $(stack_counters_delta "$cs0" "$cs1"), \"gateways\": $gws_d, \"loadgen_online\": $(lg_get /stats 'd["online"]'), \"failed\": $(lg_get /stats 'd["failed"]')}"
 lease1=$(stack_counters logic "${LOGIC_COUNTERS[@]}") lease_s=$((SECONDS - lease_t))
 for g in gw-0 gw-1; do lg1[$g]=$(stack_counters "$g" "${GW_COUNTERS[@]}"); done
@@ -309,8 +332,8 @@ t0=$SECONDS
 # reaches its floor only from ~27T victims: over the 0-20s storm wait they
 # arrive at V/20 per second against a drain of T, a 4T queue fills after
 # 4T / (V/20 - T) seconds, and first attempts turned away after that come
-# to 20T(V/20T - 1) - 4T >= 0.1V for V >= ~26.7T. The 2T cap (#115) needs
-# only ~24.4T, so 27T keeps the floor for any cap up to 4T.
+# to 20T(V/20T - 1) - 4T >= 0.1V for V >= ~26.7T (a smaller cap needs fewer:
+# 2T ~24.4T).
 max_victims=${SLOWLOGIC_MAX_VICTIMS:-120000} clamped=false
 victims=${SLOWLOGIC_VICTIMS:-$((30 * T))}
 [ -z "${SLOWLOGIC_VICTIMS:-}" ] && [ "$victims" -gt "$max_victims" ] && victims=$max_victims clamped=true
@@ -319,10 +342,11 @@ t2_check storm_size "$(t2_bool [ "$victims" -ge "$need" ])" "\"throughput_per_s\
 [ "$victims" -ge "$need" ] || { t2_check artifacts "$(t2_bool [ -z "$missing" ])" "\"missing\": $(t2_json_str "${missing# }")"; t2_finish; }
 clients=$((2 * victims))
 rate=${SLOWLOGIC_RATE:-$((T / 2))}
-qcap=${SLOWLOGIC_QUEUE_CAP:-$((T * 2))}
+qcap=${SLOWLOGIC_QUEUE_CAP:-$((T * 4))}
 back_wait=${SLOWLOGIC_BACK_WAIT:-600}
 busy_win=${SLOWLOGIC_BUSY_WINDOW:-20}
-STACK_GATEWAY_ARGS=(-max-conns $((clients + clients / 10)) -login-queue-cap "$qcap")
+STACK_GATEWAY_ARGS=(-max-conns $((clients + clients / 10)) -login-queue-cap "$qcap"
+  ${SLOWLOGIC_LOGIN_RPCS:+-login-rpcs "$SLOWLOGIC_LOGIN_RPCS"} ${SLOWLOGIC_LOGIN_BATCH:+-login-batch "$SLOWLOGIC_LOGIN_BATCH"})
 up storm || t2_finish
 lg_start storm -mode sdk -clients "$clients" -rate "$rate" -uid-prefix slow
 online=false
@@ -342,6 +366,7 @@ stack_snapshot before
 s0=$(stack_counters gw-0 "${GW_COUNTERS[@]}")
 storm_cpu_max=$(stack_cpu_max logic)
 cs0=$(stack_cpu_stat logic)
+age0=$(stack_buckets logic goim_logic_login_age_seconds)
 l0=$(stack_counters logic "${LOGIC_COUNTERS[@]}")
 t2_record_start storm
 stack_usage_start loadgen="$LG_PID"
@@ -364,9 +389,10 @@ back_s=$((SECONDS - kill_t))
 lg_get "/slo?mark=death&within=30s" d >"$STACK_DIR/artifacts/slo-death.json"
 wait "$prof" "$busy_pid"
 usage=$(stack_usage_json)
-busy_window=$(lg_py "$STACK_DIR/busy.json" '{"window_s": d["u"]["window_s"], "throughput_per_s": int(((d["d"]["logins_ok"] or 0) + (d["d"]["logins_replaced"] or 0)) / d["u"]["window_s"]), "logic_cores": d["u"]["logic"]["cores"], "logins_other": (lambda d: '"$LOGINS_OTHER"')(d["d"]), "cpu_stat": d["c"], "logic": d["d"]}' 2>/dev/null) || busy_window=null
+busy_window=$(lg_py "$STACK_DIR/busy.json" '{"window_s": d["u"]["window_s"], "throughput_per_s": int(((d["d"]["logins_ok"] or 0) + (d["d"]["logins_replaced"] or 0)) / d["u"]["window_s"]), "logic_cores": d["u"]["logic"]["cores"], "logins_other": (lambda d: '"$LOGINS_OTHER"')(d["d"]), "prepare_ms": round(1000 * d["d"]["prepare_s"] / d["d"]["prepare_n"], 1) if d["d"]["prepare_n"] else None, "cpu_stat": d["c"], "logic": d["d"]}' 2>/dev/null) || busy_window=null
 [ -n "$busy_window" ] || busy_window=null
 l1=$(stack_counters logic "${LOGIC_COUNTERS[@]}")
+age1=$(stack_buckets logic goim_logic_login_age_seconds)
 cs1=$(stack_cpu_stat logic)
 s1=$(stack_counters gw-0 "${GW_COUNTERS[@]}")
 t2_record_end storm
@@ -388,7 +414,7 @@ pass=false
 t2_check storm_back "$pass" "\"kill\": ${reply:-null}, \"back_all\": $back, \"back_s\": $back_s, \"wait_s\": $back_wait, \"backoff\": $(lg_get /stats 'd["backoff_since_mark"]'), \"slo\": $(cat "$slo")"
 t2_check storm_lease "$(echo "{\"g\": $gw_d, \"l\": $logic_d, \"w\": $window_s}" | lg_true - 'd["g"]["lease_error"] == 0 and d["g"]["lease_missing"] == 0 and d["g"]["lease_live"] >= '"$storm_floor"' and d["l"]["lease_error"] == 0')" \
   "\"window_s\": $window_s, \"live_floor\": $storm_floor, \"gw-0\": {\"live\": $(echo "$gw_d" | lg_py - 'd["lease_live"]'), \"missing\": $(echo "$gw_d" | lg_py - 'd["lease_missing"]'), \"error\": $(echo "$gw_d" | lg_py - 'd["lease_error"]')}, \"logic_lease_error\": $(echo "$logic_d" | lg_py - 'd["lease_error"]')"
-t2_field storm "{\"throughput_per_s\": $T, \"busy_window\": $busy_window, \"victims\": $victims, \"clamped\": $clamped, \"clients\": $clients, \"rate\": $rate, \"queue_cap\": $qcap, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"by_gateway_at_kill\": $by_gateway, \"back_s\": $back_s, \"usage\": $usage, \"cpu_max\": $(t2_json_str "$storm_cpu_max"), \"cpu_stat\": $(stack_counters_delta "$cs0" "$cs1"), \"logins_other\": $(echo "$logic_d" | lg_py - "$LOGINS_OTHER"), \"logic\": $logic_d, \"gw-0\": $gw_d, \"login_latency\": $(lg_get /stats 'd["login_latency"]'), \"failed\": $(lg_get /stats 'd["failed"]'), \"backoff\": $(lg_get /stats '{"clients": d["backoff_clients"], "waits": d["backoff_waits"]}')}"
+t2_field storm "{\"throughput_per_s\": $T, \"busy_window\": $busy_window, \"victims\": $victims, \"clamped\": $clamped, \"clients\": $clients, \"rate\": $rate, \"queue_cap\": $qcap, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"by_gateway_at_kill\": $by_gateway, \"back_s\": $back_s, \"usage\": $usage, \"cpu_max\": $(t2_json_str "$storm_cpu_max"), \"cpu_stat\": $(stack_counters_delta "$cs0" "$cs1"), \"logins_other\": $(echo "$logic_d" | lg_py - "$LOGINS_OTHER"), \"login_age\": $(login_age "$age0" "$age1"), \"prepare_ms\": $(prepare_ms "$logic_d"), \"logic\": $logic_d, \"gw-0\": $gw_d, \"login_latency\": $(lg_get /stats 'd["login_latency"]'), \"failed\": $(lg_get /stats 'd["failed"]'), \"backoff\": $(lg_get /stats '{"clients": d["backoff_clients"], "waits": d["backoff_waits"]}')}"
 down storm
 t2_duration storm $((SECONDS - t0))
 
