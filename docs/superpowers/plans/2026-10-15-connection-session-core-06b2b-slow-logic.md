@@ -207,8 +207,8 @@ index 6d2b62d..c0c45c9 100644
      done < <(stack_admins)
      [ -z "$busy" ] && return 0
      if [ $SECONDS -ge $end ]; then
-@@ -485,6 +500,16 @@ for le in les:
-         break' "$1" "$2" "$3" 2>/dev/null || echo null
+@@ -488,6 +503,16 @@ for le in les:
+     print("null") # Q above 1 (P6b2b-b2I-5)' "$1" "$2" "$3" 2>/dev/null || echo null
  }
  
 +# stack_cpu_max NAME: the cpu.max of NAME's cgroup (cgroup v2), e.g.
