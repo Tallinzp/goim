@@ -1,0 +1,671 @@
+# Plan 6b2b-slow: Logic Slowed by a CPU Quota (Tier 2 slowlogic) Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Run the spec's load test "Logic slowed down" on the Tier 2 host with SDK clients. Logic runs under a 25% CPU quota. With each gateway's Login-queue cap sized by the spec's rule from Logic's measured throughput, a relogin storm faster than Logic must be answered `Busy`, not `EXPIRED`. Every client comes back, and the gateways' lease renewals stay on time.
+
+**Architecture:** `stack.sh` can start Logic inside a transient systemd user scope with `CPUQuota=` (`STACK_LOGIC_CPU_QUOTA`), which is cgroup v2 `cpu.max`, the mechanism behind a Kubernetes CPU limit. `stack_cpu_max` reads the quota back. `stack_wait_idle` gains a `dropped-ok` mode, because a slowed Logic may legitimately drop Logouts (roadmap #94, amended). A new scenario, `scripts/tier2/slowlogic.sh`, runs two phases on fresh stacks. **calibrate** offers far more logins than Logic can serve, behind a small queue cap (1,000 per gateway, so no queued Login expires), and measures Logic's saturated throughput T. **storm** sets `-login-queue-cap` = T/2 × 4s per gateway, ramps 2 × 30T SDK clients at T/2 per second, then SIGKILLs `gw-1`, so 30T relogins arrive at ~1.5T/s on `gw-0` (#113). No Go change.
+
+**Tech Stack:** bash 5.2, `systemd-run --user --scope` (systemd 255 on the host; the user manager delegates `cpu memory pids`), the pinned `redis-server` 7.4.11, curl, python3 (reads JSON only).
+
+**Spec:** `docs/superpowers/specs/2026-10-03-connection-session-core-design-rev6.md`. Used here: *Verification → Load tests* ("Logic slowed down: the Login-queue cap triggers `Busy` and clients retry within the SLO; with the queue cap sized by the rule above, logins are rejected as `Busy`, not `EXPIRED` (`expired` stays near zero) *(R4H-O2)*"); *Gateway → Admission control* ("Login-queue cap … **Sizing** *(R4H-O2)*: `login_queue_cap ≤ measured Logic login throughput per gateway × (login_deadline − margin)`"; `Busy{retry_after}` 1–3s); *Failure handling* ("Logic saturated *(R1-O2)*: Lease RPCs keep their own connection and worker pool, so renewals continue. The gateway's Login-queue cap replies `Busy` (1–3s)."); *Client SDK rules* (`Busy`, `EXPIRED` and `KEY_UNKNOWN` retried after 1–3s, 5 in a row, then exponential backoff). Inputs: roadmap #94 and its amendments (quota, not `taskset`; 25%; calibration; dropped Logouts recorded), P5bI-2 (slow Logic by CPU, not by the `login` fault), P6b2a-stressI-2.
+
+**Decisions (2026-10-15, the user, with this plan):** #113 (the load is a kill storm sized from the calibration; the 30s SLO is recorded, not gated) and #114 (6b2b split; this is its second plan). **Proposed with this plan, for review (#113):** a host that cannot set a quota is refused, instead of #94's `taskset` fallback.
+
+**Branch:** `feat/plan6b2b-slow`, from the head of `feat/plan6b2b-b2` once 6b2b-b2 is executed. This plan's patches apply on top of 6b2b-b2's (`stack.sh` changes from both). Execute 6b2b-b2 first.
+
+**Size:** 3 tasks. The prototype (a scratch worktree with 6b2b-b2 applied) ran every block. Task 1 is given as `git apply` patches and Task 2 as a whole new file. A dry run at a 5% quota on the dev machine exercised calibration, the sized cap and real `Busy` (Task 2, Step 2).
+
+## Global Constraints
+
+- Go 1.27.1. No Go change in this plan.
+- `make test`, `make test-race-suite` and `make test-scripts` stay green on the dev machine (2 cores / 2GB; its user manager also delegates `cpu`, so the quota tests run there; elsewhere they print `skip quota: …`).
+- Scripts: bash with `set -uo pipefail`; JSON written without jq; python3 only reads JSON and does arithmetic; mawk-compatible awk.
+- Ports (#76): `STACK_PORT_BASE` 17000 on Tier 2, 17500 in `stack_test.sh`.
+- CPU sets (#71): gateways `4-9,16-21` (2 gateways, 6 `GOMAXPROCS` each), Logic + Redis `10,11,22,23`, loadgen `0-3,12-15`. The quota applies to Logic alone, on top of its CPU set. Redis is not slowed.
+- Spec numbers: `login_deadline` 5s (margin 1s, so the rule's factor is 4s); `Busy{retry_after}` 1–3s; the SDK hands a client to exponential backoff (cap 5 min) after 5 retryable rejects in a row; the SDK waits a uniform 0–20s after losing an established connection; lease renewal every 10s, TTL 30s, call timeout 5s.
+- Run 18 measured Logic at 0.41 cores for 5,000 logins/s (~0.08 cores per 1,000/s), so 25% should sustain ~3,000 logins/s. The calibration replaces this estimate with a measurement.
+- Swap during a measured window fails it (#70).
+- Comments and names match the surrounding code; new behaviour cites its choice number (#113) or the spec's id.
+
+## Review Focus
+
+1. **The lease under the quota.** Lease RPCs have their own connection and worker pool, but share Logic's CPU quota. CFS can throttle the whole cgroup for up to 75ms of every 100ms period while Login work saturates it. Expected: every renewal still completes well inside the gateway's 5s lease timeout, so `gw-0` never sees `missing` or `error` and renews once per 10s through the storm. Pinned by `storm_lease`. If it fails, compare Logic's storm CPU profile (`storm/artifacts/storm/logic.cpu.pb.gz`) and `cpu.stat`'s `nr_throttled`. That would be a finding against R1-O2's "renewals continue", not a harness bug.
+2. **A calibration that did not saturate Logic, or saturated it with waste.** If the offered load is too low (or loadgen is the bound), T measures the offered load. If queued logins expire, Logic's CPU partly goes to logins that do not count, and T comes out low (the prototype's first version, ~30% low). Either way the storm's cap and size come out wrong. Expected: `calibrate_saturated` requires Logic's CPU in the window ≥ 0.9 × the quota. When it fails, the storm phase does not run, so no misleading storm is reported. Calibration's `expired`, `expired_queued` and `error` are recorded in the `calibrate` field and are 0 behind the 1,000 cap. Pinned by `calibrate_saturated`, and by the scenario's early `t2_finish` (dry run: a calibration at 600/s on a 5% quota saturates; the code path for a failed one is the `[ "$saturated" = true ] ||` line).
+3. **Logic's GOMAXPROCS under a quota.** Go ≥ 1.25 derives GOMAXPROCS from the cgroup's CPU limit, rounded up with a floor of 2. Logic's CPU set has 4 CPUs, so it should be 2, not 4. Expected: recorded in `slow_scope.logic_gomaxprocs` (from `go_sched_gomaxprocs_threads`, which the prototype found exported), not gated. With 4 instead, Logic would burst into throttling more often, which shows as worse login latency at the same T.
+4. **The end of each phase under a slowed Logic.** 2 × 30T sessions log out when loadgen stops, through the same quota, and a gateway's Logout queue may drop some (the spec allows it; Reconcile repairs them). Expected: `stack_wait_idle 900 dropped-ok` settles, and the dropped count is recorded per gateway in `<phase>_idle.logouts`. A dropped Logout fails b1, b2 and b_stress (`stack_wait_idle` without `dropped-ok`), never this scenario. Pinned by `idle: dropped-ok …` in `stack_test.sh` (Task 1).
+5. **Clients handed to exponential backoff by Busy.** A victim answered `Busy` five times in a row backs off exponentially (up to 5 min). Expected: every victim is back within 600s (`storm_back`). The share that reached backoff is recorded (`storm_back.backoff`, the storm field's `backoff`), with the from-kill SLO distribution, which may miss 30s by design (#113). If `storm_back` fails, look at `slo.missing` and `backoff.waits` before raising `SLOWLOGIC_BACK_WAIT`.
+
+## Implementation choices this plan makes
+
+1. **#113: a kill storm sized from a calibration; the 30s SLO recorded, not gated** (decided). Busy needs relogins arriving faster than T. A backlog drained at T for ~25s, plus Busy retries and the backoff after 5 in a row, sits right at 30s, so a gated SLO would be fragile either way. At 30T victims over the SDK's 0–20s storm wait, arrivals are ~1.5T/s. `gw-0`'s queue (2T) fills ~4s in and Busy follows. A queued Login waits at most 2T / T = 2s, well inside the 5s deadline, so `EXPIRED` should be near zero. Gates: Busy > 0; EXPIRED (Logic's `expired` and the gateway queue's `expired_queued`, both on `gw-0`'s `logins_total`) ≤ 0.1% of its ok logins; every victim back within 600s; no reject at capacity; no missed lease renewal.
+2. **The calibration measures T as Logic's ok logins per second** over a 10s window, 5s after loadgen starts offering 8,000/s (120k SDK clients over 15s), behind a 1,000 Login-queue cap per gateway (`SLOWLOGIC_CAL_QUEUE_CAP`). The cap is under 1s of Logic's pace per gateway, so no queued Login waits out its deadline, the excess is answered `Busy` at the gateway, and Logic's CPU goes only to logins that count. The prototype first calibrated at the default cap of 8,192. There Logic spent CPU on logins that came back `EXPIRED`, and gateway entries timed out. T came out ~30% low (165–244/s against 338–346/s at a 5% quota), and the storm's arrivals at 1.5 × T barely outran Logic: in one run 25 Busy instead of ~20,000.
+3. **`slowlogic` is its own scenario**, not a `gwloss` phase. It needs a calibration phase whose result sizes the next one, and none of `gwloss`'s sweep, precompute, socket-sampler or Kick gates. About 295 lines, against `gwloss.sh`'s ~740 after 6b2b-b2.
+4. **`STACK_LOGIC_CPU_QUOTA` wraps Logic in `systemd-run --user --scope --quiet -p CPUQuota=…`.** `--scope` moves systemd-run itself into a new scope and execs the command. Logic keeps the PID `stack_start` recorded, its process group (from `setsid`) and its CPU affinity (from `taskset`, which execs `systemd-run`). Checked in the prototype: `/proc/PID/comm` is `logic`, its cgroup is `…/app.slice/run-….scope`, `cpu.max` is `50000 100000` for 50%.
+5. **No `taskset` fallback** (proposed, #113). #94 kept `taskset` to one CPU as a fallback for a host without cpu delegation. The Tier 2 host has the delegation, and the fallback would test a different slowdown: fewer CPUs, not a throttled quota. A host that cannot set a quota is refused (exit 2) with the file to check.
+6. **`stack_wait_idle SECONDS dropped-ok`:** a dropped Logout counts as settled (done + dropped ≥ logins), and the error names both counts (`logouts done 3 + dropped 1 of 5 logins`). Without the argument nothing changes.
+
+## File Structure
+
+- Modify `scripts/stack.sh`: `STACK_LOGIC_CPU_QUOTA`, `stack_cpu_max NAME`, `stack_wait_idle SECONDS [dropped-ok]` (Task 1).
+- Modify `scripts/stack_test.sh`: their tests (Task 1).
+- Create `scripts/tier2/slowlogic.sh`; modify `Makefile` (the scenario list in `test-tier2`'s comment) (Task 2).
+- Modify `README.md` (both languages), the roadmap, this plan's *Execution Notes* (Task 3).
+
+---
+
+### Task 1: Logic under a CPU quota, and dropped Logouts as settled
+
+**Files:**
+- Modify: `scripts/stack.sh`
+- Test: `scripts/stack_test.sh`
+
+**Interfaces:**
+- Consumes: `stack_start NAME CPUS CMD...` (taskset when pinned, setsid, records the PID); `stack_metrics`, `stack_metric_in`, `stack_admins`.
+- Produces: `STACK_LOGIC_CPU_QUOTA` (e.g. `25%`; empty: no quota), read by `stack_up`; `stack_cpu_max NAME` prints the `cpu.max` line of NAME's cgroup (`"25000 100000"`), or `null`; `stack_wait_idle SECONDS [dropped-ok]`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Apply (on top of 6b2b-b2's `scripts/stack_test.sh`; `git apply --check` first):
+
+```diff
+diff --git a/scripts/stack_test.sh b/scripts/stack_test.sh
+index 3e5d5e6..f04d0b3 100755
+--- a/scripts/stack_test.sh
++++ b/scripts/stack_test.sh
+@@ -75,6 +75,11 @@ fi
+   out=$(stack_wait_idle 10 2>&1) && bad "idle: a dropped Logout must fail" || ok "idle: a dropped Logout fails"
+   [ $((SECONDS - start)) -lt 3 ] && ok "idle: a dropped Logout fails at once" || bad "idle: a dropped Logout waited $((SECONDS - start))s"
+   case $out in *"dropped 1"*) ok "idle: names the dropped Logout" ;; *) bad "idle: dropped not named: [$out]" ;; esac
++  # dropped-ok (Plan 6b2b-slow): a dropped Logout counts as settled.
++  stack_wait_idle 2 dropped-ok && ok "idle: dropped-ok settles done + dropped" || bad "idle: dropped-ok, done 4 + dropped 1 of 5"
++  fake 'goim_gateway_logins_total{result="ok"} 5' 'goim_gateway_logouts_total{result="done"} 3' 'goim_gateway_logouts_total{result="dropped"} 1'
++  out=$(stack_wait_idle 1 dropped-ok 2>&1) && bad "idle: dropped-ok, a Logout short must keep it busy" || ok "idle: dropped-ok, a Logout short keeps it busy"
++  case $out in *"logouts done 3 + dropped 1 of 5 logins"*) ok "idle: dropped-ok names done and dropped" ;; *) bad "idle: dropped-ok not named: [$out]" ;; esac
+   # A gateway that does not answer is busy, never idle.
+   kill $srv; wait $srv 2>/dev/null
+   out=$(stack_wait_idle 1 2>&1) && bad "idle: a silent gateway must keep it busy" || ok "idle: a silent gateway keeps it busy"
+@@ -280,12 +285,25 @@ for name in gw-0 gw-1; do
+ done
+ 
+ # STACK_GATEWAY_PROCS overrides the share (one gateway alone would get every CPU).
+-STACK_GATEWAYS=1 STACK_GATEWAY_PROCS=1
++# STACK_LOGIC_CPU_QUOTA runs Logic under a CPU quota (Plan 6b2b-slow), where
++# a systemd user manager delegates the cpu controller.
++quota=""
++systemd-run --user --scope --quiet -p CPUQuota=50% true 2>/dev/null && quota=50%
++STACK_GATEWAYS=1 STACK_GATEWAY_PROCS=1 STACK_LOGIC_CPU_QUOTA=$quota
+ if stack_up; then
+   grep -q " loops=1 " "$STACK_DIR/logs/gw-0.log" && ok "procs: STACK_GATEWAY_PROCS=1 runs 1 loop" || bad "procs: override: $(grep -o ' loops=[0-9]* ' "$STACK_DIR/logs/gw-0.log")"
++  if [ -n "$quota" ]; then
++    expect "quota: Logic's cpu.max" "$(stack_cpu_max logic)" "50000 100000"
++    expect "quota: the PID is Logic's" "$(cat "/proc/${STACK_PIDS[logic]}/comm")" logic
++    stack_pinned logic "$T2_CPUS_LOGIC" && ok "quota: Logic still pinned" || bad "quota: Logic not pinned"
++  else
++    echo "skip quota: no systemd user manager delegating the cpu controller"
++  fi
+ else
+   bad "up: second stack"
+ fi
++STACK_LOGIC_CPU_QUOTA=
++expect "quota: no such process" "$(stack_cpu_max gw-9)" null
+ # A gateway that dies during the run is reported, and stays reported after the stop.
+ kill -KILL "${STACK_PIDS[gw-0]}"
+ sleep 0.2
+```
+
+- [ ] **Step 2: Run them to see them fail**
+
+Run: `make test-scripts 2>&1 | grep -E 'FAIL|stack_test:'`
+Expected, with `stack_test: 4 failed` as the last line:
+
+```
+FAIL idle: dropped-ok, done 4 + dropped 1 of 5
+FAIL idle: dropped-ok not named: [stack: gw-0 dropped 1 Logouts: they never settle (logouts done 3 of 5 logins, dropped 1)]
+FAIL quota: Logic's cpu.max: got [], want [50000 100000]
+FAIL quota: no such process: got [], want [null]
+```
+
+Without the mode, a dropped Logout fails at once. `stack_cpu_max: command not found` appears on stderr. `quota: the PID is Logic's` and `quota: Logic still pinned` already pass, since Logic starts without the quota. They pin that the wrapper keeps both.
+
+- [ ] **Step 3: Implement**
+
+Apply:
+
+```diff
+diff --git a/scripts/stack.sh b/scripts/stack.sh
+index 6d2b62d..c0c45c9 100644
+--- a/scripts/stack.sh
++++ b/scripts/stack.sh
+@@ -13,8 +13,10 @@
+ #   stack_expect_dead NAME [SECONDS]  # NAME was killed on purpose (loadgen /kill): reap and record it
+ #   stack_metric NAME METRIC [MATCH]  # sum of METRIC's samples (with MATCH in the line) on NAME's /metrics
+ #   stack_metrics NAME          # NAME's /metrics once; stack_metric_in BODY METRIC [MATCH] reads it
+-#   stack_wait_idle SECONDS     # phase boundary: every gateway at 0 connections, 0 awaiting Logout,
+-#                               #   its Logouts settled (one done per login, none dropped)
++#   stack_wait_idle SECONDS [dropped-ok]  # phase boundary: every gateway at 0 connections, 0 awaiting
++#                               #   Logout, its Logouts settled (one done per login, none dropped;
++#                               #   dropped-ok: a dropped Logout counts as settled)
++#   stack_cpu_max NAME          # NAME's cgroup cpu.max, e.g. "25000 100000" (null: unreadable)
+ #   stack_usage_start [N=PID..] # start a CPU window over the stack's processes (and N=PID extras)
+ #   stack_usage_json            # {"window_s", NAME: {"cpu_s", "cores", "rss_mb", "rss_peak_mb"}...} since the start
+ #   stack_counters NAME KEY=METRIC[:MATCH]...  # {"KEY": sum, ...} from one scrape of NAME (null: no answer)
+@@ -38,6 +40,9 @@
+ #   STACK_GATEWAY_PROCS  each gateway's GOMAXPROCS (default: max(1, CPUs / STACK_GATEWAYS),
+ #                        CPUs = T2_CPUS_GATEWAY when pinned, else all online; #79)
+ #   STACK_GATEWAY_ARGS, STACK_LOGIC_ARGS   arrays of extra flags
++#   STACK_LOGIC_CPU_QUOTA  e.g. 25%: Logic runs in a transient systemd user scope with
++#                        that CPUQuota (cgroup cpu.max, as a Kubernetes CPU limit; Plan
++#                        6b2b-slow); needs the user manager to delegate the cpu controller
+ #   STACK_GATEWAY_ENV    array of VAR=VALUE for every gateway, e.g. (GOGC=off GOMEMLIMIT=4GiB) (#88)
+ #   STACK_DRAIN_WINDOW   gateway -drain-window (default 1s, so stack_down's drain ends and
+ #                        exits 0 well inside STACK_DOWN_WAIT; a measured drain sets 60s)
+@@ -185,7 +190,13 @@ stack_up() {
+   fi
+   stack_start devtoken "$logic_cpus" "$bin/devtoken" serve -addr "$devtoken" -jwks "$STACK_DIR/keys/jwks.json"
+   stack_wait devtoken "http://$devtoken/" || return 1
+-  stack_start logic "$logic_cpus" "$bin/logic" -redis "$redis_addr" -redis-cluster=false \
++  # A CPU quota (Plan 6b2b-slow): systemd-run --scope moves itself into a
++  # new scope and execs Logic, so the PID, the process group and the
++  # affinity stay as stack_start set them.
++  local logic=("$bin/logic")
++  [ -n "${STACK_LOGIC_CPU_QUOTA:-}" ] &&
++    logic=(systemd-run --user --scope --quiet -p "CPUQuota=$STACK_LOGIC_CPU_QUOTA" -- "$bin/logic")
++  stack_start logic "$logic_cpus" "${logic[@]}" -redis "$redis_addr" -redis-cluster=false \
+     -grpc-addr "$grpc" -lease-addr "$lease" -admin-addr "$admin" \
+     -jwks-url "http://$devtoken/" -jwks-fallback "$STACK_DIR/keys/jwks.json" \
+     -kick-addr-file "$STACK_DIR/kick.json" "${STACK_LOGIC_ARGS[@]}"
+@@ -328,9 +339,12 @@ stack_metric_in() {
+ # answer counts as busy. Only running gateways count: a killed one's
+ # sessions end by EpochEnded, not Logouts, and it is gone from stack_admins
+ # (stack_expect_dead). Fails, naming what is left, after SECONDS, or at once
+-# on a dropped Logout, which never settles.
++# on a dropped Logout, which never settles. With dropped-ok, a dropped
++# Logout counts as settled instead (done + dropped >= logins): a slowed
++# Logic may fill a gateway's Logout queue, which the spec allows, Reconcile
++# repairing the session (R1-O3, R3-O1; roadmap #94, P6b2a-stressI-2).
+ stack_wait_idle() {
+-  local end=$((SECONDS + $1)) name admin busy body c a ldone logins dropped
++  local end=$((SECONDS + $1)) ok=${2:-} name admin busy body c a ldone logins dropped
+   while :; do
+     busy=""
+     while read -r name admin; do
+@@ -344,12 +358,13 @@ stack_wait_idle() {
+       [ "$ldone" = null ] && ldone=0
+       [ "$logins" = null ] && logins=0
+       [ "$dropped" = null ] && dropped=0
+-      if [ "$dropped" != 0 ]; then
++      if [ "$dropped" != 0 ] && [ "$ok" != dropped-ok ]; then
+         echo "stack: $name dropped $dropped Logouts: they never settle (logouts done $ldone of $logins logins, dropped $dropped)" >&2
+         return 1
+       fi
+-      [ "$c" = 0 ] && [ "$a" = 0 ] && [ "$ldone" -ge "$logins" ] ||
+-        busy+=" $name: connections $c, awaiting_logout $a, logouts done $ldone of $logins logins;"
++      [ "$ok" = dropped-ok ] || dropped=0
++      [ "$c" = 0 ] && [ "$a" = 0 ] && [ $((ldone + dropped)) -ge "$logins" ] ||
++        busy+=" $name: connections $c, awaiting_logout $a, logouts done $ldone$([ "$dropped" = 0 ] || echo " + dropped $dropped") of $logins logins;"
+     done < <(stack_admins)
+     [ -z "$busy" ] && return 0
+     if [ $SECONDS -ge $end ]; then
+@@ -485,6 +500,16 @@ for le in les:
+         break' "$1" "$2" "$3" 2>/dev/null || echo null
+ }
+ 
++# stack_cpu_max NAME: the cpu.max of NAME's cgroup (cgroup v2), e.g.
++# "25000 100000" for a 25% quota, "max 100000" for none; null if NAME is
++# not running or its cgroup has no cpu.max (the cpu controller is not
++# enabled there).
++stack_cpu_max() {
++  local pid=${STACK_PIDS[$1]:-} path
++  path=$(awk -F: '$1 == "0" { print $3 }' "/proc/$pid/cgroup" 2>/dev/null)
++  [ -n "$pid" ] && [ -n "$path" ] && cat "/sys/fs/cgroup$path/cpu.max" 2>/dev/null || echo null
++}
++
+ # stack_pinned NAME CPUS: the process's affinity is exactly CPUS.
+ stack_pinned() {
+   local have
+```
+
+- [ ] **Step 4: Run the tests**
+
+Run: `make test-scripts 2>&1 | grep -E 'FAIL|skip|quota|dropped-ok|stack_test:'`
+Expected (dev machine, which delegates `cpu`):
+
+```
+ok   idle: dropped-ok settles done + dropped
+ok   idle: dropped-ok, a Logout short keeps it busy
+ok   idle: dropped-ok names done and dropped
+ok   quota: Logic's cpu.max
+ok   quota: the PID is Logic's
+ok   quota: Logic still pinned
+ok   quota: no such process
+stack_test: all passed
+```
+
+On a machine without a systemd user manager, the three Logic quota lines are replaced by `skip quota: no systemd user manager delegating the cpu controller`.
+
+Check that a broken rule is caught: in `stack_wait_idle`, change `[ "$ok" = dropped-ok ] || dropped=0` to `dropped=0`. Expected: `FAIL idle: dropped-ok, done 4 + dropped 1 of 5` and `FAIL idle: dropped-ok not named: …`. Revert.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add scripts/stack.sh scripts/stack_test.sh
+git commit -m "feat(stack): Logic under a CPU quota (STACK_LOGIC_CPU_QUOTA, stack_cpu_max); stack_wait_idle dropped-ok (6b2b-slow, #94)"
+```
+
+---
+
+### Task 2: the `slowlogic` scenario (#113)
+
+**Files:**
+- Create: `scripts/tier2/slowlogic.sh` (mode 0755)
+- Modify: `Makefile` (comment of `test-tier2`)
+
+**Interfaces:**
+- Consumes: Task 1 (`STACK_LOGIC_CPU_QUOTA`, `stack_cpu_max`, `stack_wait_idle … dropped-ok`); `stack_up`, `stack_counters`, `stack_counters_delta`, `stack_usage_start`/`_json`, `stack_snapshot`, `stack_profile`, `stack_expect_dead`, `stack_pinned`, `stack_health`; loadgen `lg_start`, `lg_wait_online`, `lg_wait_back`, `lg_get`, `lg_post /kill`, `lg_profile`, `lg_stop`; `lib.sh`'s `t2_*`. Gateway metrics: `goim_gateway_logins_total{result="ok|busy|expired|expired_queued|error"}`, `goim_gateway_admission_rejects_total{reason="at_capacity|login_queue"}`, `goim_gateway_lease_calls_total{result}`; Logic's `goim_logic_logins_total{result}`, `goim_logic_lease_renewals_total{result}`, `go_sched_gomaxprocs_threads`.
+- Produces: `GOIM_TEST_TIER=2 make test-tier2 SCENARIO=slowlogic`; result fields `calibrate` (`throughput_per_s` = T) and `storm`; 15 checks on a full run.
+
+- [ ] **Step 1: Create the scenario**
+
+`scripts/tier2/slowlogic.sh`:
+
+```bash
+#!/usr/bin/env bash
+# Tier 2: slowlogic (Plan 6b2b-slow), the spec's load test "Logic slowed
+# down" (P5bI-2) with SDK clients: Logic runs under a CPU quota (cgroup
+# cpu.max through a systemd user scope, as a Kubernetes CPU limit; roadmap
+# #94, amended), on two gateways, each phase on a fresh stack:
+#   calibrate: SDK clients offered well above Logic's capacity, behind a
+#       small Login-queue cap, so no queued Login expires; Logic's saturated
+#       login throughput T is the rate of its ok logins while its CPU sits
+#       at the quota.
+#   storm: each gateway's -login-queue-cap set by the spec's rule,
+#       T per gateway x (login_deadline - 1s margin) = T/2 x 4s; 2 x 30T
+#       clients ramped at T/2 per second (Logic at half load), then gw-1
+#       SIGKILLed: its 30T clients come back over the SDK's 0-20s storm
+#       wait, at 1.5T per second, onto gw-0 (#113). Logins beyond Logic's
+#       pace queue up to the cap, and the rest are answered Busy: rejected
+#       as Busy, not EXPIRED (R4H-O2). At 30T, Logic needs >= 30s to
+#       serve them, so the 30s SLO is recorded, not gated (#113).
+# Logic is one process (minReplicas, no HPA).
+#
+# Usage (on the Tier 2 host, from the repo root), after the one-time
+#   sudo scripts/tier2/host-setup.sh, with the desktop apps closed:
+#   GOIM_TEST_TIER=2 make test-tier2 SCENARIO=slowlogic
+#   Results: tier2-results/slowlogic-<timestamp>/ (result.json, one directory
+#   per phase with logs, artifacts and loadgen results), plus ONE file to
+#   send back: tier2-results/slowlogic-<timestamp>.report.txt
+#   Exit code: 0 if every check passes, 1 if any check fails, 2 if the host is refused.
+#   About 15 minutes (at T ~3,000/s).
+#
+# Settings:
+#   SLOWLOGIC_QUOTA        Logic's CPUQuota (default 25%: ~3,000 logins/s from run
+#                          18's 0.41 cores at 5,000/s; roadmap #94, amended)
+#   SLOWLOGIC_CAL_CLIENTS  calibrate: SDK clients (default 120000)
+#   SLOWLOGIC_CAL_RATE     calibrate: clients started per second (default 8000,
+#                          above Logic's ~3,000/s at 25%)
+#   SLOWLOGIC_CAL_QUEUE_CAP calibrate: each gateway's -login-queue-cap (default
+#                          1000: under 1s of Logic's pace per gateway at ~1,500/s,
+#                          so no Login waits out its deadline and Logic spends no
+#                          CPU on logins that come back EXPIRED; enough to keep
+#                          its 64 workers busy). The default 8,192 made T ~30%
+#                          low in the prototype, and the storm's Busy marginal
+#   SLOWLOGIC_CAL_SKIP     calibrate: seconds from loadgen's start to the window
+#                          (default 5: the Login queues fill first)
+#   SLOWLOGIC_CAL_WINDOW   calibrate: the measured window, seconds (default 10)
+#   SLOWLOGIC_VICTIMS      storm: clients on each gateway (default 30 x T)
+#   SLOWLOGIC_RATE         storm: clients started per second (default T/2)
+#   SLOWLOGIC_QUEUE_CAP    storm: each gateway's -login-queue-cap (default
+#                          T/2 x 4, the spec's rule)
+#   SLOWLOGIC_BACK_WAIT    storm: seconds after the kill to wait for every victim
+#                          (default 600: Busy 5 times in a row hands a client to
+#                          the SDK's exponential backoff, capped at 5 min)
+#
+# Checks:
+#   calibrate_stack     redis, devtoken, Logic and both gateways become Ready
+#   slow_scope          Logic runs under the quota (its cgroup's cpu.max) and
+#                       on its CPU set (once, in calibrate); Logic's GOMAXPROCS
+#                       is recorded (Go derives it from the quota)
+#   calibrate_saturated Logic's CPU in the window was at least 0.9 x the
+#                       quota, so T is Logic's pace, not the offered load's
+#   calibrate_idle      after loadgen stops, every gateway reaches 0
+#                       connections and settles its Logouts; dropped Logouts
+#                       count as settled and are recorded (roadmap #94)
+#   calibrate_processes nothing died, panicked or stopped uncleanly
+#   storm_stack         as calibrate_stack, with the queue cap set
+#   storm_online        every client logs in, each gateway holds 45-55%
+#   storm_busy          gw-0 answered Busy at its Login-queue cap in the storm
+#   storm_expired       gw-0's EXPIRED logins in the storm (Logic's and the
+#                       queue's, expired_queued) are at most 0.1% of its ok
+#                       logins: Busy, not EXPIRED (R4H-O2)
+#   storm_back          every victim logs in again within SLOWLOGIC_BACK_WAIT,
+#                       and gw-0 rejected none at capacity; the 30s SLO from
+#                       the kill is recorded (#113)
+#   storm_lease         gw-0 renews its lease every interval through the
+#                       storm (own connection and worker pool, same quota,
+#                       R1-O2), and Logic saw no renewal error
+#   no_swap_in_storm    no page swapped in from the kill to the last victim (#70)
+#   storm_idle          as calibrate_idle
+#   storm_processes     as calibrate_processes
+#   artifacts           metrics before and after each window, the storm's CPU
+#                       profiles, the SLO and loadgen's results
+set -uo pipefail
+
+. "$(dirname "$0")/lib.sh"
+. "$(dirname "$0")/../stack.sh"
+. "$(dirname "$0")/../loadgen.sh"
+t2_init slowlogic
+t2_need curl taskset sudo python3 systemd-run
+t2_require_host_setup
+
+QUOTA=${SLOWLOGIC_QUOTA:-25%}
+case $QUOTA in
+  [1-9]% | [1-9][0-9]% | 100%) ;;
+  *) echo "slowlogic: SLOWLOGIC_QUOTA must be 1%-100%, got '$QUOTA'" >&2; exit 1 ;;
+esac
+# The quota needs the user manager to delegate the cpu controller (the Tier 2
+# host's does: user@UID.service/cgroup.controllers lists cpu).
+systemd-run --user --scope --quiet -p "CPUQuota=$QUOTA" true 2>/dev/null ||
+  t2_refuse "refused: systemd-run --user --scope cannot set CPUQuota=$QUOTA (does /sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers list cpu?)"
+t2_mem_budget 10
+t2_nofile 1048576
+
+export STACK_PIN=1 STACK_GATEWAYS=2 STACK_LOGIC_CPU_QUOTA=$QUOTA
+STACK_PORT_BASE=${STACK_PORT_BASE:-17000}
+STACK_REDIS_SERVER=$PWD/.cache/redis/bin/redis-server
+t2_on_exit 'stack_down'
+t2_on_exit 'lg_stop' # newest first: loadgen stops before the stack
+
+GW_COUNTERS=(
+  logins_ok='goim_gateway_logins_total:result="ok"'
+  logins_busy='goim_gateway_logins_total:result="busy"'
+  logins_expired='goim_gateway_logins_total:result="expired"'
+  logins_expired_queued='goim_gateway_logins_total:result="expired_queued"'
+  logins_error='goim_gateway_logins_total:result="error"'
+  rejects_at_capacity='goim_gateway_admission_rejects_total:reason="at_capacity"'
+  rejects_login_queue='goim_gateway_admission_rejects_total:reason="login_queue"'
+  lease_live='goim_gateway_lease_calls_total:result="live"'
+  lease_missing='goim_gateway_lease_calls_total:result="missing"'
+  lease_error='goim_gateway_lease_calls_total:result="error"'
+)
+LOGIC_COUNTERS=(
+  logins_ok='goim_logic_logins_total:result="ok"'
+  logins_replaced='goim_logic_logins_total:result="replaced"'
+  logins_expired='goim_logic_logins_total:result="expired"'
+  lease_error='goim_logic_lease_renewals_total:result="error"'
+)
+
+t2_report_extra() {
+  local f
+  for f in "$T2_OUT"/*/logs/*.log; do
+    [ -f "$f" ] || continue
+    t2_section "${f#"$T2_OUT"/} (last 20 lines)"
+    tail -n 20 "$f"
+  done
+}
+
+# up NAME: a fresh stack in $T2_OUT/NAME; checks NAME_stack.
+up() {
+  export STACK_DIR=$T2_OUT/$1
+  mkdir -p "$STACK_DIR"
+  ln -sfn ../bin "$STACK_DIR/bin"
+  local busy
+  busy=$(stack_busy_ports)
+  [ -z "$busy" ] || t2_refuse "$(printf 'refused: the stack ports are in use (a leftover stack?):\n%s\nstop whatever holds them first' "$busy")"
+  stack_up 2>"$STACK_DIR/stack-up.err"
+  local rc=$?
+  t2_check "${1}_stack" "$(t2_bool [ $rc -eq 0 ])" "\"gateways\": $STACK_GATEWAYS, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"error\": $(t2_json_str "$(cat "$STACK_DIR/stack-up.err")")"
+  return $rc
+}
+
+# down NAME: loadgen stopped, the gateways idle (dropped Logouts settled and
+# recorded), the stack stopped; checks NAME_idle and NAME_processes.
+down() {
+  lg_stop
+  local t=$SECONDS idle stop_s logouts="" g body problems
+  idle=$(t2_bool stack_wait_idle 900 dropped-ok 2>"$STACK_DIR/idle.err")
+  stop_s=$((SECONDS - t))
+  for g in $(stack_admins | awk '$1 ~ /^gw-/ { print $1 }'); do
+    body=$(stack_metrics "$g") || body=""
+    logouts+="${logouts:+, }\"$g\": {\"done\": $(stack_metric_in "$body" goim_gateway_logouts_total 'result="done"'), \"dropped\": $(stack_metric_in "$body" goim_gateway_logouts_total 'result="dropped"'), \"logins_ok\": $(stack_metric_in "$body" goim_gateway_logins_total 'result="ok"')}"
+  done
+  t2_check "${1}_idle" "$idle" "\"stop_s\": $stop_s, \"logouts\": {$logouts}, \"error\": $(t2_json_str "$(cat "$STACK_DIR/idle.err")")"
+  stack_down
+  problems=$(stack_health)
+  t2_check "${1}_processes" "$(t2_bool [ -z "$problems" ])" "\"problems\": $(t2_json_str "$problems")"
+}
+
+t=$SECONDS
+if ! make redis-server >"$T2_OUT/redis-build.log" 2>&1; then
+  echo "make redis-server failed, see $T2_OUT/redis-build.log" >&2
+  exit 1
+fi
+STACK_DIR=$T2_OUT stack_build >"$T2_OUT/build.log" 2>&1 || { echo "build failed, see $T2_OUT/build.log" >&2; exit 1; }
+t2_duration setup $((SECONDS - t))
+quota_cores=$(python3 -c 'import sys; print(int(sys.argv[1].rstrip("%")) / 100)' "$QUOTA")
+missing=""
+
+# Calibrate: Logic's saturated login throughput at the quota. A small queue
+# cap keeps every queued Login inside its deadline: the excess is answered
+# Busy at the gateway, and Logic's CPU goes only to logins that count.
+t0=$SECONDS
+cal_clients=${SLOWLOGIC_CAL_CLIENTS:-120000} cal_rate=${SLOWLOGIC_CAL_RATE:-8000}
+cal_cap=${SLOWLOGIC_CAL_QUEUE_CAP:-1000}
+skip=${SLOWLOGIC_CAL_SKIP:-5} win=${SLOWLOGIC_CAL_WINDOW:-10}
+STACK_GATEWAY_ARGS=(-max-conns $((cal_clients + 10000)) -login-queue-cap "$cal_cap")
+up calibrate || t2_finish
+cpu_max=$(stack_cpu_max logic)
+want_max="$(python3 -c 'import sys; print(round(float(sys.argv[1]) * 100000))' "$quota_cores") 100000"
+gomaxprocs=$(stack_metric logic go_sched_gomaxprocs_threads)
+wrong=""
+for g in gw-0 gw-1; do stack_pinned "$g" "$T2_CPUS_GATEWAY" || wrong+=" $g"; done
+for n in logic redis; do stack_pinned "$n" "$T2_CPUS_LOGIC" || wrong+=" $n"; done
+scope=false
+[ "$cpu_max" = "$want_max" ] && [ -z "$wrong" ] && scope=true
+t2_check slow_scope "$scope" \
+  "\"quota\": $(t2_json_str "$QUOTA"), \"cpu_max\": $(t2_json_str "$cpu_max"), \"want\": $(t2_json_str "$want_max"), \"logic_gomaxprocs\": $gomaxprocs, \"wrong_pinning\": $(t2_json_str "${wrong# }")"
+lg_start calibrate -mode sdk -clients "$cal_clients" -rate "$cal_rate" -uid-prefix cal
+sleep "$skip"
+stack_snapshot cal_before
+l0=$(stack_counters logic "${LOGIC_COUNTERS[@]}")
+declare -A g0=() g1=()
+for g in gw-0 gw-1; do g0[$g]=$(stack_counters "$g" "${GW_COUNTERS[@]}"); done
+stack_usage_start loadgen="$LG_PID"
+sleep "$win"
+usage=$(stack_usage_json)
+l1=$(stack_counters logic "${LOGIC_COUNTERS[@]}")
+for g in gw-0 gw-1; do g1[$g]=$(stack_counters "$g" "${GW_COUNTERS[@]}"); done
+stack_snapshot cal_after
+logic_d=$(stack_counters_delta "$l0" "$l1")
+gws_d="{\"gw-0\": $(stack_counters_delta "${g0[gw-0]}" "${g1[gw-0]}"), \"gw-1\": $(stack_counters_delta "${g0[gw-1]}" "${g1[gw-1]}")}"
+# T: Logic's ok logins per second over the window, whole.
+T=$(echo "{\"l\": $logic_d, \"u\": $usage}" | lg_py - 'int(d["l"]["logins_ok"] / d["u"]["window_s"])' 2>/dev/null)
+logic_cores=$(echo "$usage" | lg_py - 'd["logic"]["cores"]' 2>/dev/null)
+saturated=$(echo "{\"c\": ${logic_cores:-null}}" | lg_true - 'd["c"] is not None and d["c"] >= 0.9 * '"$quota_cores")
+[ -n "$T" ] && [ "$T" -gt 0 ] 2>/dev/null || { T=null saturated=false; }
+t2_check calibrate_saturated "$saturated" "\"throughput_per_s\": $T, \"logic_cores\": ${logic_cores:-null}, \"quota_cores\": $quota_cores, \"window_s\": $(echo "$usage" | lg_py - 'd["window_s"]')"
+t2_field calibrate "{\"clients\": $cal_clients, \"rate\": $cal_rate, \"queue_cap\": $cal_cap, \"skip_s\": $skip, \"throughput_per_s\": $T, \"logic_gomaxprocs\": $gomaxprocs, \"usage\": $usage, \"logic\": $logic_d, \"gateways\": $gws_d, \"loadgen_online\": $(lg_get /stats 'd["online"]'), \"failed\": $(lg_get /stats 'd["failed"]')}"
+down calibrate
+t2_duration calibrate $((SECONDS - t0))
+for f in cal_before/logic cal_after/logic; do
+  grep -q '^# TYPE' "$T2_OUT/calibrate/artifacts/$f.metrics" 2>/dev/null || missing+=" calibrate/$f.metrics"
+done
+[ "$saturated" = true ] || { t2_check artifacts "$(t2_bool [ -z "$missing" ])" "\"missing\": $(t2_json_str "${missing# }")"; t2_finish; }
+
+# The storm, sized from T (#113).
+t0=$SECONDS
+victims=${SLOWLOGIC_VICTIMS:-$((30 * T))}
+clients=$((2 * victims))
+rate=${SLOWLOGIC_RATE:-$((T / 2))}
+qcap=${SLOWLOGIC_QUEUE_CAP:-$((T / 2 * 4))}
+back_wait=${SLOWLOGIC_BACK_WAIT:-600}
+STACK_GATEWAY_ARGS=(-max-conns $((clients + clients / 10)) -login-queue-cap "$qcap")
+up storm || t2_finish
+lg_start storm -mode sdk -clients "$clients" -rate "$rate" -uid-prefix slow
+online=false
+lg_wait_online "$clients" $((clients / rate * 3 + 60)) &&
+  online=$(lg_get /stats 'd["online"] == '"$clients"' and min(d["online_by_gateway"].get(g, 0) for g in ("gw-0", "gw-1")) >= '"$clients"' * 0.45')
+[ "$online" = true ] || online=false
+by_gateway=$(lg_get /stats 'd["online_by_gateway"]')
+ramp_gw=$(stack_counters gw-0 "${GW_COUNTERS[@]}")
+t2_check storm_online "$online" "\"want\": $clients, \"by_gateway\": $by_gateway, \"rate\": $rate, \"failed\": $(lg_get /stats 'd["failed"]'), \"gw0_ramp\": $ramp_gw"
+if [ "$online" != true ]; then
+  down storm
+  t2_duration storm $((SECONDS - t0))
+  t2_finish
+fi
+
+stack_snapshot before
+l0=$(stack_counters logic "${LOGIC_COUNTERS[@]}")
+s0=$(stack_counters gw-0 "${GW_COUNTERS[@]}")
+t2_record_start storm
+stack_usage_start loadgen="$LG_PID"
+reply=$(lg_post "/kill?gateway=gw-1&pid=${STACK_PIDS[gw-1]}&mark=death" | lg_py - d)
+kill_t=$SECONDS
+stack_expect_dead gw-1 60
+dead=$?
+(stack_profile storm 30 & lg_profile storm 30 & wait) >/dev/null 2>&1 &
+prof=$!
+back=$(t2_bool lg_wait_back death "$back_wait")
+back_s=$((SECONDS - kill_t))
+lg_get "/slo?mark=death&within=30s" d >"$STACK_DIR/artifacts/slo-death.json"
+wait "$prof"
+usage=$(stack_usage_json)
+l1=$(stack_counters logic "${LOGIC_COUNTERS[@]}")
+s1=$(stack_counters gw-0 "${GW_COUNTERS[@]}")
+t2_record_end storm
+stack_snapshot after
+logic_d=$(stack_counters_delta "$l0" "$l1")
+gw_d=$(stack_counters_delta "$s0" "$s1")
+window_s=$(echo "$usage" | lg_py - 'd["window_s"]')
+slo=$STACK_DIR/artifacts/slo-death.json
+
+t2_check storm_busy "$(echo "$gw_d" | lg_true - '(d["logins_busy"] or 0) > 0')" \
+  "\"busy\": $(echo "$gw_d" | lg_py - 'd["logins_busy"]'), \"rejects_login_queue\": $(echo "$gw_d" | lg_py - 'd["rejects_login_queue"]'), \"queue_cap\": $qcap"
+t2_check storm_expired "$(echo "$gw_d" | lg_true - '(d["logins_expired"] or 0) + (d["logins_expired_queued"] or 0) <= 0.001 * d["logins_ok"]')" \
+  "\"expired\": $(echo "$gw_d" | lg_py - 'd["logins_expired"]'), \"expired_queued\": $(echo "$gw_d" | lg_py - 'd["logins_expired_queued"]'), \"ok\": $(echo "$gw_d" | lg_py - 'd["logins_ok"]'), \"logic_expired\": $(echo "$logic_d" | lg_py - 'd["logins_expired"]')"
+pass=false
+[ $dead -eq 0 ] && [ "$back" = true ] && [ "$(echo "$gw_d" | lg_py - 'd["rejects_at_capacity"]')" = 0 ] &&
+  pass=$(lg_true "$slo" 'd["population"] == '"$victims"' and d["back"] == d["population"]')
+t2_check storm_back "$pass" "\"kill\": ${reply:-null}, \"back_all\": $back, \"back_s\": $back_s, \"wait_s\": $back_wait, \"backoff\": $(lg_get /stats 'd["backoff_since_mark"]'), \"slo\": $(cat "$slo")"
+t2_check storm_lease "$(echo "{\"g\": $gw_d, \"l\": $logic_d, \"w\": $window_s}" | lg_true - 'd["g"]["lease_error"] == 0 and d["g"]["lease_missing"] == 0 and d["g"]["lease_live"] >= d["w"] // 10 - 1 and d["l"]["lease_error"] == 0')" \
+  "\"window_s\": $window_s, \"gw-0\": {\"live\": $(echo "$gw_d" | lg_py - 'd["lease_live"]'), \"missing\": $(echo "$gw_d" | lg_py - 'd["lease_missing"]'), \"error\": $(echo "$gw_d" | lg_py - 'd["lease_error"]')}, \"logic_lease_error\": $(echo "$logic_d" | lg_py - 'd["lease_error"]')"
+t2_field storm "{\"throughput_per_s\": $T, \"victims\": $victims, \"clients\": $clients, \"rate\": $rate, \"queue_cap\": $qcap, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"by_gateway_at_kill\": $by_gateway, \"back_s\": $back_s, \"usage\": $usage, \"logic\": $logic_d, \"gw-0\": $gw_d, \"login_latency\": $(lg_get /stats 'd["login_latency"]'), \"failed\": $(lg_get /stats 'd["failed"]'), \"backoff\": $(lg_get /stats '{"clients": d["backoff_clients"], "waits": d["backoff_waits"]}')}"
+down storm
+t2_duration storm $((SECONDS - t0))
+
+a=$T2_OUT/storm/artifacts
+for f in before/logic before/gw-0 after/logic after/gw-0; do
+  grep -q '^# TYPE' "$a/$f.metrics" 2>/dev/null || missing+=" storm/$f.metrics"
+done
+for f in logic gw-0 loadgen; do gzip -t "$a/storm/$f.cpu.pb.gz" 2>/dev/null || missing+=" storm/$f.cpu"; done
+[ "$(lg_true "$a/slo-death.json" '"population" in d')" = true ] || missing+=" storm/slo-death.json"
+[ "$(lg_true "$a/loadgen-storm.json" '"mode" in d')" = true ] || missing+=" storm/loadgen-storm.json"
+t2_check artifacts "$(t2_bool [ -z "$missing" ])" "\"missing\": $(t2_json_str "${missing# }")"
+
+t2_not_covered "Logic scaled out under load (HPA from minReplicas): one Logic process here (Tier 3, Plan 6d)" \
+  "a slowed Redis, or Logic slowed by something other than CPU (Redis Cluster failover in Plan 6c)" \
+  "the 30s SLO under a slowed Logic: recorded, not gated (#113)"
+t2_finish
+```
+
+Then `chmod +x scripts/tier2/slowlogic.sh` and apply:
+
+```diff
+diff --git a/Makefile b/Makefile
+index f3be91d..a4a55e8 100644
+--- a/Makefile
++++ b/Makefile
+@@ -71,7 +71,7 @@ test-redis:
+ 
+ # Tier 2 scenario entry point (spec: automation contract). The caller sets
+ # GOIM_TEST_TIER (P5bI-5), e.g. GOIM_TEST_TIER=2 make test-tier2 SCENARIO=race;
+-# scenarios: store, race, foundation, smoke, capacity, gwloss, probe (read-only, no guard).
++# scenarios: store, race, foundation, smoke, capacity, gwloss, slowlogic, probe (read-only, no guard).
+ # The script's exit code is 0 (pass), 1 (a check failed or the run stopped
+ # early) or 2 (host refused); make exits 2 on any failure, so the recipe
+ # prints the script's code. Automation that needs it runs the script directly.
+```
+
+Run: `bash -n scripts/tier2/slowlogic.sh && echo ok`
+Expected: `ok`.
+
+- [ ] **Step 2: Dry run on the dev machine**
+
+The guard refuses the dev machine, so the script is checked in a throwaway copy, as `gwloss` is: the guard lowered, the root parts removed, the scale cut. The dev machine delegates `cpu`, so the quota is real here. A 5% quota makes T small enough for this machine and lets Busy really happen.
+
+```bash
+D=$(mktemp -d); cp scripts/tier2/slowlogic.sh "$D/slowlogic.sh"
+sed -i 's|^t2_require_host_setup$|:|; s|^t2_mem_budget 10$|t2_mem_budget 0|; s|^t2_need curl taskset sudo python3 systemd-run$|t2_need curl taskset python3 systemd-run|' "$D/slowlogic.sh"
+sed -i 's|"$(dirname "$0")/lib.sh"|scripts/tier2/lib.sh; T2_MIN_CORES=1 T2_MIN_MEM_GB=1|; s|"$(dirname "$0")/../|scripts/|; s|\.sh"$|.sh|' "$D/slowlogic.sh"
+R=$PWD/.cache/redis/bin/redis-server
+sed -i "s|^STACK_REDIS_SERVER=.*|STACK_REDIS_SERVER=$R|; s|^if ! make redis-server |if ! true |" "$D/slowlogic.sh"
+grep -n '^\. \|^:$\|t2_mem_budget\|STACK_REDIS_SERVER=\|if ! true\|t2_need' "$D/slowlogic.sh"
+GOIM_TEST_TIER=2 T2_CPUS_GATEWAY=0-1 T2_CPUS_LOGIC=0-1 T2_CPUS_LOADGEN=0-1 \
+  SLOWLOGIC_QUOTA=5% SLOWLOGIC_CAL_CLIENTS=6000 SLOWLOGIC_CAL_RATE=600 SLOWLOGIC_CAL_QUEUE_CAP=100 bash "$D/slowlogic.sh"; echo "exit $?"
+```
+
+The `grep` must show three `. ` lines naming `scripts/`, a `:` line, `t2_mem_budget 0`, the redis path, `if ! true`, and `t2_need` without sudo.
+
+Expected (prototype, ~4 min): `exit 1`. `result.json` parses and has 15 checks. All pass except possibly `no_swap_in_storm` from the dev machine's own swapping (the prototype saw 3 pages in, in every run). Values from two prototype runs:
+- `slow_scope`: `cpu_max` `"5000 100000"` = `want`, `logic_gomaxprocs` 2, `wrong_pinning` `""`.
+- `calibrate_saturated`: `throughput_per_s` 346 and 338, `logic_cores` ≈ 0.048 of `quota_cores` 0.05, `window_s` 10. In the `calibrate` field: Logic `logins_expired` 0; gateways `logins_busy` 3,400–4,900 each, `logins_expired`, `logins_expired_queued` and `logins_error` 0.
+- `storm_stack`: `gateway_args` `"-max-conns … -login-queue-cap 692"` (T/2 × 4 = 173 × 4); `storm_online`: 2 × 30T ≈ 20,000 clients at T/2 ≈ 170/s, half per gateway, `gw0_ramp.logins_busy` 0.
+- `storm_busy`: `busy` ≈ 20,400 = `rejects_login_queue`; `storm_expired`: `expired` 0, `expired_queued` 0, `ok` = the victims (≈ 10,200), `logic_expired` 0.
+- `storm_back`: `back_all` true, `back_s` ≈ 50, `backoff` ≈ `{"clients": 1050, "waits": {"backoff": 1700}}` (~10% of the victims), `slo.from_mark` p50 ≈ 16.5s, p99 ≈ 37s, max ≈ 50s: over 30s, as #113 expects at 30T.
+- `storm_lease`: gw-0 `live` ≥ `window_s` / 10 − 1, `missing` 0, `error` 0.
+- `calibrate_idle` and `storm_idle`: `stop_s` a few seconds, no Logout dropped at this scale.
+
+`calibrate/artifacts/` holds `cal_before/` and `cal_after/`; `storm/artifacts/` holds `before/`, `after/`, `storm/{logic,gw-0,loadgen}.cpu.pb.gz` (the dead gw-1 is no longer profiled), `slo-death.json` and `loadgen-storm.json`. No process is left (`pgrep -f "$PWD/tier2-results/slowlogic" || echo none`). A bad quota is refused before anything starts: `GOIM_TEST_TIER=2 SLOWLOGIC_QUOTA=0% bash "$D/slowlogic.sh"` prints `slowlogic: SLOWLOGIC_QUOTA must be 1%-100%, got '0%'` and exits 1. Afterwards, remove `tier2-results/slowlogic-*` and `$D`.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add scripts/tier2/slowlogic.sh Makefile
+git commit -m "feat(tier2): slowlogic, Logic under a CPU quota: calibrated queue cap, Busy not EXPIRED in a kill storm (#113)"
+```
+
+- [ ] **Step 4: Verify the whole branch**
+
+Run: `make test && make test-race-suite && make test-scripts && make test-load-probe && bash -n scripts/tier2/slowlogic.sh`
+Expected: all pass. Record the commits and the dry run in this plan's *Execution Notes* and push the branch.
+
+---
+
+### Task 3: Tier 2 run 29 and the record
+
+**Files:**
+- Modify: this plan's *Execution Notes*, the roadmap (plan 6 row; #113), `README.md` (both languages)
+
+- [ ] **Step 1: Tier 2 run 29 (on the host, ~15 min)**
+
+On the Tier 2 host, after `git fetch && git switch feat/plan6b2b-slow`, with the desktop apps closed, the user runs `GOIM_TEST_TIER=2 make test-tier2 SCENARIO=slowlogic` and sends back the `.report.txt`. Expected: 15/15 (`calibrate_stack`, `slow_scope`, `calibrate_saturated`, `calibrate_idle`, `calibrate_processes`, `storm_stack`, `storm_online`, `storm_busy`, `storm_expired`, `storm_back`, `storm_lease`, `no_swap_in_storm`, `storm_idle`, `storm_processes`, `artifacts`).
+
+What to read, for the *Execution Notes*, the roadmap and the README:
+- **Calibration:** T (`calibrate.throughput_per_s`; ~3,000/s expected), Logic's cores in the window against the 0.25 quota, `slow_scope.logic_gomaxprocs` (expect 2), and the calibration's `busy` (large) against `expired`, `expired_queued` and `error` (all 0 behind the small cap: if not, lower `SLOWLOGIC_CAL_QUEUE_CAP`, since wasted Logic work makes T low).
+- **Storm:** `storm.queue_cap`, `victims`, `rate`; `storm_busy.busy`; `storm_expired` (expired, expired_queued, ok); `storm_back.back_s`, `slo.from_mark` p50/p99/max (the recorded SLO), `backoff`; `storm_lease`; Logic's and gw-0's cores (`storm.usage`); `storm_idle.logouts` (dropped Logouts at the end).
+- If a check fails: `calibrate_saturated` → `logic_cores` against the quota, and loadgen's `failed` (pre-handshake closes at 8,000/s), then raise `SLOWLOGIC_CAL_RATE` (or `SLOWLOGIC_CAL_QUEUE_CAP`, if Logic ran out of queued work); `storm_busy` false → arrivals did not outrun Logic (T underestimated: compare Logic's cores in the storm with the quota); `storm_expired` → the queue cap against T (lower `SLOWLOGIC_QUEUE_CAP`), and whether the EXPIRED come from Logic (`logic_expired`) or the gateway queue; `storm_lease` → Review Focus 1; `storm_back` → Review Focus 5.
+
+- [ ] **Step 2: Record**
+
+- This plan's *Execution Notes*: the run's numbers above, with the commit hash and `dirty` from `result.json`.
+- Roadmap: #113 gets one line with run 29's result. The plan 6 row: "6b2b-slow executed, run 29 …; 6b2b complete; next 6b3 (fresh session)".
+- README *Measured results*, both languages, a row after the b2 row: **Logic slowed to a 25% CPU quota**: its measured login throughput T, the queue cap from the spec's rule, Busy count against EXPIRED (≈ 0), every client back in N s (p99 from the kill, no SLO gate), lease renewals missed (0). In the status paragraph, move "slowed Logic" from *Next* to *Done*.
+
+```bash
+git add README.md docs/superpowers/plans/2026-10-07-connection-session-core-00-roadmap.md docs/superpowers/plans/2026-10-15-connection-session-core-06b2b-slow-logic.md
+git commit -m "docs: Tier 2 run 29, Logic slowed to a CPU quota recorded; README row"
+```
+
+Push the branch. Fast-forwarding `main` is the user's call.
+
+---
+
+## After this plan
+
+- **6b2b complete.** Next: Plan 6b3 (population events: whole-population reconnect, floods), in a fresh session.
+- **Spec:** nothing new. The calibration and the 30T sizing are how one host tests R4H-O2's rule; the spec's wording stands.
+
+## Execution Notes
+
+(none yet)
