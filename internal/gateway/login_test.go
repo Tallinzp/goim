@@ -7,6 +7,8 @@ import (
 
 	"github.com/Tallinzp/goim/api/clientpb"
 	pb "github.com/Tallinzp/goim/api/internalpb"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"google.golang.org/grpc"
 )
 
@@ -173,4 +175,34 @@ func TestQueuedLoginPastTheDeadlineIsDroppedBeforeSending(t *testing.T) {
 	if l.tracked(late) || l.g.loginQueued.Load() != 0 {
 		t.Fatal("a dropped Login needs no Logout and frees its queue slot")
 	}
+}
+
+// An entry's wait is split at its RPC's send (the slowlogic tail diagnostic,
+// #115 on hold): the gateway queue, then inside Logic until its reply.
+func TestLoginObservesQueueAndLogicWait(t *testing.T) {
+	l := newLive(t, nil)
+	l.logic.set(func() {
+		l.logic.login = func(b *pb.LoginBatch, s grpc.ServerStreamingServer[pb.LoginResult]) error {
+			l.clock.jump(300 * time.Millisecond) // Logic takes 0.3s
+			return s.Send(okResult(0, b.Entries[0]))
+		}
+	})
+	l.loginLive(t, 0, "u1")
+	if n := histCount(t, l.g.m.LoginQueueSeconds); n != 1 {
+		t.Fatalf("login_queue_wait_seconds count %d, want 1", n)
+	}
+	if s := histSum(t, l.g.m.LoginLogicSeconds); s < 0.3 || s > 1 {
+		t.Fatalf("login_logic_wait_seconds sum %.3f, want ~0.3", s)
+	}
+}
+
+func histCount(t *testing.T, h prometheus.Histogram) uint64 { return histDTO(t, h).GetSampleCount() }
+func histSum(t *testing.T, h prometheus.Histogram) float64  { return histDTO(t, h).GetSampleSum() }
+func histDTO(t *testing.T, h prometheus.Histogram) *dto.Histogram {
+	t.Helper()
+	var m dto.Metric
+	if err := h.Write(&m); err != nil {
+		t.Fatal(err)
+	}
+	return m.GetHistogram()
 }

@@ -229,12 +229,19 @@ func (g *Gateway) sendLogins(ctx context.Context, logic pb.LogicClient, items []
 	if len(live) == 0 {
 		return
 	}
+	for _, it := range live {
+		g.m.LoginQueueSeconds.Observe(float64(nowMs-it.entry.RecvMs) / 1000)
+	}
+	var sentMs int64
 	resolved := make([]bool, len(live))
 	left := len(live)
 	resolve := func(i int, r loginReply) {
 		if !resolved[i] {
 			resolved[i] = true
 			left--
+			if r.outcome != loginUnknown {
+				g.m.LoginLogicSeconds.Observe(float64(g.now().UnixMilli()-sentMs) / 1000)
+			}
 			g.loginFinished()
 			g.post(live[i], r)
 		}
@@ -250,6 +257,7 @@ func (g *Gateway) sendLogins(ctx context.Context, logic pb.LogicClient, items []
 	}
 	cctx, cancel := g.rpcCtx(ctx, until(latest))
 	defer cancel()
+	sentMs = g.now().UnixMilli()
 	stream, err := logic.Login(cctx, &pb.LoginBatch{Gw: g.ref, Entries: entries})
 	if err != nil {
 		return

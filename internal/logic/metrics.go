@@ -95,7 +95,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			prometheus.LinearBuckets(0, 5, 24)),
 		StoreSeconds: hv("store_seconds", "Session store call latency.", lat, "op"),
 		LoginAge: h("login_age_seconds", "Age of a Login entry (now - recv_ms) when its batch goes to the store: the gateway queue, the RPC and the batch's token checks; EXPIRED past login_deadline.",
-			[]float64{0.1, 0.25, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5, 6, 8}),
+			prometheus.LinearBuckets(0.25, 0.25, 28)), // 0.25s … 7s
 		LoginPrepare:     h("login_prepare_seconds", "A Login batch's token checks, before its store call.", lat),
 		RPCSeconds:       hv("rpc_seconds", "gRPC handler latency.", lat, "method", "code"),
 		Logouts:          cv("logouts_total", "Logout entries by result.", "result"),

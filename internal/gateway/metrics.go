@@ -28,10 +28,14 @@ type Metrics struct {
 	Rejects        *prometheus.CounterVec // reason
 	Closes         *prometheus.CounterVec // reason: client | heartbeat | kick | not_owner | logout | protocol | drain
 
-	Logins         *prometheus.CounterVec // result
-	LoginQueue     prometheus.Gauge       // Logins waiting for or inside a Login RPC
-	LoginSeconds   prometheus.Histogram   // LoginResp sent − recv_ms
-	ReloginSeconds *prometheus.HistogramVec
+	Logins       *prometheus.CounterVec // result
+	LoginQueue   prometheus.Gauge       // Logins waiting for or inside a Login RPC
+	LoginSeconds prometheus.Histogram   // LoginResp sent − recv_ms
+	// The slowlogic tail diagnostic (#115 on hold): an entry's wait split at
+	// the Login RPC's send.
+	LoginQueueSeconds prometheus.Histogram // send − recv_ms, per entry sent
+	LoginLogicSeconds prometheus.Histogram // definitive reply − send, per entry
+	ReloginSeconds    *prometheus.HistogramVec
 
 	Logouts *prometheus.CounterVec // result: done | retried | dropped
 	Kicks   *prometheus.CounterVec // result: closed | pending | ignored
@@ -97,6 +101,10 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		Logins:       cv("logins_total", "Logins by result, as the client sees it.", "result"),
 		LoginQueue:   g("login_queue", "Logins waiting for or inside a Login RPC."),
 		LoginSeconds: h("login_seconds", "LoginResp sent minus recv_ms.", lat),
+		LoginQueueSeconds: h("login_queue_wait_seconds", "A Login entry's wait in the gateway: its RPC's send minus recv_ms.",
+			prometheus.LinearBuckets(0.25, 0.25, 28)),
+		LoginLogicSeconds: h("login_logic_wait_seconds", "A Login entry's wait inside its RPC: the definitive reply minus the send.",
+			prometheus.LinearBuckets(0.25, 0.25, 28)),
 		ReloginSeconds: hv("relogin_seconds", "offline_ms + (login OK − recv_ms).",
 			prometheus.LinearBuckets(0, 2.5, 25), "reconnect_reason"),
 

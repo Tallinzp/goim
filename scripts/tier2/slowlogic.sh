@@ -116,7 +116,8 @@
 #   storm_idle          as calibrate_idle
 #   storm_processes     as calibrate_processes
 #   artifacts           metrics before and after each window, the storm's CPU
-#                       profiles, the SLO and loadgen's results
+#                       profiles, the SLO, loadgen's results and gw-0's Login
+#                       series (logins-gw-0.tsv)
 set -uo pipefail
 
 . "$(dirname "$0")/lib.sh"
@@ -190,12 +191,54 @@ lease_floor() {
 # T''s (P6b2b-slowI-4).
 LOGINS_OTHER='None if d["logins_all"] is None else d["logins_all"] - sum(d[k] or 0 for k in ("logins_ok", "logins_replaced", "logins_expired"))'
 
-# login_age A B: Logic's login_age_seconds between two stack_buckets readings
-# (each entry's age from recv_ms as its batch goes to the store) as {"p50_ms",
-# "p99_ms", "max_ms"}, bucket bounds; with the counters' delta D, the batches'
-# mean token-check time: prepare_ms D (#115 diagnostic).
-login_age() {
-  echo "{\"p50_ms\": $(stack_hist_quantile "$1" "$2" 0.5), \"p99_ms\": $(stack_hist_quantile "$1" "$2" 0.99), \"max_ms\": $(stack_hist_quantile "$1" "$2" 1)}"
+# hist_ms A B: a histogram between two stack_buckets readings as {"p50_ms",
+# "p90_ms", "p99_ms", "max_ms"}, bucket bounds. Read for Logic's
+# login_age_seconds (each entry's age from recv_ms as its batch goes to the
+# store) and gw-0's login_queue_wait_seconds / login_logic_wait_seconds (an
+# entry's wait before and after its Login RPC's send); with the counters'
+# delta D, the batches' mean token-check time: prepare_ms D (#115 diagnostic).
+hist_ms() {
+  echo "{\"p50_ms\": $(stack_hist_quantile "$1" "$2" 0.5), \"p90_ms\": $(stack_hist_quantile "$1" "$2" 0.9), \"p99_ms\": $(stack_hist_quantile "$1" "$2" 0.99), \"max_ms\": $(stack_hist_quantile "$1" "$2" 1)}"
+}
+GW_WAITS=(goim_gateway_login_queue_wait_seconds goim_gateway_login_logic_wait_seconds)
+# gw_waits NAME: NAME's two wait histograms as "QUEUE LOGIC", two
+# stack_buckets readings with their spaces removed, for gw_wait_json.
+gw_waits() { echo "$(stack_buckets "$1" "${GW_WAITS[0]}" | tr -d ' ')" "$(stack_buckets "$1" "${GW_WAITS[1]}" | tr -d ' ')"; }
+# gw_wait_json "A" "B": {"queue": hist_ms, "logic": hist_ms} between two gw_waits.
+gw_wait_json() {
+  local a=($1) b=($2)
+  echo "{\"queue\": $(hist_ms "${a[0]}" "${b[0]}"), \"logic\": $(hist_ms "${a[1]}" "${b[1]}")}"
+}
+
+# login_sampler NAME FILE: appends "unix_ms done queue" every second, from
+# NAME's metrics: its Logins with a reply (every logins_total result but
+# busy) and its login_queue gauge (#115 tail diagnostic: Logic's pace second
+# by second, and the queue it drains).
+login_sampler() {
+  local body
+  while :; do
+    body=$(stack_metrics "$1") && awk -v t="$(date +%s%3N)" '
+      index($1, "goim_gateway_logins_total{") == 1 && $1 !~ /result="busy"/ { d += $NF }
+      $1 == "goim_gateway_login_queue" { q = $NF }
+      END { printf "%s %.0f %.0f\n", t, d, q }' <<<"$body" >>"$2"
+    sleep 1
+  done
+}
+# login_series FILE: the replies per second between samples, as {"n",
+# "rate_min", "rate_p10", "rate_p50", "rate_max", "queue_max", "series":
+# [[s since the first sample, replies/s, queue], ...]} (first 180 samples).
+login_series() {
+  python3 -c 'import json, sys
+rows = [tuple(int(x) for x in l.split()) for l in open(sys.argv[1]) if len(l.split()) == 3]
+pts = [((t1 - rows[0][0]) / 1000, (d1 - d0) * 1000 / (t1 - t0), q1)
+       for (t0, d0, _), (t1, d1, q1) in zip(rows, rows[1:]) if t1 > t0]
+if not pts:
+    print("null"); sys.exit()
+r = sorted(p[1] for p in pts)
+q = lambda f: round(r[min(len(r) - 1, int(f * len(r)))])
+print(json.dumps({"n": len(pts), "rate_min": round(r[0]), "rate_p10": q(0.1), "rate_p50": q(0.5), "rate_max": round(r[-1]),
+       "queue_max": max(p[2] for p in pts),
+       "series": [[round(t, 1), round(v), qq] for t, v, qq in pts[:180]]}))' "$1" 2>/dev/null || echo null
 }
 prepare_ms() { echo "$1" | lg_py - 'round(1000 * d["prepare_s"] / d["prepare_n"], 1) if d["prepare_n"] else None'; }
 
@@ -285,6 +328,7 @@ stack_snapshot cal_before
 for g in gw-0 gw-1; do g0[$g]=$(stack_counters "$g" "${GW_COUNTERS[@]}"); done
 cs0=$(stack_cpu_stat logic)
 age0=$(stack_buckets logic goim_logic_login_age_seconds)
+w0=$(gw_waits gw-0)
 l0=$(stack_counters logic "${LOGIC_COUNTERS[@]}")
 stack_usage_start loadgen="$LG_PID"
 # The window's CPU clocks: T depends on them (run 29d; #115 diagnostic).
@@ -296,6 +340,7 @@ usage=$(stack_usage_json)
 l1=$(stack_counters logic "${LOGIC_COUNTERS[@]}")
 kill "$clk" 2>/dev/null; wait "$clk" 2>/dev/null; clk=""
 age1=$(stack_buckets logic goim_logic_login_age_seconds)
+w1=$(gw_waits gw-0)
 cs1=$(stack_cpu_stat logic)
 for g in gw-0 gw-1; do g1[$g]=$(stack_counters "$g" "${GW_COUNTERS[@]}"); done
 stack_snapshot cal_after
@@ -310,7 +355,7 @@ logic_cores=$(echo "$usage" | lg_py - 'd["logic"]["cores"]' 2>/dev/null)
 waste=$(echo "{\"l\": $logic_d, \"g\": $gws_d}" | lg_py - '{"logic_expired": d["l"]["logins_expired"] or 0, "expired_queued": sum(d["g"][g]["logins_expired_queued"] or 0 for g in d["g"]), "error": sum(d["g"][g]["logins_error"] or 0 for g in d["g"])}' 2>/dev/null)
 saturated=$(echo "{\"c\": ${logic_cores:-null}, \"w\": ${waste:-null}, \"l\": $logic_d}" | lg_true - 'd["c"] is not None and d["c"] >= 0.9 * '"$quota_cores"' and d["w"] is not None and sum(d["w"].values()) <= 0.01 * (d["l"]["logins_ok"] or 0)')
 [ -n "$T" ] && [ "$T" -gt 0 ] 2>/dev/null || { T=null saturated=false; }
-t2_check calibrate_saturated "$saturated" "\"throughput_per_s\": $T, \"logic_cores\": ${logic_cores:-null}, \"quota_cores\": $quota_cores, \"waste\": ${waste:-null}, \"waste_max\": $(echo "$logic_d" | lg_py - '0.01 * (d["logins_ok"] or 0)'), \"window_s\": $(echo "$usage" | lg_py - 'd["window_s"]'), \"logins_other\": $(echo "$logic_d" | lg_py - "$LOGINS_OTHER"), \"cpu_stat\": $(stack_counters_delta "$cs0" "$cs1"), \"cpu_clocks\": $(t2_clock_summary "$STACK_DIR/clocks-calibrate.tsv"), \"login_age\": $(login_age "$age0" "$age1"), \"prepare_ms\": $(prepare_ms "$logic_d")"
+t2_check calibrate_saturated "$saturated" "\"throughput_per_s\": $T, \"logic_cores\": ${logic_cores:-null}, \"quota_cores\": $quota_cores, \"waste\": ${waste:-null}, \"waste_max\": $(echo "$logic_d" | lg_py - '0.01 * (d["logins_ok"] or 0)'), \"window_s\": $(echo "$usage" | lg_py - 'd["window_s"]'), \"logins_other\": $(echo "$logic_d" | lg_py - "$LOGINS_OTHER"), \"cpu_stat\": $(stack_counters_delta "$cs0" "$cs1"), \"cpu_clocks\": $(t2_clock_summary "$STACK_DIR/clocks-calibrate.tsv"), \"login_age\": $(hist_ms "$age0" "$age1"), \"gw0_wait\": $(gw_wait_json "$w0" "$w1"), \"prepare_ms\": $(prepare_ms "$logic_d")"
 t2_field calibrate "{\"clients\": $cal_clients, \"rate\": $cal_rate, \"queue_cap\": $cal_cap, \"skip_s\": $skip, \"throughput_per_s\": $T, \"logic_gomaxprocs\": $gomaxprocs, \"usage\": $usage, \"logic\": $logic_d, \"cpu_stat\": $(stack_counters_delta "$cs0" "$cs1"), \"gateways\": $gws_d, \"loadgen_online\": $(lg_get /stats 'd["online"]'), \"failed\": $(lg_get /stats 'd["failed"]')}"
 lease1=$(stack_counters logic "${LOGIC_COUNTERS[@]}") lease_s=$((SECONDS - lease_t))
 for g in gw-0 gw-1; do lg1[$g]=$(stack_counters "$g" "${GW_COUNTERS[@]}"); done
@@ -367,11 +412,15 @@ s0=$(stack_counters gw-0 "${GW_COUNTERS[@]}")
 storm_cpu_max=$(stack_cpu_max logic)
 cs0=$(stack_cpu_stat logic)
 age0=$(stack_buckets logic goim_logic_login_age_seconds)
+w0=$(gw_waits gw-0)
 l0=$(stack_counters logic "${LOGIC_COUNTERS[@]}")
 t2_record_start storm
 stack_usage_start loadgen="$LG_PID"
 reply=$(lg_post "/kill?gateway=gw-1&pid=${STACK_PIDS[gw-1]}&mark=death" | lg_py - d)
 kill_t=$SECONDS
+login_sampler gw-0 "$STACK_DIR/artifacts/logins-gw-0.tsv" &
+smp=$!
+t2_on_exit '[ -n "${smp:-}" ] && kill "$smp" 2>/dev/null'
 # T': Logic's own pace while the storm keeps it saturated (relogins that
 # replace gw-1's entries, each with a Kick to the dead address), against the
 # calibration's fresh logins. Its own usage window, in a subshell, leaves
@@ -386,6 +435,7 @@ dead=$?
 prof=$!
 back=$(t2_bool lg_wait_back death "$back_wait")
 back_s=$((SECONDS - kill_t))
+kill "$smp" 2>/dev/null; wait "$smp" 2>/dev/null; smp=""
 lg_get "/slo?mark=death&within=30s" d >"$STACK_DIR/artifacts/slo-death.json"
 wait "$prof" "$busy_pid"
 usage=$(stack_usage_json)
@@ -393,6 +443,7 @@ busy_window=$(lg_py "$STACK_DIR/busy.json" '{"window_s": d["u"]["window_s"], "th
 [ -n "$busy_window" ] || busy_window=null
 l1=$(stack_counters logic "${LOGIC_COUNTERS[@]}")
 age1=$(stack_buckets logic goim_logic_login_age_seconds)
+w1=$(gw_waits gw-0)
 cs1=$(stack_cpu_stat logic)
 s1=$(stack_counters gw-0 "${GW_COUNTERS[@]}")
 t2_record_end storm
@@ -414,7 +465,7 @@ pass=false
 t2_check storm_back "$pass" "\"kill\": ${reply:-null}, \"back_all\": $back, \"back_s\": $back_s, \"wait_s\": $back_wait, \"backoff\": $(lg_get /stats 'd["backoff_since_mark"]'), \"slo\": $(cat "$slo")"
 t2_check storm_lease "$(echo "{\"g\": $gw_d, \"l\": $logic_d, \"w\": $window_s}" | lg_true - 'd["g"]["lease_error"] == 0 and d["g"]["lease_missing"] == 0 and d["g"]["lease_live"] >= '"$storm_floor"' and d["l"]["lease_error"] == 0')" \
   "\"window_s\": $window_s, \"live_floor\": $storm_floor, \"gw-0\": {\"live\": $(echo "$gw_d" | lg_py - 'd["lease_live"]'), \"missing\": $(echo "$gw_d" | lg_py - 'd["lease_missing"]'), \"error\": $(echo "$gw_d" | lg_py - 'd["lease_error"]')}, \"logic_lease_error\": $(echo "$logic_d" | lg_py - 'd["lease_error"]')"
-t2_field storm "{\"throughput_per_s\": $T, \"busy_window\": $busy_window, \"victims\": $victims, \"clamped\": $clamped, \"clients\": $clients, \"rate\": $rate, \"queue_cap\": $qcap, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"by_gateway_at_kill\": $by_gateway, \"back_s\": $back_s, \"usage\": $usage, \"cpu_max\": $(t2_json_str "$storm_cpu_max"), \"cpu_stat\": $(stack_counters_delta "$cs0" "$cs1"), \"logins_other\": $(echo "$logic_d" | lg_py - "$LOGINS_OTHER"), \"login_age\": $(login_age "$age0" "$age1"), \"prepare_ms\": $(prepare_ms "$logic_d"), \"logic\": $logic_d, \"gw-0\": $gw_d, \"login_latency\": $(lg_get /stats 'd["login_latency"]'), \"failed\": $(lg_get /stats 'd["failed"]'), \"backoff\": $(lg_get /stats '{"clients": d["backoff_clients"], "waits": d["backoff_waits"]}')}"
+t2_field storm "{\"throughput_per_s\": $T, \"busy_window\": $busy_window, \"victims\": $victims, \"clamped\": $clamped, \"clients\": $clients, \"rate\": $rate, \"queue_cap\": $qcap, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"by_gateway_at_kill\": $by_gateway, \"back_s\": $back_s, \"usage\": $usage, \"cpu_max\": $(t2_json_str "$storm_cpu_max"), \"cpu_stat\": $(stack_counters_delta "$cs0" "$cs1"), \"logins_other\": $(echo "$logic_d" | lg_py - "$LOGINS_OTHER"), \"login_age\": $(hist_ms "$age0" "$age1"), \"gw0_wait\": $(gw_wait_json "$w0" "$w1"), \"logins_per_s\": $(login_series "$STACK_DIR/artifacts/logins-gw-0.tsv"), \"prepare_ms\": $(prepare_ms "$logic_d"), \"logic\": $logic_d, \"gw-0\": $gw_d, \"login_latency\": $(lg_get /stats 'd["login_latency"]'), \"failed\": $(lg_get /stats 'd["failed"]'), \"backoff\": $(lg_get /stats '{"clients": d["backoff_clients"], "waits": d["backoff_waits"]}')}"
 down storm
 t2_duration storm $((SECONDS - t0))
 
