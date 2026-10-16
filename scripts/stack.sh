@@ -466,10 +466,12 @@ stack_buckets() {
 # of the same process (B - A); a bucket's bound, not an interpolation, so a
 # p99 reads as one of the histogram's bounds. Prints null when either
 # reading is null, there is no sample between them, or Q falls in +Inf.
+# The rank is exact (Q as a fraction), so it never moves up a sample.
 stack_hist_quantile() {
   python3 -c 'import json, math, sys
+from fractions import Fraction
 a, b = (json.loads(x) for x in sys.argv[1:3])
-q = float(sys.argv[3])
+q = Fraction(sys.argv[3]) # exact: 0.28 x 25 is 7, not 7.000000000000001
 if a is None or b is None:
     print("null"); sys.exit()
 les = sorted(b, key=lambda le: math.inf if le == "+Inf" else float(le))
