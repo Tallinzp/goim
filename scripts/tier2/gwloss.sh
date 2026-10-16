@@ -138,15 +138,18 @@
 #                      spec's b2 SLO); the survivor rejected none at capacity
 #   b2_detection       (b2 only) every victim's detection, from the DROP mark,
 #                      within GWLOSS_B2_DETECT_MAX_S, and each by Pong timeout
-#                      (loadgen's lost["pong-timeout"]), not by a FIN or RST
+#                      (loadgen's lost["pong-timeout"] since the DROP, and no
+#                      connection ended for another reason), not by a FIN or RST
 #   b2_login_p99       (b2 only) the survivor's Login p99 in the storm is at
 #                      most one histogram bucket (2x) above its p99 in the
 #                      ramp: Kicks to the silent gateway, each up to Logic's
 #                      1s Kick deadline, never delay a Login (R5S-O2); the
 #                      storm's Redis latency beside it (the sweep may
 #                      overlap the storm's tail, review O2)
-#   b2_goroutines      (b2 only) Logic's goroutines, sampled every second from
-#                      the DROP until the victims are back, never grow more
+#   b2_goroutines      (b2 only) Logic's goroutines, read at the DROP and then
+#                      every second from just after the SIGKILL (a few
+#                      seconds before any relogin) until the victims are
+#                      back, never grow more
 #                      than GWLOSS_B2_GOROUTINE_GROWTH over the DROP's count
 #   b_stress_back      (b_stress only) loadgen SIGKILLs gw-0: every one of its
 #                      clients logs in again within GWLOSS_STRESS_BACK_WAIT, and
@@ -253,7 +256,8 @@ export STACK_PIN=1
 STACK_PORT_BASE=${STACK_PORT_BASE:-17000}
 STACK_REDIS_SERVER=$PWD/.cache/redis/bin/redis-server
 NETDROP=/usr/local/sbin/goim-netdrop
-t2_on_exit "sudo -n $NETDROP flush" # b2's DROP rules, whatever stopped the run
+# b2's DROP rules, whatever stopped the run; only a run with b2 adds them.
+case " $PHASES " in *" b2 "*) t2_on_exit "sudo -n $NETDROP flush" ;; esac
 t2_on_exit 'stack_down'
 t2_on_exit 'lg_stop' # newest first: loadgen stops before the stack
 # The storm's background helpers (profiles, socket and goroutine samplers,
@@ -486,12 +490,14 @@ for name in $PHASES; do
 
   # The storm: counters before, SIGKILL, CPU profiles of its first 30s.
   stack_snapshot before
-  # b2: the survivor's Login latency so far (the ramp's; a fresh stack) and
-  # Logic's goroutines, both at the DROP.
-  login_h0=null goroutines0=null
+  # b2: the survivor's Login latency so far (the ramp's; a fresh stack),
+  # Logic's goroutines and loadgen's ended connections by reason, all at
+  # the DROP.
+  login_h0=null goroutines0=null lost0=null
   if [ "$name" = b2 ]; then
     login_h0=$(stack_buckets gw-0 goim_gateway_login_seconds)
     goroutines0=$(stack_metric logic go_goroutines)
+    lost0=$(lg_get /stats 'd["lost"]')
   fi
   # The ramp's backoff (no mark yet: since loadgen started), apart from the
   # storm's, which counts since the death mark (P6b2a-stressI-1).
@@ -576,7 +582,8 @@ for name in $PHASES; do
   sweeping=$!
   storm_helpers+=("$sweeping")
   # b2: Logic's goroutines every second until the victims are back (R5S-O2),
-  # on the Logic CPU set.
+  # on the Logic CPU set; from here, 1-3s after the SIGKILL, still well
+  # before the first relogin (~10s), so no Kick goroutine is missed.
   counting=""
   if [ "$name" = b2 ]; then
     (while :; do stack_metric logic go_goroutines; sleep 1; done) >"$STACK_DIR/goroutines.txt" 2>/dev/null &
@@ -586,6 +593,9 @@ for name in $PHASES; do
   fi
   back=$(t2_bool lg_wait_back "$mark" "$back_wait")
   back_s=$((SECONDS - kill_t))
+  # b2: the connections that ended from the DROP until the victims were back.
+  lost1=null
+  [ "$name" = b2 ] && lost1=$(lg_get /stats 'd["lost"]')
   goroutines=null
   if [ -n "$counting" ]; then
     kill "$counting" 2>/dev/null
@@ -665,10 +675,13 @@ print(json.dumps(out))' "$STACK_DIR/artifacts/ss-storm.jsonl" 2>/dev/null || ech
     # The spec's b2 SLO: from each client's detection; every victim detected.
     [ $dead -eq 0 ] && [ "$rejects" = 0 ] && pass=$(lg_true "$slo" 'd["pass_from_detection"] and d["lost"] == d["population"] and d["population"] >= '"$clients"' * 0.45')
     t2_check "${name}_slo" "$pass" "\"kill\": ${reply:-null}, \"back_all\": $back, \"back_s\": $back_s, \"wait_s\": $back_wait, \"rejects_at_capacity\": ${rejects:-null}, \"slo\": $(cat "$slo")"
-    lost=$(lg_get /stats 'd["lost"]')
+    # Ended from the DROP until the victims were back, by reason: a Pong
+    # timeout for every victim and nothing else, so a FIN or RST that
+    # leaked shows even beside a stray Pong timeout (review M-2).
+    lost=$(echo "{\"a\": ${lost0:-null}, \"b\": ${lost1:-null}}" | lg_py - '{k: v - d["a"].get(k, 0) for k, v in d["b"].items()}')
     detect_max=${GWLOSS_B2_DETECT_MAX_S:-45}
-    t2_check "${name}_detection" "$(echo "{\"s\": $(cat "$slo"), \"lost\": $lost}" | lg_true - 'd["s"]["detection"]["n"] == d["s"]["population"] and 0 <= d["s"]["detection"]["max_ms"] <= '"$detect_max"' * 1000 and d["lost"].get("pong-timeout", 0) >= d["s"]["population"]')" \
-      "\"max_s\": $detect_max, \"detection\": $(lg_py "$slo" 'd["detection"]'), \"lost\": $lost"
+    t2_check "${name}_detection" "$(echo "{\"s\": $(cat "$slo"), \"lost\": $lost}" | lg_true - 'd["s"]["detection"]["n"] == d["s"]["population"] and 0 <= d["s"]["detection"]["max_ms"] <= '"$detect_max"' * 1000 and d["lost"].get("pong-timeout", 0) >= d["s"]["population"] and all(v == 0 for k, v in d["lost"].items() if k != "pong-timeout")')" \
+      "\"max_s\": $detect_max, \"detection\": $(lg_py "$slo" 'd["detection"]'), \"lost_since_drop\": $lost"
     p99_ramp=$(stack_hist_quantile '{}' "$login_h0" 0.99) p99_storm=$(stack_hist_quantile "$login_h0" "$login_h1" 0.99)
     t2_check "${name}_login_p99" "$(echo "{\"r\": $p99_ramp, \"s\": $p99_storm}" | lg_true - 'd["r"] is not None and d["s"] is not None and d["s"] <= 2 * d["r"]')" \
       "\"ramp_p99_ms\": $p99_ramp, \"storm_p99_ms\": $p99_storm, \"bucket_bounds\": true, \"redis_latency_storm\": $redis_storm"
