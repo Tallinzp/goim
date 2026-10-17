@@ -241,13 +241,26 @@ expect "netdrop: add" "$(scripts/tier2/goim-netdrop --print add 21100)" \
 "iptables -w -I INPUT -i lo -p tcp --dport 21100 -m comment --comment goim-netdrop -j DROP
 iptables -w -I INPUT -i lo -p tcp --sport 21100 -m comment --comment goim-netdrop -j DROP"
 contains "netdrop: del" "$(scripts/tier2/goim-netdrop --print del 21100)" "iptables -w -D INPUT -i lo -p tcp --dport 21100"
-for bad_args in "add 80" "add 01167" "add 70000" "add 21100x" "add" "add 1 2" "drop 21100" "--print flush"; do
+# NOTRACK for the stack's ports on lo (#123): both directions, both chains a
+# loopback packet meets, the range lib.sh's guard checks the ports against.
+expect "netdrop: notrack" "$(scripts/tier2/goim-netdrop --print notrack)" \
+"iptables -w -t raw -I PREROUTING -i lo -p tcp --dport 17000:17199 -m comment --comment goim-notrack -j CT --notrack
+iptables -w -t raw -I PREROUTING -i lo -p tcp --sport 17000:17199 -m comment --comment goim-notrack -j CT --notrack
+iptables -w -t raw -I OUTPUT -o lo -p tcp --dport 17000:17199 -m comment --comment goim-notrack -j CT --notrack
+iptables -w -t raw -I OUTPUT -o lo -p tcp --sport 17000:17199 -m comment --comment goim-notrack -j CT --notrack"
+contains "netdrop: notrack covers lib.sh's range" "$(scripts/tier2/goim-netdrop --print notrack)" "--dport $T2_NOTRACK_LO:$T2_NOTRACK_HI "
+t2_notrack_covers 17000 >/dev/null; expect "notrack range: the default base" "$?" 0
+t2_notrack_covers 17067 >/dev/null; expect "notrack range: 4 gateways' last port is 17199" "$?" 0
+why=$(t2_notrack_covers 17068); expect "notrack range: past the end refused" "$?" 1
+contains "notrack range: says the range" "$why" "17000-17199"
+t2_notrack_covers 16999 >/dev/null; expect "notrack range: below refused" "$?" 1
+for bad_args in "add 80" "add 01167" "add 70000" "add 21100x" "add" "add 1 2" "drop 21100" "--print flush" "notrack 17000" "notrack-check x" "--print notrack-check"; do
   # shellcheck disable=SC2086
   scripts/tier2/goim-netdrop $bad_args >/dev/null 2>&1; expect "netdrop: refuses '$bad_args'" "$?" 2
 done
 # Without root, iptables fails: list and flush must say so, not exit 0.
 if [ "$(id -u)" != 0 ]; then
-  for c in list flush; do
+  for c in list flush notrack notrack-check; do
     scripts/tier2/goim-netdrop $c >/dev/null 2>&1 && bad "netdrop: $c exits 0 when iptables fails" || ok "netdrop: $c fails when iptables fails"
   done
 fi

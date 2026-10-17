@@ -11,6 +11,9 @@
 #   /usr/local/sbin/goim-netdrop           root-owned, 0755 (the b2 DROP rule only)
 #   /etc/sudoers.d/goim-netdrop            $SUDO_USER may run goim-netdrop, and only
 #                                          it, without a password (checked with visudo)
+#   NOTRACK rules for ports 17000-17199 on lo (goim-netdrop notrack, #123): not
+#                                          kept across a reboot, so run it again
+#                                          after one (the Tier 2 guard says so)
 # Everything else the runs need (nofile up to the hard limit, loopback
 # source addresses, CPU pinning) needs no root.
 #
@@ -66,5 +69,11 @@ if [ -n "$root" ]; then
 fi
 grep -vE '^[[:space:]]*(#|$)' "$here/modules.conf" | while read -r m; do modprobe "$m"; done
 sysctl -q -p /etc/sysctl.d/90-goim-tier2.conf
-command -v iptables >/dev/null || echo "host-setup: warning: iptables is not installed; goim-netdrop needs it (apt install iptables)" >&2
-echo "host-setup: done. Check: sudo -n /usr/local/sbin/goim-netdrop list"
+if [ -x /usr/sbin/iptables ]; then
+  /usr/local/sbin/goim-netdrop notrack
+  echo "applied: NOTRACK for ports 17000-17199 on lo"
+else
+  echo "host-setup: iptables is not installed; goim-netdrop needs it (apt install iptables), then run this again" >&2
+  exit 1
+fi
+echo "host-setup: done. Check: sudo -n /usr/local/sbin/goim-netdrop list; sudo -n /usr/local/sbin/goim-netdrop notrack-check"
