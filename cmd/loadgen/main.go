@@ -54,7 +54,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	fs.Float64Var(&cfg.Rate, "rate", 1000, "clients started per second; garbage: attempts per second")
 	fs.StringVar(&cfg.UIDPrefix, "uid-prefix", "lg", "uid prefix, distinct per run")
 	fs.IntVar(&cfg.Sources, "sources", 0, "source addresses 127.0.<source-net>.2…; 0: one per 5,000 connections per gateway (floods: 253)")
-	fs.IntVar(&cfg.SourceNet, "source-net", 0, "third octet of the source addresses, one per instance on a stack")
+	fs.IntVar(&cfg.SourceNet, "source-net", 0, "third octet of the source addresses, one per instance on a stack; floods: required, 1–255")
 	fs.DurationVar(&cfg.PingEvery, "ping-every", 150*time.Second, "light: Ping interval (the gateway's -heartbeat)")
 	fs.DurationVar(&cfg.Timeout, "timeout", 10*time.Second, "light: dial + handshake + Login per attempt; floods: dial, then the wait for the gateway's close")
 	down := fs.String("down", "", "gateway ids out of the balancer until POST /up, comma-separated")
@@ -79,6 +79,14 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	r, err := loadgen.New(cfg, env)
 	if err != nil {
 		return err
+	}
+	switch cfg.Mode {
+	case loadgen.ModeGarbage, loadgen.ModeSlowHandshake, loadgen.ModeSlowAuth:
+		// A flood on 127.0.0.x would spend the legitimate instance's ports
+		// per (source, gateway) pair (P6b3aI-3).
+		if cfg.SourceNet == 0 {
+			return errors.New("a flood mode needs -source-net 1–255, apart from the legitimate instance's")
+		}
 	}
 	if *duration > 0 {
 		var cancel context.CancelFunc

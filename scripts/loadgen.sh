@@ -10,6 +10,7 @@
 #   lg_post PATH                # POST PATH; prints the reply, fails on an HTTP error
 #   lg_wait_back MARK SECONDS   # until every client of MARK logged in again
 #   lg_profile NAME SECONDS     # loadgen's CPU profile over SECONDS -> $STACK_DIR/artifacts/NAME/loadgen.cpu.pb.gz
+#                               #   (another instance's: loadgen-INST.cpu.pb.gz)
 #   lg_stop                     # SIGTERM, then wait (60s) for it to write its result; LG_STATUS = exit status
 #   lg_json EXPR                # EXPR over the result file of the last loadgen
 #   lg_true SOURCE EXPR         # "true" if EXPR is true over SOURCE (a file, or - for stdin), else "false"
@@ -35,9 +36,12 @@
 # refused before the stack starts. A script names at most LG_MAX_INSTANCES
 # instances in all, and a name is never freed: name instances by role
 # (flood, flood2), not by phase, and start a stopped one again for the next
-# phase. Each lg_start takes its own NAME (its log and result file), and
-# each instance its own -uid-prefix and, for a flood, -source-net. LG_ENV
-# and LG_CPUS are read by lg_start, so set them before each:
+# phase. Each lg_start takes a NAME no lg_start took before (its log and
+# result file; a used one is refused), and each instance its own
+# -uid-prefix and, for a flood, -source-net (loadgen refuses a flood
+# without one). LG_ENV and LG_CPUS are read by lg_start, so set them
+# before each. A scenario with several instances registers
+# t2_on_exit 'lg_stop_all', not 'lg_stop':
 #
 #   lg_start legit -mode light -clients 20000 -uid-prefix legit
 #   LG_CPUS=0-1 lg_in flood lg_start garbage -mode garbage -rate 20000 -clients 5000 -source-net 1
@@ -54,6 +58,7 @@ LG_INST=main
 LG_INSTANCES=(main)
 LG_MAX_INSTANCES=4 # control ports STACK_PORT_BASE + 5 … + 8 (stack_ports)
 declare -A LG_PIDS=() LG_NAMES=() LG_STATUSES=()
+declare -A LG_USED=() # NAME -> the instance whose lg_start took it (P6b3aI-2)
 
 # lg_k INST: the instance's index; fails for an instance never named.
 lg_k() {
@@ -92,12 +97,13 @@ lg_start() {
     echo "loadgen: instance $LG_INST already runs ($LG_NAME)" >&2
     return 1
   fi
-  for inst in "${!LG_PIDS[@]}"; do
-    if [ "$inst" != "$LG_INST" ] && [ "${LG_NAMES[$inst]:-}" = "$1" ] && kill -0 "${LG_PIDS[$inst]:-0}" 2>/dev/null; then
-      echo "loadgen: name $1 is instance $inst's" >&2
-      return 1
-    fi
-  done
+  # A NAME is taken once per script, running or not: lg_start removes
+  # loadgen-NAME.json, which would lose an earlier run's result.
+  if [ -n "${LG_USED[$1]:-}" ]; then
+    echo "loadgen: name $1 is instance ${LG_USED[$1]}'s" >&2
+    return 1
+  fi
+  LG_USED[$1]=$LG_INST
   LG_NAME=$1
   shift
   local cmd=(env "${LG_ENV[@]}" "$STACK_DIR/bin/loadgen" -env "$STACK_DIR/stack.env" -control "$(lg_control)"
@@ -172,10 +178,13 @@ lg_wait_back() {
 
 # lg_profile NAME SECONDS: loadgen's own CPU profile (its control API serves
 # pprof), beside stack_profile's, so a run shows whether loadgen was the
-# bottleneck (P6a2aI-4). Blocks for SECONDS.
+# bottleneck (P6a2aI-4). Blocks for SECONDS. Main's is loadgen.cpu.pb.gz,
+# another instance's loadgen-INST.cpu.pb.gz (P6b3aI-1).
 lg_profile() {
+  local f=loadgen.cpu.pb.gz
+  [ "$LG_INST" = main ] || f=loadgen-$LG_INST.cpu.pb.gz
   mkdir -p "$STACK_DIR/artifacts/$1"
-  curl -sf -m $(($2 + 30)) "http://$(lg_control)/debug/pprof/profile?seconds=$2" >"$STACK_DIR/artifacts/$1/loadgen.cpu.pb.gz"
+  curl -sf -m $(($2 + 30)) "http://$(lg_control)/debug/pprof/profile?seconds=$2" >"$STACK_DIR/artifacts/$1/$f"
 }
 
 # lg_stop sets LG_STATUS rather than printing it: in $(...) it would run in a

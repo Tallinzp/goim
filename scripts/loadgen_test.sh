@@ -99,6 +99,8 @@ PY
   expect "inst: flood answers as flood" "$(lg_in flood lg_get /stats 'd["mode"]')" '"garbage"'
   expect "inst: LG_PID is main's again after lg_in" "$LG_PID" "$main_pid"
   expect "inst: LG_CPUS pins the flood" "$(taskset -pc "${LG_PIDS[flood]}" | awk '{print $NF}')" 1
+  lg_profile w 0 && lg_in flood lg_profile w 0
+  expect "inst: each instance's profile in its own file" "$(ls "$STACK_DIR/artifacts/w" | tr '\n' ' ')" "loadgen-flood.cpu.pb.gz loadgen.cpu.pb.gz "
   out=$(lg_start c -mode light 2>&1)
   expect "inst: a second start of a running instance is refused" "$? $out" "1 loadgen: instance main already runs (a)"
   out=$(lg_in probe lg_start a -mode light 2>&1)
@@ -115,6 +117,10 @@ PY
   lg_in flood lg_stop
   expect "inst: the flood stopped" "$(kill -0 "$flood_pid" 2>/dev/null && echo running || echo stopped) ${LG_STATUSES[flood]}" "stopped 3"
   expect "inst: LG_STATUS is main's after lg_in" "[$LG_STATUS]" "[]"
+  out=$(lg_in flood lg_start b -mode light 2>&1)
+  expect "inst: a stopped instance's name is refused" "$? $out" "1 loadgen: name b is instance flood's"
+  out=$(lg_in x3 lg_start b -mode light 2>&1)
+  expect "inst: another stopped instance's name is refused" "$? $out" "1 loadgen: name b is instance flood's"
   start=$SECONDS
   lg_in flood lg_wait 'd["mode"] == "garbage"' 5 2>"$dir/wait.err"
   expect "wait: a stopped instance fails at once" "$? $((SECONDS - start <= 1)) $(grep -c 'loadgen exited' "$dir/wait.err")" "1 1 1"

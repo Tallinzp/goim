@@ -65,6 +65,12 @@ const slowHeld = 3 * time.Second
 // FloodStats are a flood run's counts (Stats.Flood). Held is from the
 // garbage frame's write, the slow-handshake dial or the slow-auth
 // handshake to the gateway's close, over the attempts it closed.
+//
+// The rest of a flood's Stats (P6b3aI-4): clients is Config.Clients (for
+// ModeGarbage the in-flight cap), started counts ModeGarbage's attempts
+// not skipped or the slow clients ramped (Attempts also counts every
+// redial), ramp_done is true from the start for ModeGarbage, and the
+// light/SDK counts (online, failed, lost, …) stay 0.
 type FloodStats struct {
 	Attempts int64            `json:"attempts"` // dials started
 	Skipped  int64            `json:"skipped"`  // garbage: due while Clients attempts were in flight

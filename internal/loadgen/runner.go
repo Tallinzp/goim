@@ -51,7 +51,7 @@ type Stats struct {
 	RampDone   bool             `json:"ramp_done"`
 	ElapsedS   float64          `json:"elapsed_s"`
 	Precompute *PrecomputeStats `json:"precompute,omitempty"`
-	Flood      *FloodStats      `json:"flood,omitempty"`
+	Flood      *FloodStats      `json:"flood,omitempty"` // flood modes only
 	Counts
 }
 
@@ -234,6 +234,11 @@ func (r *Runner) start(ctx context.Context, wg *sync.WaitGroup, i int) {
 // process ended between Kill's check and the signal. The mark stands.
 var ErrKillAfterMark = errors.New("loadgen: SIGKILL failed after the mark")
 
+// ErrFloodNoMarks refuses /mark and /kill on a flood instance: it has no
+// population, so a /kill sent through it would kill a gateway with no mark
+// where the clients are (P6b3aI-5). /kill then sends no signal.
+var ErrFloodNoMarks = errors.New("loadgen: a flood mode takes no marks")
+
 // Kill is POST /kill: the clients logged in on gateway gw become mark
 // name's population, gw leaves the balancer, and pid gets SIGKILL. The mark
 // is taken just before the signal is sent: T_death, the moment loadgen
@@ -262,6 +267,9 @@ func (r *Runner) Kill(gw, pid int, name string) (int, error) {
 // e.g. b2's DROP; down also takes gw out of the balancer, as an LB's
 // health check would, once the mark is taken.
 func (r *Runner) Mark(gw int, name string, down bool) (int, error) {
+	if r.flood != nil {
+		return 0, ErrFloodNoMarks
+	}
 	if r.pre != nil {
 		// The storm's CPU is the storm's (#106). Stopped before the mark, and
 		// not undone if the mark fails: rec.Mark fails only on a name already

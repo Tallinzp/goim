@@ -5,7 +5,11 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"os/exec"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -286,5 +290,35 @@ func TestGarbageWriteErrorIsCounted(t *testing.T) {
 	r.garbageOn(context.Background(), failWrite{a})
 	if f := r.flood.stats(); f.Outcomes[FloodError] != 1 || len(f.Outcomes) != 1 {
 		t.Fatalf("outcomes %v, want one error", f.Outcomes)
+	}
+}
+
+// A flood instance has no population: /mark and /kill are refused, and
+// /kill sends no signal, so one sent through the wrong instance fails
+// where it is made (Plan 6b3a interface review, P6b3aI-5).
+func TestFloodRefusesMarkAndKill(t *testing.T) {
+	env := Env{GatewayIDs: []string{"gw-0"}, GatewayAddrs: []string{"127.0.0.1:1"}}
+	r, err := New(Config{Mode: ModeSlowHandshake, Clients: 1, Rate: 1, UIDPrefix: "x", Timeout: time.Second, SourceNet: 1}, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(r.Handler())
+	defer srv.Close()
+	if code, _ := post(t, srv.URL+"/mark?gateway=all&mark=m"); code != http.StatusConflict {
+		t.Fatalf("/mark: %d, want 409", code)
+	}
+	victim := exec.Command("sleep", "30")
+	if err := victim.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer victim.Process.Kill()
+	if code, _ := post(t, srv.URL+"/kill?gateway=gw-0&pid="+itoa(victim.Process.Pid)+"&mark=death"); code != http.StatusConflict {
+		t.Fatalf("/kill: %d, want 409", code)
+	}
+	if err := victim.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatalf("victim: %v, want alive", err)
+	}
+	if r.bal.Down(0) {
+		t.Fatal("gw-0 left the balancer")
 	}
 }

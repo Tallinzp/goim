@@ -30,7 +30,7 @@ func (r *Runner) Result(within time.Duration) Result {
 //
 //	GET  /stats                               Stats
 //	POST /kill?gateway=gw-1&pid=N&mark=death  SIGKILL and mark T_death  {"mark", "population"}
-//	                                          409: pid gone or mark taken, nothing changed; 500: ErrKillAfterMark
+//	                                          409: pid gone, mark taken or a flood mode, nothing changed; 500: ErrKillAfterMark
 //	POST /mark?gateway=gw-1|all&mark=drop     a mark; &down=1 also takes the gateway out of the balancer
 //	POST /up?gateway=gw-1                     the gateway is back in the balancer  {"gateway"}
 //	                                          also after /kill: send it once the gateway listens again

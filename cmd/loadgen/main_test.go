@@ -28,6 +28,7 @@ func TestRunRefusesBadFlags(t *testing.T) {
 		{[]string{"-env", "ENV", "-precompute"}, "sdk mode"},
 		{[]string{"-env", "ENV", "-mode", "slow-auth", "-timeout", "0s"}, "Timeout"},
 		{[]string{"-env", "ENV", "-mode", "garbage", "-source-net", "256"}, "source net"},
+		{[]string{"-env", "ENV", "-mode", "slow-handshake"}, "-source-net"},
 	} {
 		for i, a := range tc.args {
 			if a == "ENV" {
