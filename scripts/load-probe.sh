@@ -5,7 +5,13 @@
 #
 #   1. light: 3,000 connections log in, Ping every 5s for 15s: every Ping
 #      answered, no connection lost
-#   2. sdk:   2,000 SDK clients log in; loadgen SIGKILLs gw-1 (POST /kill):
+#   2. floods (Plan 6b3a): beside 2,000 light clients, loadgen instance
+#      flood sends garbage handshakes at 2,000/s for 10s, then runs again
+#      holding 500 slow-handshake connections beside flood2's 500 slow-auth
+#      ones: the gateways fail and close every garbage handshake, close
+#      every slow connection by its 5s timeout (held p99 ≤ 6.5s), and the
+#      light clients keep every Ping answered
+#   3. sdk:   2,000 SDK clients log in; loadgen SIGKILLs gw-1 (POST /kill):
 #      99% of its clients log in again within 30s of T_death, and the
 #      killed gateway is the only process that did not stop cleanly
 #
@@ -26,7 +32,7 @@ ok() { echo "ok   $1"; }
 bad() { echo "FAIL $1"; fails=$((fails + 1)); }
 check() { if [ "$2" = true ]; then ok "$1"; else bad "$1: $3"; fi; }
 cleanup() {
-  lg_stop
+  lg_stop_all
   stack_down
   if [ "$fails" -eq 0 ] && [ "${PROBE_KEEP:-0}" != 1 ]; then rm -rf "$STACK_DIR"; else echo "probe: results in $STACK_DIR"; fi
 }
@@ -50,7 +56,55 @@ check "light: every Ping answered" "$(lg_json 'd["pong_missing"] == 0 and d["pon
 check "light: none lost while held" "$(lg_json 'd["lost"] == {}')" "$(lg_json 'd["lost"]')"
 echo "     light: login p99 $(lg_json 'd["login_latency"]["p99_ms"]')ms, Pong p99 $(lg_json 'd["pong_rtt"]["p99_ms"]')ms, failed $(lg_json 'd["failed"]')"
 
-# 2: sdk, and a gateway killed by loadgen.
+# 2: floods beside light clients, each flood on its own loadgen instance
+# from its own source addresses; instance flood runs garbage, then
+# slow-handshake (instances are named by role and reused, #120).
+# gw_sum METRIC MATCH: over both gateways; a labelled counter has no sample
+# before its first increment, which counts as 0.
+gw_sum() {
+  python3 -c 'import sys; print(sum(0 if x == "null" else int(float(x)) for x in sys.argv[1:]))' \
+    "$(stack_metric gw-0 "$1" "$2")" "$(stack_metric gw-1 "$1" "$2")"
+}
+lg_start floods-light -mode light -clients 2000 -rate 1000 -ping-every 5s -uid-prefix floods || { bad "floods: light loadgen did not start"; exit 1; }
+if lg_wait_online 2000 60; then ok "floods: 2000 light clients online"; else bad "floods: light clients not all online"; fi
+failed0=$(gw_sum goim_gateway_handshakes_total 'result="failed"')
+limited0=$(gw_sum goim_gateway_admission_rejects_total 'reason="handshake_rate"')
+lg_in flood lg_start garbage -mode garbage -rate 2000 -clients 500 -source-net 1 || bad "garbage: loadgen did not start"
+sleep 10
+lg_in flood lg_stop
+check "garbage: loadgen exited 0" "$([ "${LG_STATUSES[flood]}" = 0 ] && echo true)" "status ${LG_STATUSES[flood]}"
+outcomes=$(lg_in flood lg_json 'd["flood"]["outcomes"]')
+closed=$(lg_in flood lg_json 'd["flood"]["outcomes"].get("closed", 0)')
+check "garbage: ≥ 15000 attempts, every one counted closed by a gateway" "$(lg_in flood lg_true "$STACK_DIR/artifacts/loadgen-garbage.json" 'set(d["flood"]["outcomes"]) == {"closed"} and d["flood"]["outcomes"]["closed"] >= 15000')" "$outcomes"
+failed=$(($(gw_sum goim_gateway_handshakes_total 'result="failed"') - failed0))
+limited=$(($(gw_sum goim_gateway_admission_rejects_total 'reason="handshake_rate"') - limited0))
+check "garbage: the gateways failed (or limited) as many handshakes" "$([ $((failed + limited)) -ge "$closed" ] && [ "$failed" -gt 0 ] && echo true)" "failed $failed + handshake_rate $limited, closed $closed"
+echo "     garbage: $(lg_in flood lg_json 'd["flood"]["attempts"]') attempts, $(lg_in flood lg_json 'd["flood"]["skipped"]') skipped, held p50 $(lg_in flood lg_json 'd["flood"]["held"]["p50_ms"]')ms p99 $(lg_in flood lg_json 'd["flood"]["held"]["p99_ms"]')ms; gateways: failed $failed, handshake_rate $limited"
+hst0=$(gw_sum goim_gateway_admission_rejects_total 'reason="handshake_timeout"')
+aut0=$(gw_sum goim_gateway_admission_rejects_total 'reason="auth_timeout"')
+lg_in flood lg_start slowhs -mode slow-handshake -clients 500 -rate 500 -source-net 2 || bad "slow-handshake: loadgen did not start"
+lg_in flood2 lg_start slowauth -mode slow-auth -clients 500 -rate 500 -source-net 3 || bad "slow-auth: loadgen did not start"
+for inst in flood flood2; do
+  lg_in "$inst" lg_wait 'd["flood"]["outcomes"].get("closed", 0) >= 500 and d["flood"]["open"] >= 450' 30 ||
+    bad "$inst: not 500 closed with 450 open again: $(lg_in "$inst" lg_get /stats 'd["flood"]')"
+done
+lg_in flood lg_stop
+lg_in flood2 lg_stop
+for inst in slowhs slowauth; do
+  check "$inst: held p50 ≥ 5s, p99 ≤ 6.5s, max ≤ 7.5s, then closed by a gateway" "$(lg_true "$STACK_DIR/artifacts/loadgen-$inst.json" 'set(d["flood"]["outcomes"]) == {"closed"} and d["flood"]["held"]["p50_ms"] >= 5000 and d["flood"]["held"]["p99_ms"] <= 6500 and d["flood"]["held"]["max_ms"] <= 7500')" \
+    "$(lg_py "$STACK_DIR/artifacts/loadgen-$inst.json" 'd["flood"]')"
+done
+echo "     slow: held p50/p99/max: slow-handshake $(lg_in flood lg_json '[d["flood"]["held"][k] for k in ("p50_ms", "p99_ms", "max_ms")]')ms, slow-auth $(lg_in flood2 lg_json '[d["flood"]["held"][k] for k in ("p50_ms", "p99_ms", "max_ms")]')ms"
+hst=$(($(gw_sum goim_gateway_admission_rejects_total 'reason="handshake_timeout"') - hst0))
+aut=$(($(gw_sum goim_gateway_admission_rejects_total 'reason="auth_timeout"') - aut0))
+check "slow: the gateways closed them by their timeouts" "$([ "$hst" -ge 500 ] && [ "$aut" -ge 500 ] && echo true)" "handshake_timeout $hst, auth_timeout $aut"
+lg_stop
+check "floods: light loadgen exited 0" "$([ "$LG_STATUS" = 0 ] && echo true)" "status $LG_STATUS"
+check "floods: every light Ping answered through the floods" "$(lg_json 'd["pong_missing"] == 0 and d["pongs"] >= 2000 * 3 and d["lost"] == {}')" \
+  "pongs $(lg_json 'd["pongs"]'), missing $(lg_json 'd["pong_missing"]'), lost $(lg_json 'd["lost"]')"
+echo "     floods: light Pong p99 $(lg_json 'd["pong_rtt"]["p99_ms"]')ms, max $(lg_json 'd["pong_rtt"]["max_ms"]')ms"
+
+# 3: sdk, and a gateway killed by loadgen.
 lg_start sdk -mode sdk -clients 2000 -rate 500 -uid-prefix sdk || { bad "sdk: loadgen did not start"; exit 1; }
 if lg_wait_online 2000 60; then ok "sdk: 2000 online"; else bad "sdk: not all online"; fi
 reply=$(lg_post "/kill?gateway=gw-1&pid=${STACK_PIDS[gw-1]}&mark=death" | lg_py - '"population %d" % d["population"]')

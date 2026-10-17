@@ -1365,4 +1365,26 @@ git commit -m "test: load probe floods phase: garbage, slow-handshake, slow-auth
 
 ## Execution Notes
 
-(none yet)
+Executed inline 2026-10-16 (superpowers:executing-plans) on `feat/plan6b3` from `4e2dfa3`. Every block applied as written (`git apply --check` clean), with no ruling needed.
+
+- **Task 1** (`6b661e9`). RED as expected: `internal/loadgen` failed to build (`undefined: garbageHandshake`, `ModeGarbage`, `unknown field SourceNet`, …), and `cmd/loadgen` failed its two new cases (`mode "slow-auth", want light or sdk`; `flag provided but not defined: -source-net`). GREEN: `gofmt` and `go vet` clean, `go test -race -count=3 ./internal/loadgen/` ok (106s for the three runs), `./cmd/loadgen/` ok. All 7 mutations failed their named test as the plan says: `key_id 8, want 7`; `timed out after 10s waiting for 100 garbage handshakes closed`; `garbage: 1 sources from 127.0.3.2`; `timed out after 5s waiting for 5 open again` (both modes); `after a timeout: 0s–0s, want spread over the tick`; `9649 attempts, want ≤ 140 (no spin)` plus `after an early close: 0s`; `Outcomes:map[handshake:59] …, want only pre-handshake outcomes`.
+- **Task 2** (`8925e3a`). RED as expected: `loadgen_test: 9 failed` (`lg_in: command not found`, `a second start of a running instance is refused: got [0 ]`, `lg_wait: command not found`, …), and `stack_test` failed `ports: the 4th loadgen instance's control port missing`. `stack_test` printed `4 failed` for that one `FAIL` line: its subshell blocks `exit $fails` with the count they inherited, so a failure before them is counted again. That was already so before this plan and is harmless. GREEN: `make test-scripts` gave `lib_test`, `loadgen_test` and `stack_test: all passed`. The optional `GWLOSS_PHASES=b1` dry run (Review Focus 1) was not run.
+- **Task 3** (this commit). `make test-load-probe`: `load-probe: all passed`. The floods phase printed:
+
+```
+ok   floods: 2000 light clients online
+ok   garbage: loadgen exited 0
+ok   garbage: ≥ 15000 attempts, every one counted closed by a gateway
+ok   garbage: the gateways failed (or limited) as many handshakes
+     garbage: 20013 attempts, 0 skipped, held p50 0ms p99 4ms; gateways: failed 20011, handshake_rate 0
+ok   slowhs: held p50 ≥ 5s, p99 ≤ 6.5s, max ≤ 7.5s, then closed by a gateway
+ok   slowauth: held p50 ≥ 5s, p99 ≤ 6.5s, max ≤ 7.5s, then closed by a gateway
+     slow: held p50/p99/max: slow-handshake [5512, 5992, 6000]ms, slow-auth [5513, 5995, 6004]ms
+ok   slow: the gateways closed them by their timeouts
+ok   floods: light loadgen exited 0
+ok   floods: every light Ping answered through the floods
+     floods: light Pong p99 9ms, max 28ms
+```
+
+  The other phases: light login p99 180ms, Pong p99 10ms. SDK: gw-1's population of 1,000 was back from T_death at p50 10,359ms and p99 19,841ms. The README's test count was recounted to 479.
+
