@@ -822,7 +822,7 @@ P6b3b4I-1..4, over what Task 3's runs and 6b3c build on (`wire.Key`, `Respond`/`
 
 ### Run 30i, `floods` (2026-10-17, the user, Tier 2 host; commit `16f93e7`, `dirty` 0, 306s; `floods-20261017-085352`; `FLOODS_RATE=7500`)
 
-**Passed 30/30**, every phase on one stack (storm, garbage, slow at 7,500/s). No swap in any phase; conntrack peaks 29 / 30 / 24. `dmesg | grep -i conntrack` and the profile readings (Task 3 Step 1) not yet sent.
+**Passed 30/30**, every phase on one stack (storm, garbage, slow at 7,500/s). No swap in any phase; conntrack peaks 29 / 30 / 24. `dmesg | grep -i conntrack` after the run: empty.
 - **Storm (against run 30c):** `storm_rate` verdict **`met`** (30c: `loadgen-bound`): `new_per_s` **19,998** of 20,000 (15,962), `loadgen_cores_ramp` **4.86** of 8 (7.94), `no_slot_share` **0.032** (0.274; `hs_no_slot` 6,540 against 200,000 `hs_ok`), `no_token` 0. gw-0 4.08 cores over the 11.6s window, loadgen 4.10, Logic 1.17. Login p50/p99/max 18 / 42 / 76ms; none gave up. The window includes the new 8s profiles (final review M3).
 - **Garbage (against run 30c):** `garbage_limited` **`bound_by` `bucket`** on both gateways (30c: `slots`): `dh_per_s` 24,990 / 25,028 against the 25,000/s bucket (21,629 / 21,256); `no_token` 1,406,313 / 796,404, `no_slot` 263,208 / 237,524. 7,207,404 attempts, `TCPSynRetrans` 0. gw-0 / gw-1 2.60 / 2.46 cores for ~25k DH/s each; gateway set 41.7% busy. The 400,000 Pinging clients: 1,588,167 Pongs, none missing, p99/max 3 / 17ms, no heartbeat close, `ping_gap_max_ms` 30,019.
 - **Slow at 7,500/s (against run 30e, which ran the slow phase alone; review O5):** verdict **`valid`** (30e: `gateway-set-saturated`), so `slow_legit` and `slow_heartbeats` pass.
@@ -842,4 +842,13 @@ P6b3b4I-1..4, over what Task 3's runs and 6b3c build on (`wire.Key`, `Respond`/`
   | Pong p99 / max | 55 / 124ms | **15 / 32ms** |
 
   `pending_mem`, Busy, `at_capacity`, `login_queue`, `no_token` 0 on both gateways; 400,000 online; 1,209,345 Pongs, none missing, `ping_gap_max_ms` 30,013. `first_s`: only `no_slot` and `light_refused` (1.1, as in every healthy run); no saturation, `pending_mem`, gave-up or late scrape. Loadgen 20.7% busy over the ramp.
-- **Reading:** the gain shows wherever the handshake bound. The storm now meets its 20k/s with loadgen at 61% of its set (it was the bound), and the concurrency limit's loss fell from 27% to 3%: the slot hold halved, and the three-slot Erlang loss fell with it (#111's input). The garbage flood now reaches the 25,000/s bucket, the designed limit, on 2.5 cores per gateway. At 7,500/s the slow phase, which failed on the shared gateway set in run 30e, is valid with the set half idle: the gateways' cores fell 35% and slow-auth's 43% (both sides of each handshake), and the refused share fell from 51% to 7%. Profiles pending.
+- **Reading:** the gain shows wherever the handshake bound. The storm now meets its 20k/s with loadgen at 61% of its set (it was the bound), and the concurrency limit's loss fell from 27% to 3%: the slot hold halved, and the three-slot Erlang loss fell with it (#111's input). The garbage flood now reaches the 25,000/s bucket, the designed limit, on 2.5 cores per gateway. At 7,500/s the slow phase, which failed on the shared gateway set in run 30e, is valid with the set half idle: the gateways' cores fell 35% and slow-auth's 43% (both sides of each handshake), and the refused share fell from 51% to 7%. 
+- **Profiles (required, review O4):**
+
+  | profile | `x25519ScalarMult` (cum) | `feMul` (flat) | `suite.DH` | `suite.GenerateKeypair` | `NewPrivateKey` |
+  |---|---|---|---|---|---|
+  | storm gw-0 (8s, 4.75 cores sampled) | 62.5% | 25.2% | 42.1% | 21.1% | 20.9% |
+  | storm loadgen (8s, 4.79 cores) | 51.3% | 23.2% | 32.1% | 19.6% | 19.4% |
+  | garbage gw-0 (30s, 2.59 cores) | 48.3% | 20.3% | 48.6% | — | none |
+
+  `NewPrivateKey` runs only under `GenerateKeypair` (equal times in both storm profiles), never under `suite.DH`: each side parses once per handshake, its ephemeral. On gw-0 in the storm `DH` is twice `GenerateKeypair` (es and ee against one key generation), the expected 3 multiplications. The garbage profile has no `NewPrivateKey` at all and `-peek 'NewPrivateKey$'` found nothing: a garbage handshake fails at message 1's tag after its one DH (es), before the server generates its ephemeral, so it costs 1 multiplication (was 2). X25519 is still the largest cost (48% of the gateway in garbage, against run 30c's 67.7% at the doubled cost; ~25k DH/s on 2.6 cores, about 50µs a multiplication). Key generation is ~21% of the storm's gateway and ~20% of loadgen: the fixed-base step (*After this plan*) would cut most of that, if wanted.
