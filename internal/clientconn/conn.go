@@ -132,6 +132,10 @@ func (c *Conn) Recv(deadline time.Time) (Frame, error) {
 // the Pong timeout while another goroutine waits in Recv.
 func (c *Conn) SetReadDeadline(t time.Time) error { return c.nc.SetReadDeadline(t) }
 
+// SetWriteDeadline bounds the Sends that follow, e.g. a Ping a full socket
+// buffer would block.
+func (c *Conn) SetWriteDeadline(t time.Time) error { return c.nc.SetWriteDeadline(t) }
+
 // Close closes the socket with a FIN.
 func (c *Conn) Close() error { return c.nc.Close() }
 
