@@ -11,7 +11,9 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/Tallinzp/goim/api/clientpb"
 	"github.com/Tallinzp/goim/internal/clientconn"
+	"github.com/Tallinzp/goim/internal/wire"
 )
 
 // A Ping due while the previous one has no Pong is counted missing; a
@@ -87,6 +89,56 @@ func TestPingerCatchesUpOnMissedSlots(t *testing.T) {
 // each stamped at its own Send, not at the blocked one's (6b3b2 review O1,
 // O9).
 func TestPingerTimesOutABlockedSend(t *testing.T) {
+	t.Run("the real Send", testPingerRealSendDeadline)
+	t.Run("stubbed", testPingerTimesOutABlockedSend)
+}
+
+// The pinger's own send sets the write deadline: a peer that never reads
+// (a pipe, like a full socket buffer) times the Ping out and closes the
+// client, instead of holding the shard (6b3b2 final review I-1).
+func testPingerRealSendDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		rec := NewRecorder(1, []string{"gw-0"})
+		p := newPinger(pingTick, rec)
+		a, b := net.Pipe()
+		defer b.Close()
+		key, err := wire.GenerateKey()
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() { // the gateway's side: answer the handshake, then read nothing
+			f := make([]byte, wire.HeaderLen+wire.HandshakeLen)
+			if _, err := io.ReadFull(b, f); err != nil {
+				return
+			}
+			if _, reply, err := wire.Respond(key, f, uint16(clientpb.Cmd_CMD_HANDSHAKE)); err == nil {
+				b.Write(reply)
+			}
+		}()
+		c := clientconn.New(a)
+		if err := c.Handshake(1, key.Public, time.Now().Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		p.add(&lightConn{c: c})
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() { p.run(ctx); close(done) }()
+		time.Sleep(pingTick + pingSendTimeout + pingTick/2)
+		synctest.Wait()
+		if c := rec.Counts(); c.PingSendTimeouts != 1 {
+			t.Errorf("ping_send_timeouts %d, want 1", c.PingSendTimeouts)
+		}
+		b.SetReadDeadline(time.Now().Add(pingTick))
+		if _, err := b.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+			t.Errorf("the blocked client's connection: read %v, want EOF (closed)", err)
+		}
+		cancel()
+		a.Close() // a Send still blocked without a deadline returns now
+		<-done
+	})
+}
+
+func testPingerTimesOutABlockedSend(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		rec := NewRecorder(2, []string{"gw-0"})
 		p := newPinger(pingTick, rec) // one slot: every client every tick
