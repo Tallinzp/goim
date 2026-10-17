@@ -9,15 +9,17 @@
 #   garbage: 2 x 200k light clients (the operating point per gateway) Ping
 #       every 30s, then loadgen instance flood sends garbage handshakes (a
 #       valid header and key_id, a random Noise message: each costs the
-#       gateway a DH) at 60,000/s for 90s from 253 sources, above both
-#       gateways' buckets (2 x 25,000/s), so the limiter refuses the excess:
+#       gateway a DH) at 80,000/s for 90s from 253 sources, above both
+#       gateways' buckets (2 x 25,000/s) even when least-connections splits
+#       it 65/35 (the dry run's split: a refused attempt closes sooner, so
+#       its gateway gets more), so each limiter refuses part of it:
 #       every Ping is still answered on time and the gateways renew their
 #       leases (#121 (1)).
 #   slow: instances flood and flood2 hold 80k slow-handshake and 40k
 #       slow-auth connections (sends nothing; handshakes, then sends
 #       nothing), freed by the gateways' 5s timeouts and redialed, while
 #       400k light clients log in beside them and Ping: no Busy, no reject,
-#       no limiter refusal (slow-auth's ~7k handshakes/s fit the buckets,
+#       no bucket refusal (slow-auth's ~7k handshakes/s fit the buckets,
 #       6b3a Review Focus 5).
 # Logic is one process (minReplicas, no HPA), unthrottled.
 #
@@ -40,7 +42,7 @@
 #   FLOODS_HEARTBEAT       garbage, slow: the gateways' -heartbeat and the light
 #                          clients' Ping interval, seconds (default 30, the
 #                          lowest the gateway takes: most Pings per flood)
-#   FLOODS_GARBAGE_RATE    garbage attempts per second (default 60000)
+#   FLOODS_GARBAGE_RATE    garbage attempts per second (default 80000)
 #   FLOODS_GARBAGE_INFLIGHT  garbage attempts in flight at most (default 20000)
 #   FLOODS_GARBAGE_SECONDS the garbage flood's length (default 90: 3 Pings each;
 #                          at least 45, so the profile from 10s to 40s ends inside it)
@@ -89,8 +91,11 @@
 #   slow_freed            the gateways counted at least as many
 #                         handshake_timeout and auth_timeout closes
 #   slow_legit            every light client logs in beside the floods: no
-#                         Busy, no reject (login_queue, pending_mem,
-#                         at_capacity) and no limiter refusal
+#                         Busy, no reject (login_queue, pending_mem: the
+#                         slots, at_capacity) and no bucket refusal
+#                         (no_token); the concurrency limit's (no_slot,
+#                         retried as in storm) and loadgen's failed are
+#                         recorded
 #   slow_heartbeats, slow_lease   as garbage's, over the floods
 #   no_swap_in_slow       no page swapped in from the floods' start to their stop
 #   <phase>_idle          after loadgen stops, every gateway reaches 0
@@ -296,7 +301,7 @@ phase_storm() {
 
 # garbage: #121 (1), garbage handshakes beside a Pinging population.
 phase_garbage() {
-  local n=${FLOODS_CLIENTS:-400000} rate=${FLOODS_RATE:-10000} grate=${FLOODS_GARBAGE_RATE:-60000}
+  local n=${FLOODS_CLIENTS:-400000} rate=${FLOODS_RATE:-10000} grate=${FLOODS_GARBAGE_RATE:-80000}
   local inflight=${FLOODS_GARBAGE_INFLIGHT:-20000} secs=${FLOODS_GARBAGE_SECONDS:-90}
   local online s0 s1 d l0 l1 tw0 tw1 usage want flood prof t0 lease_s f
   STACK_GATEWAYS=2 STACK_GATEWAY_ARGS=(-max-conns $((n / 2 + n / 10 + inflight)) -heartbeat "${HB}s"
@@ -387,7 +392,7 @@ phase_slow() {
   t2_check slow_held "$held" "\"slowhs\": $(lg_py "$STACK_DIR/artifacts/loadgen-slowhs.json" '{k: d["flood"][k] for k in ("attempts", "open", "outcomes", "held")}'), \"slowauth\": $(lg_py "$STACK_DIR/artifacts/loadgen-slowauth.json" '{k: d["flood"][k] for k in ("attempts", "open", "outcomes", "held")}')"
   t2_check slow_freed "$(echo "{\"g\": $d, \"h\": $(lg_py "$STACK_DIR/artifacts/loadgen-slowhs.json" 'd["flood"]["outcomes"].get("closed", 0)'), \"a\": $(lg_py "$STACK_DIR/artifacts/loadgen-slowauth.json" 'd["flood"]["outcomes"].get("closed", 0)')}" | lg_true - 'sum(v["rejects_handshake_timeout"] for v in d["g"].values()) >= d["h"] and sum(v["rejects_auth_timeout"] for v in d["g"].values()) >= d["a"]')" \
     "\"handshake_timeout\": $(echo "$d" | lg_py - 'sum(v["rejects_handshake_timeout"] for v in d.values())'), \"slowhs_closed\": $(lg_py "$STACK_DIR/artifacts/loadgen-slowhs.json" 'd["flood"]["outcomes"].get("closed", 0)'), \"auth_timeout\": $(echo "$d" | lg_py - 'sum(v["rejects_auth_timeout"] for v in d.values())'), \"slowauth_closed\": $(lg_py "$STACK_DIR/artifacts/loadgen-slowauth.json" 'd["flood"]["outcomes"].get("closed", 0)')"
-  t2_check slow_legit "$(echo "{\"g\": $d, \"o\": ${online:-false}}" | lg_true - 'd["o"] is True and all(v[k] == 0 for v in d["g"].values() for k in ("logins_busy", "rejects_login_queue", "rejects_pending_mem", "rejects_at_capacity", "hs_no_slot", "hs_no_token"))')" \
+  t2_check slow_legit "$(echo "{\"g\": $d, \"o\": ${online:-false}}" | lg_true - 'd["o"] is True and all(v[k] == 0 for v in d["g"].values() for k in ("logins_busy", "rejects_login_queue", "rejects_pending_mem", "rejects_at_capacity", "hs_no_token"))')" \
     "\"want\": $n, \"online\": ${online:-false}, \"failed\": $(lg_json 'd["failed"]'), \"login_latency\": $(lg_json 'd["login_latency"]'), \"gateways\": $(echo "$d" | lg_py - '{g: {k: v[k] for k in ("logins_ok", "logins_busy", "rejects_login_queue", "rejects_pending_mem", "rejects_at_capacity", "hs_no_slot", "hs_no_token")} for g, v in d.items()}')"
   heartbeats slow "$n" "$d"
   lease slow "$d" "$lease_s" "$(stack_counters_delta "$l0" "$l1")"
