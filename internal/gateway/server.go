@@ -76,6 +76,11 @@ func (g *Gateway) Start(ctx context.Context, sc ServerConfig) error {
 	if g.limitsErr != nil {
 		g.log.Error("limits self-check failed: staying NotReady", "err", g.limitsErr)
 	}
+	if c := conntrackCount(g.cfg.Limits.CountPath, g.limits); c != nil {
+		if err := g.registry.Register(c); err != nil {
+			g.log.Warn("nf_conntrack_count not exported", "err", err)
+		}
+	}
 	for _, target := range []string{sc.LogicTarget, sc.LeaseTarget} {
 		cc, err := g.dial(target)
 		if err != nil {

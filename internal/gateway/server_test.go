@@ -11,6 +11,7 @@ import (
 
 	pb "github.com/Tallinzp/goim/api/internalpb"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestLimitsSelfCheck(t *testing.T) {
@@ -82,6 +83,47 @@ func TestReadyOnlyAfterLogicAndFirstLease(t *testing.T) {
 	keysLoaded.Store(true)
 	if readyz(t, l.g) != http.StatusOK {
 		t.Fatalf("not Ready: %v", l.g.Ready())
+	}
+}
+
+// The node's nf_conntrack_count is a gauge read at each scrape, where the
+// file is readable at startup, and absent where it is not (spec:
+// Observability, limits; run 30: the table filled unseen).
+func TestConntrackCountGauge(t *testing.T) {
+	n := "120\n"
+	c := conntrackCount("/count", limitSource{readFile: func(string) ([]byte, error) { return []byte(n), nil }})
+	if c == nil {
+		t.Fatal("a readable count has no gauge")
+	}
+	if v := testutil.ToFloat64(c); v != 120 {
+		t.Fatalf("gauge %v, want 120", v)
+	}
+	n = "121\n"
+	if v := testutil.ToFloat64(c); v != 121 {
+		t.Fatalf("gauge %v after the count changed, want 121", v)
+	}
+	for _, err := range []error{fs.ErrNotExist, errors.New("permission denied")} {
+		if conntrackCount("/count", limitSource{readFile: func(string) ([]byte, error) { return nil, err }}) != nil {
+			t.Fatalf("%v: a gauge, want none", err)
+		}
+	}
+	if conntrackCount("/count", limitSource{readFile: func(string) ([]byte, error) { return []byte("x\n"), nil }}) != nil {
+		t.Fatal("an unparsable count: a gauge, want none")
+	}
+}
+
+// Start registers the gauge, so /metrics serves it.
+func TestMetricsServeConntrackCount(t *testing.T) {
+	l := startLive(t, nil, nil) // okLimits: every limit file reads 4000000
+	_, admin := l.g.Addrs()
+	resp, err := http.Get("http://" + admin + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), "goim_gateway_nf_conntrack_count 4e+06") {
+		t.Fatal("/metrics has no goim_gateway_nf_conntrack_count 4e+06")
 	}
 }
 
