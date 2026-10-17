@@ -137,7 +137,7 @@ type Session struct {
 // frame, with the static key its key_id selected. It returns the session and
 // the server's handshake frame (Cmd = cmd, payload = the raw Noise message).
 func Respond(key Key, frame []byte, cmd uint16) (*Session, []byte, error) {
-	return respond(newSuite(key.priv), key, frame, cmd, nil)
+	return respond(newSuite(key), key, frame, cmd, nil)
 }
 
 // respond is Respond with cipher suite cs and the ephemeral key read from rng
@@ -178,7 +178,7 @@ type Initiator struct {
 // Initiate starts the client side: it returns the handshake frame to send,
 // for the server key pinned under keyID.
 func Initiate(keyID uint16, serverPub []byte, cmd uint16) (*Initiator, []byte, error) {
-	return initiate(newSuite(nil), keyID, serverPub, cmd, nil)
+	return initiate(newSuite(Key{}), keyID, serverPub, cmd, nil)
 }
 
 // initiate is Initiate with cipher suite cs and the ephemeral key read from

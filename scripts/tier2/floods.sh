@@ -234,7 +234,10 @@ t2_on_exit 'stack_down'
 t2_on_exit 'lg_stop_all' # newest first: every loadgen instance stops before the stack
 smp="" prof=""
 t2_on_exit '[ -n "$smp" ] && kill "$smp" 2>/dev/null'
-t2_on_exit '[ -n "$prof" ] && kill "$prof" 2>/dev/null'
+# kill_tree PID: PID and its descendants, so the exit trap stops a profile
+# subshell's curls too (6b3b4 final review M4).
+kill_tree() { local c; for c in $(pgrep -P "$1"); do kill_tree "$c"; done; kill "$1" 2>/dev/null; }
+t2_on_exit '[ -n "$prof" ] && kill_tree "$prof"'
 cts=""
 t2_on_exit '[ -n "$cts" ] && kill "$cts" 2>/dev/null'
 
@@ -660,7 +663,9 @@ phase_storm() {
   hs_sampler gw-0 "$STACK_DIR/artifacts/handshakes-gw-0.tsv" "$LG_PID" &
   smp=$!
   # The gateway's and loadgen's CPU over 8s of the ramp, from 1s in: X25519's
-  # share on both sides of the handshake (#130).
+  # share on both sides of the handshake (#130). pprof's few percent fall
+  # inside the window storm_rate measures, as the garbage phase's do in its
+  # window: runs before 6b3b4 had no storm profile (final review M3).
   (sleep 1; stack_profile storm 8 & lg_profile storm 8 & wait) >/dev/null 2>&1 &
   prof=$!
   online=$(t2_bool lg_wait "$(settled "$n")" $((n / rate * 3 + 60)))

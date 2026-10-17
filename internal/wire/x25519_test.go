@@ -31,7 +31,7 @@ func countParses(t *testing.T) *atomic.Int64 {
 }
 
 func TestSuiteNameIsDH25519s(t *testing.T) {
-	if got, want := newSuite(nil).Name(), dh25519.Name(); !bytes.Equal(got, want) {
+	if got, want := newSuite(Key{}).Name(), dh25519.Name(); !bytes.Equal(got, want) {
 		t.Fatalf("name %q, want %q", got, want)
 	}
 }
@@ -40,7 +40,7 @@ func TestSuiteNameIsDH25519s(t *testing.T) {
 // side completes a handshake with the other's old implementation.
 func TestHandshakeBytesMatchDH25519(t *testing.T) {
 	k := key(t)
-	_, f1, err := initiate(newSuite(nil), 3, k.Public, cmdHandshake, seeded(1))
+	_, f1, err := initiate(newSuite(Key{}), 3, k.Public, cmdHandshake, seeded(1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func TestHandshakeBytesMatchDH25519(t *testing.T) {
 	if !bytes.Equal(f1, ref1) {
 		t.Fatal("the client's handshake frame differs from DH25519's")
 	}
-	srv, f2, err := respond(newSuite(k.priv), k, f1, cmdHandshake, seeded(2))
+	srv, f2, err := respond(newSuite(k), k, f1, cmdHandshake, seeded(2))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestAKeyFromItsBytesAloneStillWorks(t *testing.T) {
 // bytes. A handshake with such an ephemeral fails.
 func TestDHRefusesWhatX25519Refuses(t *testing.T) {
 	k := key(t)
-	s := newSuite(k.priv)
+	s := newSuite(k)
 	for _, pub := range [][]byte{make([]byte, 32), make([]byte, 31)} {
 		if _, err := s.DH(k.Private, pub); err == nil {
 			t.Fatalf("DH with a %d-byte public key %x: no error", len(pub), pub)
@@ -150,7 +150,16 @@ func TestConcurrentRespondsOnOneKey(t *testing.T) {
 	for range 4 {
 		wg.Go(func() {
 			for range 10 {
-				if _, _, err := handshake(t, ks, 1, k.Public, nil); err != nil {
+				// Not handshake: its t.Fatal can't stop the test from a
+				// goroutine (final review M2).
+				in, f1, err := Initiate(1, k.Public, cmdHandshake)
+				if err == nil {
+					var f2 []byte
+					if _, f2, err = Respond(ks[KeyID(f1)], f1, cmdHandshake); err == nil {
+						_, err = in.Finish(f2)
+					}
+				}
+				if err != nil {
 					t.Error(err)
 					return
 				}
@@ -165,7 +174,7 @@ func TestConcurrentRespondsOnOneKey(t *testing.T) {
 // review I1: +400 B and the ephemeral per live connection otherwise).
 func TestASessionKeepsNoHandshakeKeys(t *testing.T) {
 	k := key(t)
-	cli, srv := newSuite(nil), newSuite(k.priv)
+	cli, srv := newSuite(Key{}), newSuite(k)
 	in, f1, err := initiate(cli, 1, k.Public, cmdHandshake, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -181,5 +190,16 @@ func TestASessionKeepsNoHandshakeKeys(t *testing.T) {
 		if s.keys != [2]*ecdh.PrivateKey{} || s.raw[0] != nil || s.raw[1] != nil {
 			t.Errorf("%s suite still keeps its keys", name)
 		}
+	}
+}
+
+var suiteSink *suite // so newSuite's result escapes, as in respond
+
+// A server suite reuses the Key's private bytes rather than copying them: one
+// allocation, the suite itself, per Respond (final review M1).
+func TestNewSuiteAllocatesOnlyItself(t *testing.T) {
+	k := key(t)
+	if n := testing.AllocsPerRun(100, func() { suiteSink = newSuite(k) }); n != 1 {
+		t.Fatalf("newSuite allocates %v times, want 1", n)
 	}
 }

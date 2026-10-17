@@ -733,7 +733,7 @@ go tool pprof -peek 'NewPrivateKey$' "$R/garbage/artifacts/garbage/gw-0.cpu.pb.g
 ```
 
 There are 30 checks. The comparisons, phase by phase:
-- **Storm** (against run 30c): `storm_rate`'s `no_slot_share` (0.27) should fall, since a slot is held for half as long. `new_per_s` (15,962, loadgen-bound) may rise, since loadgen's own handshakes cost half. The verdict may stay `loadgen-bound`: loadgen still runs 200k light clients on 8 CPUs.
+- **Storm** (against run 30c): `storm_rate`'s `no_slot_share` (0.27) should fall, since a slot is held for half as long. `new_per_s` (15,962, loadgen-bound) may rise, since loadgen's own handshakes cost half. The verdict may stay `loadgen-bound`: loadgen still runs 200k light clients on 8 CPUs. The storm now profiles gw-0 and loadgen from 1s to 9s, inside the window it measures (pprof's few percent, as the garbage phase has always had); runs before 30i didn't (final review M3).
 - **Garbage** (against run 30c): a garbage handshake costs 1 multiplication, not 2. The slots bound the flood at ~21,600 DH/s per gateway in run 30c. They can now pass about twice as many, so `garbage_limited`'s `bound_by` may move from the slots to the bucket (25,000/s). The 400,000 Pinging clients' checks should pass as before.
 - **Slow at 7,500/s** (against run 30e, which failed only on verdict `gateway-set-saturated`): the gateway set's busy share falls for two reasons, the gateways' `Respond` and slow-auth's `Initiate`/`Finish`, since slow-auth completes a real handshake per connection on the same CPUs (review O3). The gateways' own cores are the measure of #130's gain there. The concurrency limit's refused share (51% in 30e) should fall. A `valid` verdict with `slow_legit` and `slow_heartbeats` passing is the expected result. `loadgen-saturated` is still a valid record: slow-auth's handshakes got cheaper, but light clients' retries may not drop enough. The order in `first_s` rules on it as before.
 
@@ -786,3 +786,18 @@ Push the branch. Fast-forwarding `main` is the user's call.
 - **Fixed-base key generation** (#130's possible later step): `GenerateKeypair`'s one remaining basepoint multiplication could use edwards25519's precomputed-table `ScalarBaseMult`, several times cheaper. Only if run 30i's profiles (Task 3) still show key generation high.
 
 ## Execution Notes
+
+### Tasks 1–2 executed (2026-10-17)
+
+- Commits (from `4cea62e`): benchmarks and `c28561a` (wire), `66c3d4b` (floods' storm profiles). All steps' expectations met: 5/5 mutations caught; `make test`, `go vet`, `make test-load-probe`, `make test-scripts` green.
+- Benchmarks on the dev machine (`-benchtime 3000x`, mean of 5, µs per op): `Respond` 447 → 226, `Initiate` 291 → 141, `Finish` 146 → 76; `InitiatorHeap` 616 → 1,016 B.
+- `floods` dry run: 30 checks, failing only `no_swap_in_storm`/`_garbage`/`_slow` (the dev machine's swap; the prototype had only garbage's). `artifacts` passed. Storm profiles 8s; `x25519ScalarMult` 61.7% of gw-0, 39.2% of loadgen; `NewPrivateKey`'s only caller `wire.(*suite).GenerateKeypair`.
+
+### Final review (fresh Opus reviewer, 2026-10-17)
+
+0 Critical, 1 Important, 4 Minor; all fixed (the minors on the user's request).
+- **I-1** (`4abae14`): flynn/noise's `CipherState` keeps its `CipherSuite`, so every live `Session` kept the handshake's `suite`: the ephemeral private key and a copy of the static key, +400 B per connection (+100 MB at the 250k cap). Review Focus 6 had counted only the pending `Initiator`. Fix: `suite.forget()` after the last DH (`respond` after `WriteMessage`, `Finish` after `ReadMessage`). `TestASessionKeepsNoHandshakeKeys`; new `BenchmarkSessionHeap`: live heap per server Session 199 B before #130, 599 B at `66c3d4b`, 295 B now (the 96 B left is the emptied suite). `InitiatorHeap` 1,032 B (the `Initiator.cs` field).
+- **M1**: `newSuite` copied the static key (`k.Bytes()`), one allocation per `Respond`. It now takes the `Key` and keeps `k.Private`, the slice flynn/noise passes back to `DH`. `TestNewSuiteAllocatesOnlyItself` (2 → 1). `Respond` ~210µs.
+- **M2**: `TestConcurrentRespondsOnOneKey` called `handshake` (whose `t.Fatal` can't stop a test from a goroutine); it now runs the handshake inline and reports with `t.Error`.
+- **M3**: the storm's profiles (1s–9s) fall inside the window `storm_rate` measures, as the garbage phase's always have. Noted in `floods.sh` and in Task 3's storm comparison: runs before 30i had no storm profile.
+- **M4**: the exit trap killed only the profile subshell, leaving its curls to their `-m` timeout. `floods.sh` now has `kill_tree` (as `gwloss.sh`), and the trap uses it; `floods_test.sh` checks both.

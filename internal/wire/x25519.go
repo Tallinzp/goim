@@ -34,13 +34,14 @@ type suite struct {
 	raw  [2][]byte           // their private bytes, as flynn/noise passes them back
 }
 
-// newSuite returns the suite for one handshake with the static key k (nil
+// newSuite returns the suite for one handshake with the static key k (Key{}
 // for none, the client's side of NK). A suite serves one handshake: it
-// remembers the one ephemeral it generates.
-func newSuite(k *ecdh.PrivateKey) *suite {
+// remembers the one ephemeral it generates. It keeps k.Private itself, the
+// slice flynn/noise passes back to DH, rather than a copy (final review M1).
+func newSuite(k Key) *suite {
 	s := &suite{CipherFunc: noise.CipherChaChaPoly, HashFunc: noise.HashSHA256}
-	if k != nil {
-		s.keys[0], s.raw[0] = k, k.Bytes()
+	if k.priv != nil {
+		s.keys[0], s.raw[0] = k.priv, k.Private
 	}
 	return s
 }
