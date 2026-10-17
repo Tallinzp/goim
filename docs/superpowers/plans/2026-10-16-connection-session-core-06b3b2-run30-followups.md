@@ -1298,3 +1298,40 @@ Push the branch. Fast-forwarding `main` is the user's call.
 - **The spec:** nothing here changes its text. The gauge implements a line it already has. #125 (review O2) queues a follow-up for the next revision, with #97 and #101: run 30 showed that `nf_conntrack_max ≥ 2 × cap` doesn't survive a handshake flood.
 
 ## Execution Notes
+
+**Executed 2026-10-17** (inline, superpowers:executing-plans), on `feat/plan6b3` from `512c5cb`:
+- `1793f91` Task 1, the pinger. The four mutations were caught as the plan says.
+- `8ca6336` Task 2, the gauge.
+- `d960a9a` Task 3, NOTRACK and the guard. 12 `notrack` oks.
+- `f0145d0` Task 4, `floods`. The checks below all passed.
+
+`make test`, `make test-scripts`, `go vet ./...` and `go test -race` on the changed packages are green.
+
+**Dry run** (dev machine):
+- 30 checks. Only `no_swap_in_*` failed (1, 29 and 558 pages of the dev machine's own swapping).
+- `storm_rate`: `met`, `new_per_s` 957 of 1,000, `loadgen_cores_ramp` 0.745 of 2 CPUs.
+- `garbage_limited`: both gateways `bound_by` `bucket` (gw-0 `no_token` 33,831, gw-1 6,386).
+- `ping_gap_max_ms`: 30,005 in garbage and 30,001 in slow. Tick lag ≤ 12ms, no Send timeouts.
+- `_conntrack`: null peaks (no conntrack on the dev machine), `conns` 2,000, 2,500 and 3,000.
+
+**Forced cases** (each as the plan expects, except two differences noted):
+- **Gap and conntrack max:** `garbage_heartbeats` and `garbage_conntrack` failed (801 of 1000, `peak_per_conn` 0.3204).
+- **Connections share:** with 300 of 1M, `storm_conntrack` failed at `peak_per_conn` 0.15. With 100 it passed at 0.05.
+- **Loadgen-bound:** verdict `loadgen-bound`, `loadgen_cores_ramp` 0.919 of 1 CPU, with the `storm:` `not_covered` line. Different from the prototype:
+  - `new_per_s` was null, because the starved sampler's gaps reached 2.7s. The verdict comes from the CPU reading, so it still holds.
+  - `storm_online` passed, because the dev machine got all 20k clients online this time.
+- **Short:** verdict `short`, `new_per_s` 772, 1.073 of 2 CPUs.
+- **Bucket `not_covered` condition** (checked on JSON): true, false, false.
+
+**Final review** (Opus, fresh context) found 0 Critical and 1 Important.
+- **I-1, fixed `f82adb2`:** no test ran the pinger's real `send`, so nothing would catch a missing `SetWriteDeadline`. The new test is `TestPingerTimesOutABlockedSend/the_real_Send`: a handshaken `net.Pipe` whose peer never reads. It fails with the deadline line removed and passes with it.
+- **Minors, deferred (the user decides):**
+  1. The storm verdict counts `T2_CPUS_LOADGEN`, not `lg_start`'s `${LG_CPUS:-…}`. With an empty set and a null reading it would give `loadgen-bound`.
+  2. The bucket's `not_covered` line is written only when every gateway is bound by the slots alone, so a mixed case writes none.
+  3. The write deadline stays set after a Ping, so a write added later in `read()` would inherit it.
+  4. `start` is taken after `NewTicker`, so ticks come a few ns early. This was harmless in the reviewer's probe.
+  5. Task 5's firewall check should cover `OUTPUT` too.
+  6. A non-numeric `STACK_PORT_BASE` is refused with an empty message.
+  7. Each Ping takes the Recorder lock 2–3 times. Watch `ping_send_max_ms` in run 30b.
+
+Next: Task 5 on the host (the user): `sudo scripts/tier2/host-setup.sh` after the firewall checks, then run 30b.
