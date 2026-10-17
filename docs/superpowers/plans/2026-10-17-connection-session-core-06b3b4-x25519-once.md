@@ -876,3 +876,18 @@ Asked by the user after run 30i ("should it be 10000/s?"): 10,000/s is `FLOODS_R
 
   400,000 online; `pending_mem`, Busy, `at_capacity`, `login_queue`, `no_token` 0 on both gateways; `pending_max` ≤ 59,178 of 100k; no heartbeat close, `ping_gap_max_ms` 30,021. `first_s`: only `no_slot` and `light_refused` (1.2). Highest per-second gateway-set reading 76.2% (2.3s).
 - **Reading:** `floods` passes at its own defaults, the first time since the scenario was written (runs 30–30c failed; 30d passed only at 5,000/s). At 10,000 legitimate logins/s beside 80,000 slow-handshake and 40,000 slow-auth connections, the gateways' set (with slow-auth's ~2 cores on it) stays at 60% over the ramp, so the edge #129 put at 5,500–6,000/s is now above 10,000/s on this host. The concurrency limit still refuses 10.7% of the light handshakes (retried, none given up): #111's input at the new hold.
+
+### Run 30l, the slow phase at 15,000/s, a rate-edge probe (2026-10-17, the user, Tier 2 host; commit `16f93e7`, `dirty` 0, 111s; `floods-20261017-091334`; `FLOODS_PHASES=slow FLOODS_RATE=15000`; continues #129's probes)
+
+Asked by the user after run 30k ("maybe we can make it higher? 15000/s?"). **Passed 12/12, verdict `valid`.** No swap; conntrack peak 24. `dmesg` not sent.
+- **Gated readings:** 400,000 online, none gave up, failures `pre-handshake` 172,050 only; `pending_mem`, Busy, `at_capacity`, `login_queue`, `no_token` 0 on both gateways; `hs_no_slot` 138,444 / 141,990. Login p50/p90/p99/max 11 / 71 / 270 / 377ms. 1,045,926 Pongs, none missing, Pong p99/max 59 / 154ms, no heartbeat close, `ping_gap_max_ms` 30,012, `ping_tick_lag_max_ms` 444.
+- **The light rate after #130** (slow phase, same floods; 30i/30k/30l on `16f93e7`):
+
+  | light rate | verdict | gateway set (ramp) | Logic set (ramp) | loadgen (ramp) | light handshakes refused | gave up | login p99 | Pong p99 |
+  |---|---|---|---|---|---|---|---|---|
+  | 7,500/s (30i) | `valid` | 53.6% | 46.2% | 20.7% | 6.6% | 0 | 51ms | 15ms |
+  | 10,000/s (30k) | `valid` | 59.9% | 51.7% | 27.7% | 10.7% | 0 | 58ms | 5ms |
+  | 15,000/s (30l) | `valid` | 72.8% | 62.1% | 53.0% | 30.1% | 0 | 270ms | 59ms |
+
+- **Per second (`first_s`):** every set crossed 85% for single seconds inside a valid window: the gateway set from 3.3s (84.8–87.6% at 2.2–9.0s, ~75–85% after), Logic's at 20.4s (87.9%), loadgen's at 22.7s (85.6%); `pending_mem`, `gave_up`, `stats_unanswered`, `scrape_late`, `closes_heartbeat` null. `gw_runq_ms_per_s` 1,100–1,930 through the ramp (30k: 130–1,160), back to ~200 in the hold. Logins reached ~12–18k/s, so the 400,000 were online in ~28s.
+- **Reading:** 15,000 legitimate logins/s beside the slow floods still holds, with nobody refused for memory or capacity and nobody giving up, but it is near this host's edge: the gateway set averages 73% with seconds over 85%, the run-queue wait is back at run 30e's level (the gateways share their set with slow-auth), and the concurrency limit refuses 30% of handshakes (retried), so login p99 rises from 58 to 270ms. Past this rate all three CPU sets saturate together, so the host, not the gateway, would be measured; the probes stop here. Before #130 the edge was 5,500–6,000/s (runs 30e–30g).
