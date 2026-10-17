@@ -48,10 +48,10 @@ expect "verdict: gateways before Logic" "$(chk "$(w 50 10 10)" "$(w 50 50 50)")"
 expect "verdict: 85.0% busy is in" "$(chk "$(w 15.1 15.1 15.1)" "$(w 15 50 50)")" '"loadgen-saturated"'
 expect "verdict: unread" "$(chk null "$(w 50 50 50)")" '"unread"'
 
-# slow_series over synthetic lines. gwj NO_SLOT [CLOSES [RUNQ]] is one
-# gateway's reading; line MS SKEW_MS GW0 GW1 [LG] one sample.
-gwj() { echo "{\"online\": 100, \"handshake\": 1, \"auth_pending\": 1, \"pending_mem\": 0, \"no_slot\": $1, \"logins_ok\": 50, \"closes_heartbeat\": ${2:-0}, \"runq_ns\": ${3:-0}}"; }
-line() { echo "{\"ms\": $1, \"ticks\": [0, 0, 0], \"sets\": {}, \"lg\": ${5:-null}, \"gw\": {\"gw-0\": $3, \"gw-1\": $4}, \"ms_end\": $(($1 + $2))}"; }
+# slow_series over synthetic lines. gwj NO_SLOT [CLOSES] is one gateway's
+# reading; line MS SKEW_MS GW0 GW1 [LG [RQ0 RQ1]] one sample.
+gwj() { echo "{\"online\": 100, \"handshake\": 1, \"auth_pending\": 1, \"pending_mem\": 0, \"no_slot\": $1, \"logins_ok\": 50, \"closes_heartbeat\": ${2:-0}}"; }
+line() { echo "{\"ms\": $1, \"ticks\": [0, 0, 0], \"sets\": {}, \"lg\": ${5:-null}, \"rq\": {\"gw-0\": ${6:-0}, \"gw-1\": ${7:-0}}, \"gw\": {\"gw-0\": $3, \"gw-1\": $4}, \"ms_end\": $(($1 + $2))}"; }
 col() { python3 -c 'import json,sys; d=json.loads(sys.argv[1]); c=d["columns"].index(sys.argv[2]); print([r[c] for r in d["rows"]])' "$1" "$2"; }
 first() { python3 -c 'import json,sys; print(json.loads(sys.argv[1])["first_s"][sys.argv[2]])' "$1" "$2"; }
 
@@ -95,9 +95,15 @@ expect "series: the gateways' first no_slot" "$(first "$s" no_slot)" 1.0
 
 # A run-queue total that went down (a thread gone, a restarted gateway) is
 # no reading, never a negative wait (M6).
-{ line 0 10 "$(gwj 0 0 5000000000)" "$(gwj 0 0 5000000000)"; line 1000 10 "$(gwj 0 0 1000000000)" "$(gwj 0 0 1000000000)"; line 2000 10 "$(gwj 0 0 1100000000)" "$(gwj 0 0 1000000000)"; } >"$tmp/m6.jsonl"
+{ line 0 10 "$(gwj 0)" "$(gwj 0)" null 5000000000 5000000000; line 1000 10 "$(gwj 0)" "$(gwj 0)" null 1000000000 1000000000; line 2000 10 "$(gwj 0)" "$(gwj 0)" null 1100000000 1000000000; } >"$tmp/m6.jsonl"
 s=$(slow_series "$tmp/m6.jsonl")
 expect "series: no negative run-queue wait" "$(col "$s" gw_runq_ms_per_s)" "[None, 100.0]"
+
+# A gateway's failed scrape keeps its run-queue wait, which is read beside
+# it, not inside it (P6b3b3I-2): gw-1 waits 1s/s and its middle scrape fails.
+{ line 0 10 "$(gwj 0)" "$(gwj 0)" null 0 0; line 1000 10 "$(gwj 0)" null null 100000000 1000000000; line 2000 10 "$(gwj 0)" "$(gwj 0)" null 200000000 2000000000; } >"$tmp/i2.jsonl"
+s=$(slow_series "$tmp/i2.jsonl")
+expect "series: run-queue wait through a failed scrape" "$(col "$s" gw_runq_ms_per_s)" "[1000.0, 1000.0]"
 expect "series: columns" "$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])["columns"]))' "$s")" 19
 
 [ "$fails" -eq 0 ] && echo "floods_test: all passed" || { echo "floods_test: $fails failed"; exit 1; }

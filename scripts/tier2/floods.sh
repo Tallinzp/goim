@@ -508,9 +508,11 @@ runq_ns() {
 # ticks], "sets": {"loadgen", "gateway", "logic": [busy, total]}, "lg":
 # the light instance's {"online", "gave_up", "failed", "refused": its own
 # pre-handshake failures, a gateway's refusals} (null when /stats does not
-# answer within 1s: a saturated loadgen answers late), "gw": {gateway:
-# SERIES_COUNTERS plus "runq_ns", null if its /metrics does not answer
-# within 1s}, "ms_end": the clock after the gateways' scrapes}. The clock,
+# answer within 1s: a saturated loadgen answers late), "rq": {gateway: its
+# threads' run-queue wait in ns}, apart from its scrape so a failed one
+# keeps it (P6b3b3I-2), "gw": {gateway: SERIES_COUNTERS, null if its
+# /metrics does not answer within 1s}, "ms_end": the clock after the
+# gateways' scrapes}. The clock,
 # CPU and run-queue readings come first, side by side; the gateways'
 # scrapes trail them by ms_end - ms (up to ~2s), and /stats comes last.
 SERIES_COUNTERS=(
@@ -523,7 +525,7 @@ SERIES_COUNTERS=(
   closes_heartbeat='goim_gateway_closes_total:reason="heartbeat"'
 )
 slow_sampler() {
-  local ms ms_end ticks sets lg gw g p t
+  local ms ms_end ticks sets lg gw rqj g p t
   local -A rq
   while :; do
     ms=$(date +%s%3N) ticks=""
@@ -531,15 +533,14 @@ slow_sampler() {
     sets="\"loadgen\": [$(set_ticks "$T2_CPUS_LOADGEN" | tr ' ' ,)], \"gateway\": [$(set_ticks "$T2_CPUS_GATEWAY" | tr ' ' ,)], \"logic\": [$(set_ticks "$T2_CPUS_LOGIC" | tr ' ' ,)]"
     rq=()
     for g in $(stack_admins | awk '$1 ~ /^gw-/ { print $1 }'); do rq[$g]=$(runq_ns "${STACK_PIDS[$g]}"); done
-    gw=""
+    gw="" rqj=""
     for g in "${!rq[@]}"; do
       t=$(STACK_CURL_TIMEOUT=1 stack_counters "$g" "${SERIES_COUNTERS[@]}")
-      [ "$t" = null ] || t="${t%\}}, \"runq_ns\": ${rq[$g]:-null}}"
-      gw+="${gw:+, }\"$g\": $t"
+      gw+="${gw:+, }\"$g\": $t" rqj+="${rqj:+, }\"$g\": ${rq[$g]:-null}"
     done
     ms_end=$(date +%s%3N)
     lg=$(LG_CURL_TIMEOUT=1 lg_get /stats '{"online": d["online"], "gave_up": d["failed"].get("gave-up", 0), "failed": sum(d["failed"].values()), "refused": d["failed"].get("pre-handshake", 0)}')
-    echo "{\"ms\": $ms, \"ticks\": [$ticks], \"sets\": {$sets}, \"lg\": ${lg:-null}, \"gw\": {$gw}, \"ms_end\": $ms_end}" >>"$1"
+    echo "{\"ms\": $ms, \"ticks\": [$ticks], \"sets\": {$sets}, \"lg\": ${lg:-null}, \"rq\": {$rqj}, \"gw\": {$gw}, \"ms_end\": $ms_end}" >>"$1"
     sleep 1
   done
 }
@@ -557,7 +558,8 @@ slow_sampler() {
 # slow-auth's own refusals too; lg_refused_per_s is the light clients'
 # alone (M5). gw_runq_ms_per_s is the larger gateway's run-queue wait per
 # second, summed over its threads, null for a gateway whose total went
-# down (a thread gone, M6): recorded, not gated (6b3b3 review O2).
+# down (a thread gone, M6), kept through a failed scrape (P6b3b3I-2):
+# recorded, not gated (6b3b3 review O2).
 slow_series() {
   python3 -c 'import json, os, sys
 rows = []
@@ -586,8 +588,8 @@ def per_s(p, b, k):
         return None
     return round(sum(b["gw"][g][k] - (p["gw"][g].get(k) or 0) for g in b["gw"]) / ((b["ms"] - p["ms"]) / 1000), 1)
 def runq(a, b, dt):
-    v = [(b["gw"][g]["runq_ns"] - a["gw"][g]["runq_ns"]) / 1e6 / dt for g in b["gw"]
-         if b["gw"][g] and (a["gw"].get(g) or {}).get("runq_ns") is not None and b["gw"][g].get("runq_ns") is not None]
+    x, y = a.get("rq") or {}, b.get("rq") or {}
+    v = [(y[g] - x[g]) / 1e6 / dt for g in y if y[g] is not None and x.get(g) is not None]
     v = [x for x in v if x >= 0]
     return round(max(v), 1) if v else None
 def lrate(a, b, k, dt):
