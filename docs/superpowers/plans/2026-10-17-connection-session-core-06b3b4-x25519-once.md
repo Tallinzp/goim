@@ -55,7 +55,7 @@ Inputs:
 3. **An attacker's ephemeral.** A garbage handshake can carry any 32 bytes as `e`, a low-order point included. `curve25519.X25519` refuses an all-zero result, and `ecdh.(*PrivateKey).ECDH` does too. `TestDHRefusesWhatX25519Refuses` checks `suite.DH` directly (the all-zero and a 31-byte public key) beside `DH25519`, then a whole `Respond` with an all-zero ephemeral. At the handshake level, a wrong DH result would still fail at the tag. The direct check is what pins the refusal (the prototype's handshake-only test let the mutation through).
 4. **A `Key` built from its bytes.** A `wire.Key{Private: …, Public: …}` literal has no parsed key. It must still work, at the old cost of a parse per DH. Today no caller outside tests builds one: the gateway's keys all come through `LoadKeyDir` → `ParsePrivate`. `TestAKeyFromItsBytesAloneStillWorks` checks it.
 5. **The key generation's randomness.** Since Go 1.26, `ecdh.X25519().GenerateKey(rng)` ignores `rng` and always uses the system's randomness. `suite.GenerateKeypair` must read its 32 bytes from the rng flynn/noise passes (`Config.Random`, nil meaning `crypto/rand`), or the seeded equivalence test can't hold and `Config.Random` would silently mean nothing. The mutation in Step 6 that swaps in `GenerateKey(rng)` fails both the bytes test and the parse count. `wire.GenerateKey`, the static key's generator, may use `ecdh`'s `GenerateKey`, since it always wants `crypto/rand`.
-6. **Memory per pending handshake** (review O1). A pending `Initiator` holds flynn/noise's handshake state, which now holds its `suite`: the parsed ephemeral (`*ecdh.PrivateKey`, its `*PublicKey`, their slices) and the suite's fields. `BenchmarkInitiatorHeap` measures 616 → 1,016 bytes of live heap per Initiator. The suite must live until `Finish`, whose `ee` DH uses the kept ephemeral. A phone holds one at a time. Loadgen holds one per SDK client: the precomputer (#106, `internal/loadgen/precompute.go`, `prepared.in`) prepares each logged-in client's next handshake, and #109 keeps an unanswered one (`held`). At gwloss b_stress's 600,000 clients that is about +240MB of live heap, ~1.5% of its 16GiB `GOMEMLIMIT`, in exchange for half of loadgen's handshake CPU, which bound that storm. Run 30j reads `loadgen_heap` (Task 3).
+6. **Memory per pending handshake** (review O1). A pending `Initiator` holds flynn/noise's handshake state, which now holds its `suite`: the parsed ephemeral (`*ecdh.PrivateKey`, its `*PublicKey`, their slices) and the suite's fields. `BenchmarkInitiatorHeap` measures 616 → 1,016 bytes of live heap per Initiator. The suite must live until `Finish`, whose `ee` DH uses the kept ephemeral. A phone holds one at a time. Loadgen holds one per SDK client: the precomputer (#106, `internal/loadgen/precompute.go`, `prepared.in`) prepares each logged-in client's next handshake, and #109 keeps an unanswered one (`held`). At gwloss b_stress's 600,000 clients that is about +240MB of live heap, ~1.5% of its 16GiB `GOMEMLIMIT`, in exchange for half of loadgen's handshake CPU, which bound that storm. Run 30j reads `loadgen_heap` (Task 3). After the final review's I-1, the measured figures are +416 B per pending Initiator (616 → 1,032) and +96 B per live `Session` (199 → 295: the emptied suite its `CipherState`s keep), on loadgen's clients and on the gateway alike: about +300MB at b_stress's 600k (P6b3b4I-1).
 
 ## Implementation choices this plan makes
 
@@ -758,13 +758,13 @@ This is review O2. b_stress's storm was bound by loadgen's handshakes (X25519 43
 What to read, for the *Execution Notes*:
 - b1: back times and `b1_slo`, against runs 21 and 28's b1.
 - b2: its checks against run 28.
-- b_stress: `back_s` (179–188s before), `storm_first30` and `loadgen_bound` (loadgen's cores in the storm's first 30s), `b_stress_storm_real` (#110: does it still fail as loadgen-bound?), the survivors' refused handshakes (~3.9M before), `loadgen_heap` at the ramp and at the kill against the last 16GiB runs (Review Focus 6: about +240MB expected), and the profiles: `x25519ScalarMult`'s share of loadgen against 43–47%.
+- b_stress: `back_s` (179–188s before), `storm_first30` and `loadgen_bound` (loadgen's cores in the storm's first 30s), `b_stress_storm_real` (#110: does it still fail as loadgen-bound?), the survivors' refused handshakes (~3.9M before), `loadgen_heap` at the ramp and at the kill against the last 16GiB runs (Review Focus 6: about +300MB expected, P6b3b4I-1: ~250MB of pending Initiators and ~58MB of Sessions), and the profiles: `x25519ScalarMult`'s share of loadgen against 43–47%.
 
 Any outcome goes to the user before anything changes. Whether the handshake-concurrency trial is repeated at the new cost is the user's call after this run (#111, #116), not part of this plan.
 
 - [ ] **Step 3: Record**
 
-- This plan's *Execution Notes*: Task 1's benchmark numbers (Step 1 and Step 7, `InitiatorHeap` included), run 30i's and run 30j's numbers above, each with the commit hash and `dirty` from `result.json`.
+- This plan's *Execution Notes*: run 30i's and run 30j's numbers above (Task 1's benchmarks are already there, P6b3b4I-3), each with the commit hash and `dirty` from `result.json`.
 - Roadmap: #130 gets one line with the benchmarks and runs 30i and 30j. The plan 6 row says "6b3b4 executed, runs 30i, 30j …; next 6b3c (fresh session)", or the follow-up the runs call for.
 - Plan 6b3b3's *Execution Notes*: one line under the profile section, "Fixed by Plan 6b3b4; run 30i: see there".
 - The README's floods row quotes runs 30c–30h, and its 600k SIGKILL row the gwloss runs before 30j, all measured before this change. Whether runs 30i and 30j replace or join those numbers is the user's call. Ask, and change the rows (both languages) only if they say so.
@@ -780,7 +780,7 @@ Push the branch. Fast-forwarding `main` is the user's call.
 
 ## After this plan
 
-- **6b3c** (`POST /reset`, `POST /network-change`, scenario `reconnect`, run 31), with its inputs P6b3bI-2/-3 and P6b3b3I-4.
+- **6b3c** (`POST /reset`, `POST /network-change`, scenario `reconnect`, run 31), with its inputs P6b3bI-2/-3, P6b3b3I-4 and P6b3b4I-2.
 - **Results measured before #130** (review O2): runs 30–30h (floods), the gwloss runs before 30j (b_stress's 179–188s and #110's loadgen-bound ruling), and the handshake-concurrency-4 trial (`d218483`, 594s), on which the default slot count rests. Runs 30i and 30j replace the first two where the user says so. Whether to repeat the concurrency trial is the user's call after run 30j (input to #111 and #116).
 - **#111 (parked):** run 30i's `no_slot` shares are its input at the new slot hold. The spec's ~100µs NK estimate (*Admission control*) is now nearer the measured hold, and the measured number belongs with #97, #101 and #125 for the next spec revision.
 - **Fixed-base key generation** (#130's possible later step): `GenerateKeypair`'s one remaining basepoint multiplication could use edwards25519's precomputed-table `ScalarBaseMult`, several times cheaper. Only if run 30i's profiles (Task 3) still show key generation high.
@@ -789,7 +789,7 @@ Push the branch. Fast-forwarding `main` is the user's call.
 
 ### Tasks 1–2 executed (2026-10-17)
 
-- Commits (from `4cea62e`): benchmarks and `c28561a` (wire), `66c3d4b` (floods' storm profiles). All steps' expectations met: 5/5 mutations caught; `make test`, `go vet`, `make test-load-probe`, `make test-scripts` green.
+- Commits (from `4cea62e`): `841fd75` (benchmarks), `c28561a` (wire), `66c3d4b` (floods' storm profiles). All steps' expectations met: 5/5 mutations caught; `make test`, `go vet`, `make test-load-probe`, `make test-scripts` green.
 - Benchmarks on the dev machine (`-benchtime 3000x`, mean of 5, µs per op): `Respond` 447 → 226, `Initiate` 291 → 141, `Finish` 146 → 76; `InitiatorHeap` 616 → 1,016 B.
 - `floods` dry run: 30 checks, failing only `no_swap_in_storm`/`_garbage`/`_slow` (the dev machine's swap; the prototype had only garbage's). `artifacts` passed. Storm profiles 8s; `x25519ScalarMult` 61.7% of gw-0, 39.2% of loadgen; `NewPrivateKey`'s only caller `wire.(*suite).GenerateKeypair`.
 
@@ -801,3 +801,11 @@ Push the branch. Fast-forwarding `main` is the user's call.
 - **M2**: `TestConcurrentRespondsOnOneKey` called `handshake` (whose `t.Fatal` can't stop a test from a goroutine); it now runs the handshake inline and reports with `t.Error`.
 - **M3**: the storm's profiles (1s–9s) fall inside the window `storm_rate` measures, as the garbage phase's always have. Noted in `floods.sh` and in Task 3's storm comparison: runs before 30i had no storm profile.
 - **M4**: the exit trap killed only the profile subshell, leaving its curls to their `-m` timeout. `floods.sh` now has `kill_tree` (as `gwloss.sh`), and the trap uses it; `floods_test.sh` checks both.
+
+### Interface review (2026-10-17, Claude; decided by the user, "apply all")
+
+P6b3b4I-1..4, over what Task 3's runs and 6b3c build on (`wire.Key`, `Respond`/`Initiate`/`Finish` with `forget`, the storm's profiles, Task 3's readings). **Checked, unchanged:** no code outside `internal/wire` builds a `wire.Key` from its bytes or used `wire.Suite`; loadgen's #109 reuse sends an unanswered Initiator again only while no reply byte came, so `Finish` (and `forget`) never ran on it; gwloss b_stress's victim is gw-0, so Task 3 Step 2's `storm/gw-1` and `storm/loadgen` profiles exist; Task 3's `grep`/`-peek` patterns match the symbols (`crypto/ecdh.(*x25519Curve).NewPrivateKey`, `wire.(*suite).DH`, `.GenerateKeypair`).
+- **P6b3b4I-1 (fixed, plan):** Review Focus 6 and Task 3 Step 2 expected `loadgen_heap` about +240MB, the Initiator alone. Since I-1 every live `Session` also keeps the emptied suite, +96 B (`BenchmarkSessionHeap` 199 → 295), on loadgen's clients and on the gateway: at 600k, ~250MB of pending Initiators and ~58MB of Sessions, so about +300MB. The gateway's +96 B per connection (~58MB at `capacity`'s 600k) goes into the record beside run 30j.
+- **P6b3b4I-2 (noted, for 6b3c):** `kill_tree` is now in both `floods.sh` (M4) and `gwloss.sh`: its second user, so it moves to `lib.sh` in 6b3c Task 1 with P6b3bI-3's and P6b3b3I-4's helpers.
+- **P6b3b4I-3 (fixed, plan):** the Execution Notes now name the benchmarks commit (`841fd75`), and Task 3 Step 3 records only the runs, the benchmarks being already here.
+- **P6b3b4I-4 (fixed, roadmap):** the plan 6 row ended "next: execute 6b3b4"; it now says executed, reviewed, and next runs 30i and 30j.
