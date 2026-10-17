@@ -3,6 +3,7 @@ package loadgen
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"syscall"
@@ -39,19 +40,22 @@ func TestPingerCountsMissingPongs(t *testing.T) {
 
 // A pinger that falls behind pings, at its next tick, every slot whose time
 // has passed, each once however long the stall: slots follow the clock, not
-// the ticks it got (run 30: dropped ticks stretched a 30s cycle to 126s, and
-// the gateways closed 177,743 clients for their heartbeat). How late it was
-// and its slowest Send are recorded. The Send stub sleeps on synctest's clock.
+// the ticks it got. Run 30's pinger left clients unpinged for 126s and the
+// gateways closed 177,743 for their heartbeat; whether ticks were dropped or
+// a Send blocked is open, so this covers the first and the Send deadline the
+// second. How late it was and its slowest Send are recorded. The Send stub
+// sleeps on synctest's clock.
 func TestPingerCatchesUpOnMissedSlots(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		rec := NewRecorder(5, []string{"gw-0"})
 		p := newPinger(5*pingTick, rec) // five slots, one client each
 		var pings [5]int
-		p.send = func(lc *lightConn) {
+		p.send = func(lc *lightConn, _ time.Time) error {
 			pings[lc.i]++
 			if lc.i == 0 && pings[0] == 1 {
 				time.Sleep(10 * pingTick) // the first Send blocks for 1s
 			}
+			return nil
 		}
 		for i := range 5 {
 			p.add(&lightConn{i: i})
@@ -72,6 +76,57 @@ func TestPingerCatchesUpOnMissedSlots(t *testing.T) {
 		}
 		if c.PingSendMaxMs < 1000 {
 			t.Errorf("ping_send_max_ms %d, want >= 1000", c.PingSendMaxMs)
+		}
+		cancel()
+		<-done
+	})
+}
+
+// A Ping Send that misses its deadline closes its client, so its read ends
+// lost, and is counted; the clients after it in the same visit are pinged,
+// each stamped at its own Send, not at the blocked one's (6b3b2 review O1,
+// O9).
+func TestPingerTimesOutABlockedSend(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		rec := NewRecorder(2, []string{"gw-0"})
+		p := newPinger(pingTick, rec) // one slot: every client every tick
+		var calls int
+		var blocked *lightConn
+		var stamped int64 // the second client's pingAt at its Send
+		p.send = func(lc *lightConn, deadline time.Time) error {
+			calls++
+			switch calls {
+			case 1:
+				blocked = lc
+				time.Sleep(time.Until(deadline))
+				return os.ErrDeadlineExceeded
+			case 2:
+				stamped = lc.pingAt.Load()
+			}
+			return nil
+		}
+		var peers [2]net.Conn
+		for i := range 2 {
+			a, b := net.Pipe()
+			defer b.Close()
+			peers[i] = b
+			p.add(&lightConn{i: i, c: clientconn.New(a)})
+		}
+		t0 := time.Now()
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() { p.run(ctx); close(done) }()
+		time.Sleep(pingTick + pingSendTimeout + pingTick/2)
+		synctest.Wait()
+		if c := rec.Counts(); c.PingSendTimeouts != 1 {
+			t.Errorf("ping_send_timeouts %d, want 1", c.PingSendTimeouts)
+		}
+		if want := t0.Add(pingTick + pingSendTimeout).UnixNano(); stamped < want {
+			t.Errorf("the second client stamped %v before the blocked Send ended", time.Duration(want-stamped))
+		}
+		peers[blocked.i].SetReadDeadline(time.Now().Add(pingTick))
+		if _, err := peers[blocked.i].Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+			t.Errorf("the blocked client's connection: read %v, want EOF (closed)", err)
 		}
 		cancel()
 		<-done

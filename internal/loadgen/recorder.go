@@ -34,6 +34,7 @@ type Recorder struct {
 	gapMax         time.Duration
 	lagMax         time.Duration
 	sendMax        time.Duration
+	sendTimeouts   int64
 	pongRTT        *hist
 	marks          []*mark // by index
 	byName         map[string]*mark
@@ -233,6 +234,14 @@ func (r *Recorder) PingSend(d time.Duration) {
 	r.mu.Unlock()
 }
 
+// PingSendTimeout: a Ping's Send missed its deadline and its client was
+// closed.
+func (r *Recorder) PingSendTimeout() {
+	r.mu.Lock()
+	r.sendTimeouts++
+	r.mu.Unlock()
+}
+
 // Mark records instant now as name, with the clients logged in on gateway
 // gw (-1: on any gateway) as its population, and returns its size. A client
 // belongs to its latest mark only. Names are unique. gw -1 is only for an
@@ -345,6 +354,7 @@ type Counts struct {
 	PingGapMaxMs     int64            `json:"ping_gap_max_ms"`
 	PingTickLagMaxMs int64            `json:"ping_tick_lag_max_ms"` // a slot pinged late by the pinger itself
 	PingSendMaxMs    int64            `json:"ping_send_max_ms"`     // the slowest Ping Send
+	PingSendTimeouts int64            `json:"ping_send_timeouts"`   // Sends past the deadline, their clients closed
 	PongRTT          Dist             `json:"pong_rtt"`
 }
 
@@ -385,7 +395,8 @@ func (r *Recorder) Counts() Counts {
 		BackoffSinceMark: BackoffCount{Mark: r.since.Mark, Clients: r.since.Clients, Waits: map[string]int64{}},
 		StormSinceMark:   r.storm,
 		LoginLatency:     r.login.dist(r.login.n), Pongs: r.pongs, PongMissing: r.missing, PingGapMaxMs: r.gapMax.Milliseconds(),
-		PingTickLagMaxMs: r.lagMax.Milliseconds(), PingSendMaxMs: r.sendMax.Milliseconds(), PongRTT: r.pongRTT.dist(r.pongRTT.n)}
+		PingTickLagMaxMs: r.lagMax.Milliseconds(), PingSendMaxMs: r.sendMax.Milliseconds(),
+		PingSendTimeouts: r.sendTimeouts, PongRTT: r.pongRTT.dist(r.pongRTT.n)}
 	for i, n := range r.online {
 		c.Online += n
 		c.OnlineByGateway[r.ids[i]] = n

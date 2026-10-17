@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math/rand/v2"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -169,21 +170,29 @@ func (lc *lightConn) read(rec *Recorder) string {
 // pinger sends every light client a Ping each PingEvery, spread evenly:
 // clients sit in PingEvery/100ms slots by index, and one slot is due every
 // 100ms by the clock; a late tick pings every slot due since. A Ping due
-// while the last one is unanswered is counted missing.
+// while the last one is unanswered is counted missing. A Send not done in
+// pingSendTimeout (a full socket buffer) closes its client, so one blocked
+// socket can't hold back its shard: the client's read ends lost.
 type pinger struct {
 	tick   time.Duration
 	rec    *Recorder
 	shards int // of the pingers it belongs to (1 alone)
 	mu     sync.Mutex
 	slots  []map[*lightConn]struct{}
-	send   func(*lightConn) // sends one Ping; tests replace it
+	send   func(lc *lightConn, deadline time.Time) error // sends one Ping; tests replace it
 }
 
-const pingTick = 100 * time.Millisecond
+const (
+	pingTick        = 100 * time.Millisecond
+	pingSendTimeout = time.Second
+)
 
 func newPinger(every time.Duration, rec *Recorder) *pinger {
 	p := &pinger{tick: pingTick, rec: rec, shards: 1, slots: make([]map[*lightConn]struct{}, max(1, int(every/pingTick))),
-		send: func(lc *lightConn) { lc.c.Send(clientpb.Cmd_CMD_PING, lc.reqID.Add(1), nil) }} // a failure ends read
+		send: func(lc *lightConn, deadline time.Time) error {
+			lc.c.SetWriteDeadline(deadline)
+			return lc.c.Send(clientpb.Cmd_CMD_PING, lc.reqID.Add(1), nil) // a failure ends read
+		}}
 	for i := range p.slots {
 		p.slots[i] = map[*lightConn]struct{}{}
 	}
@@ -259,14 +268,19 @@ func (p *pinger) run(ctx context.Context) {
 			}
 		}
 		p.mu.Unlock()
-		now := time.Now().UnixNano()
 		for _, lc := range due {
+			// Each client's own time, so a Send blocked before it is not
+			// counted in its gap or its Pong's RTT.
+			s := time.Now()
+			now := s.UnixNano()
 			if lc.pingAt.Swap(now) != 0 {
 				p.rec.PongMissing()
 			}
 			p.rec.PingGap(time.Duration(now - lc.lastPing.Swap(now)))
-			s := time.Now()
-			p.send(lc)
+			if err := p.send(lc, s.Add(pingSendTimeout)); errors.Is(err, os.ErrDeadlineExceeded) {
+				p.rec.PingSendTimeout()
+				lc.c.Close()
+			}
 			p.rec.PingSend(time.Since(s))
 		}
 	}
