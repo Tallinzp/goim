@@ -277,6 +277,10 @@ expect "tcpstat: deltas of the named counters" "$(T2_TCPSTAT_NAMES="TCPSynRetran
   '{"TCPSynRetrans": 250, "PAWSActive": 4, "ListenOverflows": 0, "AttemptFails": 15, "EstabResets": 0, "NoSuchCounter": null}'
 expect "tcpstat: a missing snapshot is null" "$(t2_tcpstat_json "$tmp/none" "$tmp/tcp1")" null
 
+# The lease renewals a window must hold (P6b2b-slowI-5): one call can end
+# up to 5s after its tick, and a short window still needs its one renewal.
+expect "lease floor: 16s, 53s, 66s, 5s" "$(t2_lease_floor 16) $(t2_lease_floor 53) $(t2_lease_floor 66) $(t2_lease_floor 5)" "1 4 6 0"
+
 # make test-tier2 shows the script's own exit code (make itself exits 2 on any failure).
 out=$(GOIM_TEST_TIER= make -s test-tier2 SCENARIO=race 2>&1)
 contains "make: shows the scenario's exit code" "$out" "test-tier2: race exited 2"
