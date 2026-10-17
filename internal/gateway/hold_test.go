@@ -21,6 +21,13 @@ func (h *core) refusal(li int, reason string) (k *fakeLink, held bool) {
 	return k, k.c != nil
 }
 
+// alignTo moves the clock to at past a whole wheel tick, so a hold test
+// knows how far the next tick is.
+func (h *core) alignTo(at time.Duration) {
+	ms := h.g.now().UnixMilli() % 1000
+	h.advance((at - time.Duration(ms)*time.Millisecond + time.Second) % time.Second)
+}
+
 func heldNow(h *core) int { return int(testutil.ToFloat64(h.g.m.Held)) }
 func heldTotal(h *core, result string) int {
 	return int(testutil.ToFloat64(h.g.m.HeldTotal.WithLabelValues(result)))
@@ -29,6 +36,7 @@ func heldTotal(h *core, result string) int {
 func TestPendingMemRefusalIsHeldUntilTheTickAfterRefuseHold(t *testing.T) {
 	h := newCore(t, func(c *Config) { c.PendingCap = 1 })
 	h.open(0)
+	h.alignTo(900 * time.Millisecond) // the next tick is 100ms away: a hold must outlast it
 	k, held := h.refusal(1, RejectPendingMem)
 	if !held || k.isClosed() {
 		t.Fatalf("held %v closed %v, want the refused socket held open", held, k.isClosed())
@@ -44,7 +52,7 @@ func TestPendingMemRefusalIsHeldUntilTheTickAfterRefuseHold(t *testing.T) {
 	if k.isClosed() {
 		t.Fatal("closed before RefuseHold (500ms)")
 	}
-	h.advance(1100 * time.Millisecond) // 1.5s: past the first tick after 500ms
+	h.advance(800 * time.Millisecond) // 1.2s: the first tick after 500ms (1.1s)
 	if !k.isClosed() || len(k.sent()) != 0 {
 		t.Fatalf("closed %v frames %d, want a silent close by 1.5s", k.isClosed(), len(k.sent()))
 	}
@@ -95,6 +103,9 @@ func TestClientCloseFreesAHeldRefusal(t *testing.T) {
 	h.sync()
 	if heldNow(h) != 0 || closes(h, "client") != 0 {
 		t.Fatalf("refusals_held %d, closes{client} %d; want 0, 0", heldNow(h), closes(h, "client"))
+	}
+	if n := onLoop(k, func(c *Conn) int { return c.ls.wheel.n }); n != 0 {
+		t.Fatalf("%d timers armed on the loop, want 0: the hold's timer must stop with the close", n)
 	}
 	if _, held := h.refusal(1, RejectPendingMem); !held {
 		t.Fatal("the slot a client freed must be reused")
