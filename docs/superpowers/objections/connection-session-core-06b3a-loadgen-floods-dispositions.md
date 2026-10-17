@@ -82,3 +82,13 @@ Objections: `connection-session-core-06b3a-loadgen-floods.md`. Decided by the us
 - The probe's `$inst: every connection held 5–6.5s` check: the expression is `… d["flood"]["held"]["p50_ms"] >= 5000 and d["flood"]["held"]["p99_ms"] <= 6500 and d["flood"]["held"]["max_ms"] <= 7500`. The label becomes "held p50 ≥ 5s, p99 ≤ 6.5s, max ≤ 7.5s, then closed by a gateway". The header comment and the expected output change to match.
 - The `slow:` echo line prints p50/p99/max.
 - O1's jitter does not change `held`, which runs from the dial or the handshake to the gateway's close.
+
+## Applied (2026-10-16)
+
+All seven were applied to the plan and re-verified in the prototype, `proto-6b3a` at `eb2639c`:
+- `go test -race -count=3 ./internal/loadgen/` and `cmd/loadgen` pass, and `go vet ./...` and `gofmt` are clean.
+- The new mutations fail as intended: jitter removed, backoff removed, `pre-handshake` miscounted. The old ones still fail too (slow-loop redial checked again).
+- `make test-scripts` passes. Without the `LG_STATUS` swap, exactly the two O5 checks fail.
+- `make test-load-probe` passes: slow holds p50/p99/max 5,506/5,996/6,007ms and 5,507/5,998/6,010ms; garbage 20,009 attempts, all failed by the gateways.
+- The plan's code blocks replay against `1b6f64c` to the prototype's tree byte for byte.
+- Roadmap: #119 and #120 are decided (amended), and #121 is added as decided.

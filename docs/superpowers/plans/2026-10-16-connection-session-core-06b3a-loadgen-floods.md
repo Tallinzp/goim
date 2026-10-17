@@ -16,11 +16,11 @@
 
 Inputs: roadmap #118 (the 6b3 split), P6a2bI-1 (6a2a plan, *Execution Notes*).
 
-**Decisions:** #118 (the user, 2026-10-16) puts instances and flood modes in this plan, with no Tier 2 run. **Proposed with this plan, for review:** #119 (the flood modes) and #120 (the instances), under *Implementation choices* below.
+**Decisions:** #118 (the user, 2026-10-16) puts instances and flood modes in this plan, with no Tier 2 run. **Proposed with this plan, decided by the review (2026-10-16):** #119 (the flood modes) and #120 (the instances), both amended, and #121 (the reading of the spec's 20k/s storm clause), under *Implementation choices* below. **Reviewed 2026-10-16:** objections O1–O7 all accepted (`docs/superpowers/objections/connection-session-core-06b3a-loadgen-floods.md`, decisions in `…-dispositions.md`) and applied here.
 
 **Branch:** `feat/plan6b3`, which already holds #118. Execute from its head, `1b6f64c` or later.
 
-**Size:** 3 tasks, about 700 lines changed. The prototype (`proto-6b3a`, from `1b6f64c`) ran every block. Its code is replayed here byte for byte: new Go files in full, every other change as a `git apply` patch against `1b6f64c`. On the dev machine the prototype passed `go test -race` for `internal/loadgen` (3 runs) and `cmd/loadgen`, `go vet ./...`, `gofmt`, `scripts/loadgen_test.sh`, `scripts/stack_test.sh` and the full `make test-load-probe`.
+**Size:** 3 tasks, about 760 lines changed. The prototype (`proto-6b3a`, from `1b6f64c`; the review's changes are `eb2639c`) ran every block. Its code is replayed here byte for byte: new Go files in full, every other change as a `git apply` patch against `1b6f64c`. On the dev machine the prototype passed `go test -race` for `internal/loadgen` (3 runs) and `cmd/loadgen`, `go vet ./...`, `gofmt`, `scripts/loadgen_test.sh`, `scripts/stack_test.sh` and the full `make test-load-probe`.
 
 ## Global Constraints
 
@@ -36,32 +36,35 @@ Inputs: roadmap #118 (the 6b3 split), P6a2bI-1 (6a2a plan, *Execution Notes*).
 ## Review Focus
 
 1. **Existing scenarios under the new `lg_start` guard.** `lg_start` now refuses an instance that is still running. Before, it silently overwrote `LG_PID`, and the old loadgen kept the control port, so the new one's `/stats` check passed against the old process. Expected: every existing scenario calls `lg_stop` (directly, or through `slowlogic`'s `down`) before its next `lg_start`. This was checked by grep for `smoke.sh` (lines 92/113, 122/136), `capacity.sh` (158/278), `gwloss.sh` (473, then 503/559/804) and `slowlogic.sh` (320, `down`'s `lg_stop`, 397). The guard is pinned by `inst: a second start of a running instance is refused` (Task 2). A `gwloss` or `slowlogic` dry run is not part of this plan. If the executor has the time, `GWLOSS_PHASES=b1` with the 2 × 1,000 dry-run settings is the cheapest end-to-end check.
-2. **The garbage rate loadgen actually reaches.** The garbage schedule is open loop: when loadgen falls behind, it starts the overdue attempts back to back. `skipped` counts only attempts refused at the `-clients` in-flight cap, not lateness. Expected: the achieved rate is `flood.attempts / elapsed_s`, and 6b3b gates on it (e.g. attempts ≥ 0.95 × rate × duration) before reading any gateway number as the effect of that rate. In the dry run, 20,012–20,018 attempts were made in 10s at 2,000/s, with 0 skipped. Pinned here only by the probe's `≥ 15000 attempts`.
+2. **The garbage rate loadgen actually reaches, and the rate that reaches a DH.** The garbage schedule is open loop: when loadgen falls behind, it starts the overdue attempts back to back. `skipped` counts only attempts refused at the `-clients` in-flight cap, not lateness. `flood.attempts / elapsed_s` is the *schedule* rate: it says loadgen kept up. It counts dials started, failed dials and attempts cut off at the stop included, and `closed` is the same for a failed DH, `handshake_rate`, `noise_unknown_key`, `at_capacity` and `pending_mem`. The *delivered* expensive rate is the gateways' `handshakes_total{result="failed"}` delta over the flood window, plus `{no_slot, no_token}` (O3). Expected: 6b3b gates on the delivered rate (e.g. ≥ 0.95 × rate × duration) before reading any gateway number as the effect of that rate, as the probe's `failed + limited ≥ closed` check does here. A stale `NOISE_KEY_ID` or a full gateway would otherwise turn the run into the cheap flood and still pass. In the dry runs, 20,009–20,018 attempts were made in 10s at 2,000/s, with 0 skipped, and the gateways failed every one.
 3. **TIME_WAIT at Tier 2 rates.** The gateway closes first, so loadgen keeps no TIME_WAIT, and the gateway's side holds one per garbage attempt for 60s. At 20,000/s that is ~1.2M, beyond the kernel's default `net.ipv4.tcp_max_tw_buckets` (262,144). `scripts/tier2/sysctl.conf` does not raise it, so the kernel drops the excess TIME_WAIT entries and logs `TCP: time wait bucket table overflow`. Expected: harmless to the gateway, and no `dial-no-port` in loadgen's outcomes. Not exercised here (the dry run made 20k attempts in total). 6b3b records `ss -s`'s `timewait` and checks the outcomes.
 4. **Instances named inside `$(...)`.** `lg_in` registers a new instance in the shell that runs it. A first `$(lg_in x …)` registers `x` only in that subshell, so the parent may later give another instance that index. Expected: harmless, because ports come from the parent's order, and `lg_start` and `lg_stop` must run in the parent anyway (a subshell cannot keep or wait for the pid). The `loadgen.sh` header and `lg_in`'s comment say so. Pinned by `inst: a 5th instance is refused` (Task 2), whose count leaves out the instance named only in a subshell.
-5. **Slow-auth spends the handshake bucket.** Each slow-auth connection runs a real Noise handshake on both sides before it goes quiet. Each one is admitted by the same limiter that legitimate clients need, and it costs loadgen an X25519. At the probe's 500 connections every ~5.5s this is ~90/s. At Tier 2 scale (100k slow-auth connections ≈ 18k handshakes/s) it would by itself near the 25k/s bucket, which would make "legitimate clients get no `Busy`" fail for the wrong reason. Expected: 6b3b sizes the slow-auth share against the bucket and records `handshakes_total{result=no_token|no_slot}`. Flagged, not gated, here.
+5. **Slow-auth spends the handshake bucket.** Each slow-auth connection runs a real Noise handshake on both sides before it goes quiet. Each one is admitted by the same limiter that legitimate clients need, and it costs loadgen an X25519. At the probe's 500 connections every ~6s this is ~85/s. At Tier 2 scale (100k slow-auth connections ≈ 16k handshakes/s) it would by itself near the 25k/s bucket, which would make "legitimate clients get no `Busy`" fail for the wrong reason. A redial at once would have been worse: every client the wheel closed in one tick would be accepted again within one tick's interval and closed together every round, so the bucket would see per-tick blocks of about the ramp rate (e.g. 20k within milliseconds against a 2,500 burst). The 0–1s redial jitter (choice 1, O1) spreads each tick's cohort over the tick, so the arrival rate is the average. Expected: 6b3b sizes the slow-auth share against the bucket and records `handshakes_total{result=no_token|no_slot}`. Flagged, not gated, here.
+6. **The limiter path.** The probe's dry run never makes the limiter refuse (`handshake_rate 0`: one loop per gateway, concurrency 1, 2,000/s against 25k/s). `TestSlowAuthRefusedAtTheLimitBacksOff` (Task 1) covers it in process: a gateway with a 2/s bucket and a burst of 1 refuses slow-auth's handshakes, loadgen counts them `pre-handshake` and backs off 0.5–1.5s each time, with no spin (O2). 6b3b's Tier 2 run is its first test at scale.
 
 ## Implementation choices this plan makes
 
-1. **#119 (proposed): three flood modes on the existing `Runner`, each counted in `Stats.Flood`.**
+1. **#119 (decided, amended): three flood modes on the existing `Runner`, each counted in `Stats.Flood`.**
    - **`garbage`** sends one well-formed client handshake frame: the right version, `CMD_HANDSHAKE`, `HandshakeLen` and the stack's `key_id`, followed by 48 random bytes as the Noise message. It passes every check the gateway makes before any crypto. The gateway therefore admits it through the handshake limiter, computes the DH and fails the AEAD check (`handshakes_total{result="failed"}`), or refuses it at the limit (`handshake_rate`). This is the expensive garbage, the kind the spec's limiter exists for. A frame with an unknown key_id or a bad header would be closed before any crypto and test nothing. Loadgen makes no X25519 for it, so it can flood far faster than it can log in. Attempts start at `-rate` per second, open loop, with at most `-clients` in flight. An attempt due while the cap is full is counted as `skipped`.
    - **`slow-handshake`** holds `-clients` connections that send nothing (`HANDSHAKE` state).
    - **`slow-auth`** holds `-clients` connections that complete the handshake and send no Login (`AUTH_PENDING` state).
    - **The gateway always closes first.** Every attempt waits up to `-timeout` (default 10s) for the gateway to close.
    - **`held`** is a distribution over the attempts the gateway closed: from the garbage frame's write, the slow-handshake dial or the slow-auth handshake, until the close.
    - **Outcomes:** `closed`, `answered` (the gateway sent bytes where it should only close), `timeout`, `pre-handshake`/`handshake` (slow-auth's own handshake failed), `error`, and dial failures under light mode's names.
-   - **Redialing:** a slow client closed after ≥ 3s (the config range's lower bound, so by its timeout) dials again at once, so the flood keeps its slots. One closed sooner (at capacity, at the limit) waits 0.5–1.5s, as the SDK does after a pre-handshake close, so it never spins.
+   - **Redialing:** a slow client closed after ≥ 3s (the config range's lower bound, so by its timeout) dials again after a uniform 0–1s, one tick of the gateway's timer wheel. Dialing at once would keep each tick's cohort phase-locked to the wheel, redialing as one burst every round (Review Focus 5, O1). With the jitter, the flood keeps ~90% of its slots. One closed sooner (at capacity, at the limit) waits 0.5–1.5s, as the SDK does after a pre-handshake close, so it never spins.
    - **Stopping:** attempts in flight at the stop are not counted. Flood modes default to all 253 sources ("from many sources").
    - **Alternatives:** a separate flood binary would duplicate `Env`, the balancer and the control API. A flood inside the light runner would break "one mode per process" (P6a2bI-1).
-2. **#119 (proposed): `-source-net K`, sources `127.0.K.2…`.** Each (source, gateway) pair has 28,232 ports (#69). A flood on the legitimate instance's sources would take ports from it (and from its relogins in 6b3c) and could produce `dial-no-port` failures that are not the gateway's doing. Separate /24s make the two populations' ports independent. They also stay distinguishable in `ss` output. `NewBalancer` and `Sources` keep their signatures. `NewBalancerIn` and `SourcesIn` take the octet.
-3. **#120 (proposed): instances in `loadgen.sh`, selected by `lg_in INST CMD…`, at most 4.**
-   - **Selection:** every existing function acts on the current instance, so no call site changes and `$LG_PID` still names the current instance's process. `lg_in` saves the current instance's `LG_PID`/`LG_NAME`, loads INST's, runs CMD, and restores both. Instance k's control port is `STACK_PORT_BASE + 5 + k`.
-   - **Why at most 4:** main plus three, enough for 6b3b (legitimate + garbage, or + slow-handshake + slow-auth) and 6b3c (SDK storm + light heartbeat probe). `stack_ports` adds base + 6 … + 8, so a leftover loadgen on any of them is refused before the stack starts.
+2. **#119 (decided): `-source-net K`, sources `127.0.K.2…`.** Each (source, gateway) pair has 28,232 ports (#69). A flood on the legitimate instance's sources would take ports from it (and from its relogins in 6b3c) and could produce `dial-no-port` failures that are not the gateway's doing. Separate /24s make the two populations' ports independent. They also stay distinguishable in `ss` output. `NewBalancer` and `Sources` keep their signatures. `NewBalancerIn` and `SourcesIn` take the octet.
+3. **#120 (decided, amended): instances in `loadgen.sh`, selected by `lg_in INST CMD…`, at most 4.**
+   - **Selection:** every existing function acts on the current instance, so no call site changes and `$LG_PID` still names the current instance's process. `lg_in` saves the current instance's `LG_PID`/`LG_NAME`/`LG_STATUS`, loads INST's, runs CMD, and restores all three (O5). Instance k's control port is `STACK_PORT_BASE + 5 + k`.
+   - **Why at most 4:** main plus three running at once, enough for 6b3b (legitimate + garbage, or + slow-handshake + slow-auth) and 6b3c (SDK storm + light heartbeat probe). `stack_ports` adds base + 6 … + 8, so a leftover loadgen on any of them is refused before the stack starts.
+   - **Names are slots for the whole script (O4):** the cap counts every instance name a script uses, and a name is never freed, so indexes (and ports) never change (Review Focus 4 depends on that). Scenarios name instances by role (`flood`, `flood2`), not by phase, and start a stopped instance again for the next phase, under a new NAME (its own log and result file). The probe does this: `flood` runs garbage and then slow-handshake.
    - **`lg_start` guards:** it refuses an instance that still runs, and a NAME a running instance already holds (the two would share `loadgen-NAME.json`).
    - **Per-instance settings:** `LG_CPUS` (default `T2_CPUS_LOADGEN`) pins each instance under `STACK_PIN=1`. `LG_ENV` is read at each `lg_start`, as before.
    - **New helpers:** `lg_stop_all` stops every instance (scenario cleanup and phase ends), with each status in `LG_STATUSES[INST]`. `lg_wait EXPR SECONDS` is the general wait over `/stats` (a flood has no `online`).
    - **Alternative:** a function per instance (`lg_start_flood`, …) would fix the scenario's shape into the library.
-4. **The dry run is a load-probe phase, not a Tier 2 scenario** (#118). Between the probe's light and SDK phases, `floods` runs 2,000 light clients. Beside them it runs a garbage instance at 2,000/s for 10s, and then slow-handshake and slow-auth instances of 500 each at the same time, so 4 instances are up at once. It gates every outcome and the gateways' own counters, and the light clients' Pings. That runs on every `make test-load-probe`, so a regression in the modes or the instances shows on the dev machine before 6b3b reaches the host.
+4. **The dry run is a load-probe phase, not a Tier 2 scenario** (#118). Between the probe's light and SDK phases, `floods` runs 2,000 light clients. Beside them, instance `flood` runs garbage at 2,000/s for 10s. Then `flood` runs again with 500 slow-handshake connections, beside `flood2`'s 500 slow-auth ones, so 3 instances are up at once and one name stays free. It gates every outcome and the gateways' own counters, the slow holds (p50 ≥ 5s, p99 ≤ 6.5s = 5s + one tick + 0.5s, max ≤ 7.5s, so a contended 2-core machine does not flake it, O7), and the light clients' Pings. That runs on every `make test-load-probe`, so a regression in the modes or the instances shows on the dev machine before 6b3b reaches the host.
+5. **#121 (decided): the spec's handshake-flood bullet holds two tests** (O6). (1) "Garbage handshakes from many sources leave heartbeats answered on time": a flood beside a legitimate population. (2) "A legitimate 20k/s storm is not rejected by the bucket": the bucket's sizing check, run without garbage, because 20k/s of garbage plus a 20k/s storm cannot fit under a 25k/s bucket. 6b3b runs (2) as a light instance ramping at 20,000/s and judges it by `failed["pre-handshake"]` and the gateways' `handshake_rate` / `handshakes_total{no_slot, no_token}`.
 
 ## File Structure
 
@@ -88,7 +91,8 @@ Inputs: roadmap #118 (the 6b3 split), P6a2bI-1 (6a2a plan, *Execution Notes*).
   - `type FloodStats struct { Attempts, Skipped, Open int64; Outcomes map[string]int64; Held Dist }`, served as `/stats`'s and the result's `"flood"`, with keys `attempts`, `skipped`, `open`, `outcomes`, `held`.
   - `Config.SourceNet int`, and the flag `-source-net`.
   - `SourcesIn(netOctet, n int) ([]net.IP, error)` and `NewBalancerIn(addrs []string, netOctet, sources int) (*Balancer, error)`.
-  - Test helpers `startStack(t, n, opts ...func(*gateway.Config))`, `gatewayRegs` (gateway id → `*prometheus.Registry`) and `metric(t, id, name, label, value) float64`.
+  - `redialWait(held, ok) time.Duration`, a slow client's wait before it dials again (O1).
+  - Test helpers `type stackOpt func(*gateway.Config, *tcp.Config)` and `startStack(t, n, opts ...stackOpt)`, applied after both defaults so a test can set the handshake limit (O2), `gatewayRegs` (gateway id → `*prometheus.Registry`) and `metric(t, id, name, label, value) float64`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -106,6 +110,7 @@ import (
 
 	"github.com/Tallinzp/goim/api/clientpb"
 	"github.com/Tallinzp/goim/internal/gateway"
+	"github.com/Tallinzp/goim/internal/gateway/tcp"
 	"github.com/Tallinzp/goim/internal/wire"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -228,7 +233,9 @@ func TestSlowFloodHeldUntilTheGatewaysTimeout(t *testing.T) {
 		{ModeSlowAuth, gateway.RejectAuthTimeout},
 	} {
 		t.Run(tc.mode, func(t *testing.T) {
-			env, _ := startStack(t, 1, func(c *gateway.Config) { c.HandshakeTimeout, c.AuthTimeout = 3*time.Second, 3*time.Second })
+			env, _ := startStack(t, 1, func(c *gateway.Config, _ *tcp.Config) {
+				c.HandshakeTimeout, c.AuthTimeout = 3*time.Second, 3*time.Second
+			})
 			r, err := New(Config{Mode: tc.mode, Clients: 5, Rate: 100, UIDPrefix: "s", Timeout: 10 * time.Second}, env)
 			if err != nil {
 				t.Fatal(err)
@@ -246,6 +253,61 @@ func TestSlowFloodHeldUntilTheGatewaysTimeout(t *testing.T) {
 				t.Fatalf("gateway %s rejects %v, want ≥ 5", tc.reason, got)
 			}
 		})
+	}
+}
+
+// A slow client the gateway's timeout closed redials within one wheel tick,
+// spread over it, so a cohort closed in one tick does not redial together;
+// one closed sooner waits 0.5–1.5s, as the SDK does (O1).
+func TestRedialWaitSpreadsOverATick(t *testing.T) {
+	lo, hi := time.Hour, time.Duration(0)
+	for range 200 {
+		w := redialWait(5*time.Second, true)
+		if w < 0 || w >= time.Second {
+			t.Fatalf("after a timeout: %v, want 0–1s", w)
+		}
+		lo, hi = min(lo, w), max(hi, w)
+		if w := redialWait(10*time.Millisecond, true); w < 500*time.Millisecond || w >= 1500*time.Millisecond {
+			t.Fatalf("after an early close: %v, want 0.5–1.5s", w)
+		}
+		if w := redialWait(0, false); w < 500*time.Millisecond || w >= 1500*time.Millisecond {
+			t.Fatalf("after a failure: %v, want 0.5–1.5s", w)
+		}
+	}
+	if hi-lo < 500*time.Millisecond {
+		t.Fatalf("after a timeout: %v–%v, want spread over the tick", lo, hi)
+	}
+}
+
+// Against a gateway whose handshake bucket is nearly empty, slow-auth's
+// handshakes are refused at the limit: loadgen counts them pre-handshake
+// and backs off 0.5–1.5s each time, so it does not spin (O2).
+func TestSlowAuthRefusedAtTheLimitBacksOff(t *testing.T) {
+	env, _ := startStack(t, 1, func(_ *gateway.Config, tc *tcp.Config) { tc.HandshakeRate, tc.HandshakeBurst = 2, 1 })
+	const clients = 20
+	r, err := New(Config{Mode: ModeSlowAuth, Clients: clients, Rate: 1000, UIDPrefix: "l", Timeout: 10 * time.Second}, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := run(r)
+	begin := time.Now()
+	time.Sleep(3 * time.Second)
+	stop()
+	elapsed := time.Since(begin)
+	f := r.Stats().Flood
+	// Each client refused waits ≥ 0.5s; the few admitted hold (5s timeout).
+	if bound := int64(clients * (elapsed/(500*time.Millisecond) + 1)); f.Attempts > bound {
+		t.Fatalf("flood %+v in %v: %d attempts, want ≤ %d (no spin)", f, elapsed, f.Attempts, bound)
+	}
+	if f.Outcomes[FloodPreHandshake] < clients || len(f.Outcomes) != 1 {
+		t.Fatalf("flood %+v, want only pre-handshake outcomes, ≥ %d", f, clients)
+	}
+	id := env.GatewayIDs[0]
+	if got := metric(t, id, "goim_gateway_admission_rejects_total", "reason", gateway.RejectHandshakeRate); got < clients {
+		t.Fatalf("gateway handshake_rate %v, want ≥ %d", got, clients)
+	}
+	if got := metric(t, id, "goim_gateway_handshakes_total", "result", "no_token"); got < clients {
+		t.Fatalf("gateway no_token %v, want ≥ %d", got, clients)
 	}
 }
 ```
@@ -267,10 +329,10 @@ index 10ae8f4..80bb48b 100644
  		for i, a := range tc.args {
  			if a == "ENV" {
 diff --git a/internal/loadgen/e2e_test.go b/internal/loadgen/e2e_test.go
-index 49dcb76..a14d404 100644
+index 49dcb76..22795c7 100644
 --- a/internal/loadgen/e2e_test.go
 +++ b/internal/loadgen/e2e_test.go
-@@ -42,9 +42,14 @@ func (s staticKeys) Verify(tok string) (auth.Claims, error) {
+@@ -42,9 +42,18 @@ func (s staticKeys) Verify(tok string) (auth.Claims, error) {
  func (staticKeys) Ready() bool         { return true }
  func (staticKeys) Run(context.Context) {}
  
@@ -281,22 +343,24 @@ index 49dcb76..a14d404 100644
 +// metrics for the flood tests).
 +var gatewayRegs sync.Map
 +
++// stackOpt changes each gateway's core and transport configs (the
++// handshake limit is the transport's).
++type stackOpt func(*gateway.Config, *tcp.Config)
++
 +// startStack starts Logic and n gateways, each config passed through opts;
 +// stop[i] stops gateway i's transport (its clients see their connections
 +// close) and core.
-+func startStack(t *testing.T, n int, opts ...func(*gateway.Config)) (env Env, stop []func()) {
++func startStack(t *testing.T, n int, opts ...stackOpt) (env Env, stop []func()) {
  	t.Helper()
  	jwt, err := auth.GenerateKey("k1")
  	if err != nil {
-@@ -82,9 +87,13 @@ func startStack(t *testing.T, n int) (env Env, stop []func()) {
- 		cfg.GatewayID, cfg.Epoch, cfg.NumLoops = testredis.Gateway(), gateway.NewEpoch(), 2
- 		cfg.MaxConns, cfg.PendingCap, cfg.LoginQueueCap, cfg.LogoutQueue = 1000, 1000, 1000, 1000
+@@ -84,7 +93,11 @@ func startStack(t *testing.T, n int) (env Env, stop []func()) {
  		cfg.Limits.Notrack = true
-+		for _, o := range opts {
-+			o(&cfg)
-+		}
  		tcfg := tcp.DefaultConfig(cfg.NumLoops)
  		tcfg.Addr = "tcp://127.0.0.1:0"
++		for _, o := range opts {
++			o(&cfg, &tcfg)
++		}
  		greg := prometheus.NewRegistry()
 +		gatewayRegs.Store(cfg.GatewayID, greg)
  		var tr *tcp.Transport
@@ -307,7 +371,7 @@ index 49dcb76..a14d404 100644
 - [ ] **Step 2: Run them to see them fail**
 
 Run: `go test -count=1 ./internal/loadgen/ ./cmd/loadgen/`
-Expected: `internal/loadgen` fails to build (`undefined: garbageHandshake`, `undefined: ModeGarbage`, `unknown field SourceNet`, …). Then `cmd/loadgen`'s two new cases fail: `-mode slow-auth` gives `mode "slow-auth", want light or sdk`, not `Timeout`, and `-source-net` gives `flag provided but not defined`.
+Expected: `internal/loadgen` fails to build (`undefined: garbageHandshake`, `undefined: ModeGarbage`, `undefined: redialWait`, `unknown field SourceNet`, …). Then `cmd/loadgen`'s two new cases fail: `-mode slow-auth` gives `mode "slow-auth", want light or sdk`, not `Timeout`, and `-source-net` gives `flag provided but not defined`.
 
 - [ ] **Step 3: Implement**
 
@@ -370,8 +434,12 @@ const (
 // slowHeld is the shortest hold that counts as the gateway's timeout (its
 // configured range is 3–30s): a slow client closed sooner (at capacity, at
 // the handshake limit) waits 0.5–1.5s before it dials again, as the SDK
-// does after a pre-handshake close; one closed by the timeout dials at
-// once, so the flood keeps its slots.
+// does after a pre-handshake close. One closed by the timeout waits 0–1s,
+// one tick of the gateway's timer wheel: dialing again at once would put
+// every client the wheel closed in one tick back into one tick's interval,
+// so the cohort would be closed and redial together every round, a burst
+// of handshakes each tick (Plan 6b3a, O1). The flood still keeps ~90% of
+// its slots.
 const slowHeld = 3 * time.Second
 
 // FloodStats are a flood run's counts (Stats.Flood). Held is from the
@@ -497,17 +565,23 @@ func (r *Runner) garbageOnce(ctx context.Context) {
 }
 
 // slow keeps one ModeSlowHandshake or ModeSlowAuth connection open, dialing
-// again whenever the gateway closes it, until ctx ends.
+// again after redialWait whenever the gateway closes it, until ctx ends.
 func (r *Runner) slow(ctx context.Context) {
 	for ctx.Err() == nil {
-		if held, ok := r.slowOnce(ctx); ok && held >= slowHeld {
-			continue
-		}
+		held, ok := r.slowOnce(ctx)
 		select {
 		case <-ctx.Done():
-		case <-time.After(500*time.Millisecond + mrand.N(time.Second)):
+		case <-time.After(redialWait(held, ok)):
 		}
 	}
+}
+
+// redialWait is a slow client's wait before it dials again (slowHeld).
+func redialWait(held time.Duration, ok bool) time.Duration {
+	if ok && held >= slowHeld {
+		return mrand.N(time.Second)
+	}
+	return 500*time.Millisecond + mrand.N(time.Second)
 }
 
 // slowOnce is one slow connection: dial, the handshake in ModeSlowAuth,
@@ -816,7 +890,7 @@ index c731ea5..ec37395 100644
 - [ ] **Step 4: Run the tests to see them pass**
 
 Run: `gofmt -l internal/ cmd/ && go vet ./internal/loadgen/ ./cmd/loadgen/ && go test -race -count=3 ./internal/loadgen/ && go test -race -count=1 ./cmd/loadgen/`
-Expected: no gofmt output, vet clean, `ok` for both packages. The prototype took ~30s per `internal/loadgen` run. `TestSlowFloodHeldUntilTheGatewaysTimeout` takes ~5s per mode. `TestGarbageFloodIsClosedByTheGateway` showed `held` p99 ≤ 16ms in every run. The first prototype of that test asked for every attempt to be `closed` and failed 4 runs out of 4: 1–3 attempts in flight at the stop go uncounted by design. The bound is now `closed ≥ attempts − 50` (the `-clients` cap).
+Expected: no gofmt output, vet clean, `ok` for both packages. The prototype took ~36s per `internal/loadgen` run. `TestSlowFloodHeldUntilTheGatewaysTimeout` takes ~5s per mode, and `TestSlowAuthRefusedAtTheLimitBacksOff` 3.5s. `TestGarbageFloodIsClosedByTheGateway` showed `held` p99 ≤ 16ms in every run. The first prototype of that test asked for every attempt to be `closed` and failed 4 runs out of 4: 1–3 attempts in flight at the stop go uncounted by design. The bound is now `closed ≥ attempts − 50` (the `-clients` cap).
 
 - [ ] **Step 5: Mutation checks**
 
@@ -825,6 +899,9 @@ Each mutation must make the named test fail, as it did in the prototype. Revert 
 - `Run`'s `if r.cfg.Mode == ModeGarbage {` becomes `if false {`, so the garbage runner ramps slow-handshake clients instead: `TestGarbageFloodIsClosedByTheGateway` fails with `timed out after 10s waiting for 100 garbage handshakes closed`.
 - `New` drops `cfg.Sources = maxSources` for flood modes: `TestNewFloodModes` fails with `garbage: 1 sources from 127.0.3.2`.
 - `slow`'s loop body becomes `r.slowOnce(ctx); return`, so a slow client never redials: `TestSlowFloodHeldUntilTheGatewaysTimeout` fails, timing out on `5 open again`.
+- `redialWait`'s timeout branch returns `0` (no jitter, O1): `TestRedialWaitSpreadsOverATick` fails with `after a timeout: 0s–0s, want spread over the tick`.
+- `redialWait`'s last line returns `0` (no backoff after an early close, O2): `TestSlowAuthRefusedAtTheLimitBacksOff` fails with `9238 attempts, want ≤ 140 (no spin)` (and `TestRedialWaitSpreadsOverATick` with `after an early close: 0s`).
+- `slowOnce`'s `case errors.Is(err, clientconn.ErrClosedBeforeReply):` becomes `case false:`: `TestSlowAuthRefusedAtTheLimitBacksOff` fails with `Outcomes:map[handshake:57] …, want only pre-handshake outcomes`.
 
 - [ ] **Step 6: Commit**
 
@@ -861,15 +938,15 @@ Apply (the fake loadgen is a python3 HTTP server that serves `/stats` on its `-c
 
 ```diff
 diff --git a/scripts/loadgen_test.sh b/scripts/loadgen_test.sh
-index 527cd7d..fff8d4f 100755
+index 527cd7d..0cf42fa 100755
 --- a/scripts/loadgen_test.sh
 +++ b/scripts/loadgen_test.sh
-@@ -64,4 +64,61 @@ expect "wait_online: a 2s wait ends by its deadline" "$((SECONDS - start <= 5))"
+@@ -64,4 +64,68 @@ expect "wait_online: a 2s wait ends by its deadline" "$((SECONDS - start <= 5))"
  expect "wait_online: gave up on the deadline, not on loadgen" "$(grep -c "online and failed after" "$dir/online.err")" 1
  kill $slow 2>/dev/null; wait $slow 2>/dev/null
  
 +# Instances (P6a2bI-1), with a fake loadgen that serves /stats on its
-+# -control port and writes its -out at SIGTERM.
++# -control port, and at SIGTERM writes its -out and exits $FAKE_EXIT.
 +(
 +  STACK_DIR=$dir/stack
 +  mkdir -p "$STACK_DIR/bin"
@@ -886,7 +963,7 @@ index 527cd7d..fff8d4f 100755
 +    def log_message(self, *x): pass
 +def term(*_):
 +    open(out, "wb").write(doc)
-+    os._exit(0)
++    os._exit(int(os.environ.get("FAKE_EXIT", "0")))
 +signal.signal(signal.SIGTERM, term)
 +http.server.HTTPServer((host, int(port)), H).serve_forever()
 +PY
@@ -895,6 +972,7 @@ index 527cd7d..fff8d4f 100755
 +  T2_OURS_PGIDS=()
 +  lg_start a -mode light || echo "FAIL inst: main did not start"
 +  main_pid=$LG_PID
++  LG_ENV=(FAKE_EXIT=3)
 +  STACK_PIN=1 T2_CPUS_LOADGEN=0 LG_CPUS=1 lg_in flood lg_start b -mode garbage || echo "FAIL inst: flood did not start"
 +  expect "inst: main's control port is base + 5" "$(lg_control)" "127.0.0.1:$((STACK_PORT_BASE + 5))"
 +  expect "inst: flood's control port is base + 6" "$(lg_in flood lg_control)" "127.0.0.1:$((STACK_PORT_BASE + 6))"
@@ -916,11 +994,17 @@ index 527cd7d..fff8d4f 100755
 +  expect "wait: a false one fails by its deadline" "$? $((SECONDS - start <= 2))" "1 1"
 +  flood_pid=${LG_PIDS[flood]}
 +  lg_in flood lg_stop
-+  expect "inst: the flood stopped" "$(kill -0 "$flood_pid" 2>/dev/null && echo running || echo stopped) ${LG_STATUSES[flood]}" "stopped 0"
++  expect "inst: the flood stopped" "$(kill -0 "$flood_pid" 2>/dev/null && echo running || echo stopped) ${LG_STATUSES[flood]}" "stopped 3"
++  expect "inst: LG_STATUS is main's after lg_in" "[$LG_STATUS]" "[]"
 +  expect "inst: main still runs" "$(kill -0 "$LG_PID" 2>/dev/null && echo running)" running
 +  expect "inst: the flood's result" "$(lg_in flood lg_json 'd["out"]')" '"loadgen-b.json"'
++  lg_in flood lg_start b2 -mode slow-auth || echo "FAIL inst: a stopped instance did not start again"
++  LG_ENV=()
++  expect "inst: a stopped instance runs again under a new name" "$(lg_in flood lg_get /stats 'd["mode"]')" '"slow-auth"'
 +  lg_stop_all
 +  expect "inst: lg_stop_all stopped main" "$(kill -0 "$main_pid" 2>/dev/null && echo running || echo stopped) ${LG_STATUSES[main]} [$LG_PID]" "stopped 0 []"
++  expect "inst: LG_STATUS is main's after lg_stop_all" "$LG_STATUS ${LG_STATUSES[flood]}" "0 3"
++  expect "inst: the restarted instance's result" "$(lg_in flood lg_json 'd["out"]')" '"loadgen-b2.json"'
 +  expect "inst: main's result" "$(lg_json 'd["out"]')" '"loadgen-a.json"'
 +) | tee "$dir/inst.out"
 +fails=$((fails + $(grep -c '^FAIL' "$dir/inst.out")))
@@ -943,13 +1027,13 @@ index e7f9e2b..d1e03b4 100755
 - [ ] **Step 2: Run them to see them fail**
 
 Run: `scripts/loadgen_test.sh; STACK_REDIS_SERVER=$HOME/.local/bin/redis-server scripts/stack_test.sh 2>&1 | grep -v '^ok'`
-Expected: `loadgen_test` fails from `inst: flood did not start` on (`lg_in: command not found`; `LG_PIDS[flood]` unbound), and `inst: a second start of a running instance is refused` gets `0`, because the old `lg_start` started a second loadgen on main's port. `stack_test` fails `ports: the 4th loadgen instance's control port missing`. The `kill: … No such process` and `Killed … setsid` lines from `stack_test.sh` are its own expected kills; they print on `1b6f64c` too.
+Expected: `loadgen_test` fails from `inst: flood did not start` on (`lg_in: command not found`; `LG_PIDS[flood]` unbound), and `inst: a second start of a running instance is refused` gets `0`, because the old `lg_start` started a second loadgen on main's port. The checks the review added (a stopped instance started again under a new name, O4; `LG_STATUS` as main's after `lg_in` and after `lg_stop_all`, O5) fail as well. `stack_test` fails `ports: the 4th loadgen instance's control port missing`. The `kill: … No such process` and `Killed … setsid` lines from `stack_test.sh` are its own expected kills; they print on `1b6f64c` too.
 
 - [ ] **Step 3: Implement**
 
 ```diff
 diff --git a/scripts/loadgen.sh b/scripts/loadgen.sh
-index 27faac0..8a0aee5 100644
+index 27faac0..d5bf983 100644
 --- a/scripts/loadgen.sh
 +++ b/scripts/loadgen.sh
 @@ -5,6 +5,7 @@
@@ -960,7 +1044,7 @@ index 27faac0..8a0aee5 100644
  #   lg_get PATH EXPR            # EXPR (python, over the JSON as d) of GET PATH on the control API
  #   lg_post PATH                # POST PATH; prints the reply, fails on an HTTP error
  #   lg_wait_back MARK SECONDS   # until every client of MARK logged in again
-@@ -12,30 +13,90 @@
+@@ -12,30 +13,96 @@
  #   lg_stop                     # SIGTERM, then wait (60s) for it to write its result; LG_STATUS = exit status
  #   lg_json EXPR                # EXPR over the result file of the last loadgen
  #   lg_true SOURCE EXPR         # "true" if EXPR is true over SOURCE (a file, or - for stdin), else "false"
@@ -984,17 +1068,22 @@ index 27faac0..8a0aee5 100644
 +# Instances (P6a2bI-1): several loadgens can run on one stack, one mode
 +# each, e.g. a flood beside a legitimate population, or a light instance
 +# answering heartbeats beside an SDK storm. Every function above acts on the
-+# current instance, "main" unless inside lg_in; LG_PID and LG_NAME are the
-+# current instance's. Instance k (main is 0, the others numbered in the
-+# order lg_in first names them, at most LG_MAX_INSTANCES in all) has its
-+# control API on STACK_PORT_BASE + 5 + k, among stack_ports, so a leftover
-+# loadgen there is refused before the stack starts. Each instance needs its
-+# own NAME, -uid-prefix and, for a flood, -source-net. LG_ENV and LG_CPUS
-+# are read by lg_start, so set them before each:
++# current instance, "main" unless inside lg_in; LG_PID, LG_NAME and
++# LG_STATUS are the current instance's. Instance k (main is 0, the others
++# numbered in the order lg_in first names them) has its control API on
++# STACK_PORT_BASE + 5 + k, among stack_ports, so a leftover loadgen there is
++# refused before the stack starts. A script names at most LG_MAX_INSTANCES
++# instances in all, and a name is never freed: name instances by role
++# (flood, flood2), not by phase, and start a stopped one again for the next
++# phase. Each lg_start takes its own NAME (its log and result file), and
++# each instance its own -uid-prefix and, for a flood, -source-net. LG_ENV
++# and LG_CPUS are read by lg_start, so set them before each:
 +#
 +#   lg_start legit -mode light -clients 20000 -uid-prefix legit
-+#   LG_CPUS=0-1 lg_in flood lg_start flood -mode garbage -rate 20000 -clients 5000 -source-net 1
++#   LG_CPUS=0-1 lg_in flood lg_start garbage -mode garbage -rate 20000 -clients 5000 -source-net 1
 +#   lg_in flood lg_get /stats 'd["flood"]["outcomes"]'
++#   lg_in flood lg_stop
++#   lg_in flood lg_start slowhs -mode slow-handshake -clients 50000 -source-net 1
 +#   lg_stop_all
  
  LG_PID=""
@@ -1019,8 +1108,9 @@ index 27faac0..8a0aee5 100644
  
 -lg_control() { echo "127.0.0.1:$((${STACK_PORT_BASE:-17000} + 5))"; }
 +# lg_in INST CMD...: CMD with INST as the current instance, then the
-+# previous one again. Not in $(...) for lg_start or lg_stop: a subshell
-+# cannot keep the pid or wait for it.
++# previous one again. A name first seen here takes the next index, for
++# good (#120, O4). Not in $(...) for lg_start or lg_stop: a subshell cannot
++# keep the pid or wait for it.
 +lg_in() {
 +  local inst=$1 prev=$LG_INST rc
 +  shift
@@ -1028,12 +1118,12 @@ index 27faac0..8a0aee5 100644
 +    [ ${#LG_INSTANCES[@]} -lt "$LG_MAX_INSTANCES" ] || { echo "loadgen: instance $inst: already $LG_MAX_INSTANCES instances" >&2; return 1; }
 +    LG_INSTANCES+=("$inst")
 +  fi
-+  LG_PIDS[$prev]=$LG_PID LG_NAMES[$prev]=$LG_NAME
-+  LG_INST=$inst LG_PID=${LG_PIDS[$inst]:-} LG_NAME=${LG_NAMES[$inst]:-}
++  LG_PIDS[$prev]=$LG_PID LG_NAMES[$prev]=$LG_NAME LG_STATUSES[$prev]=$LG_STATUS
++  LG_INST=$inst LG_PID=${LG_PIDS[$inst]:-} LG_NAME=${LG_NAMES[$inst]:-} LG_STATUS=${LG_STATUSES[$inst]:-}
 +  "$@"
 +  rc=$?
-+  LG_PIDS[$inst]=$LG_PID LG_NAMES[$inst]=$LG_NAME
-+  LG_INST=$prev LG_PID=${LG_PIDS[$prev]:-} LG_NAME=${LG_NAMES[$prev]:-}
++  LG_PIDS[$inst]=$LG_PID LG_NAMES[$inst]=$LG_NAME LG_STATUSES[$inst]=$LG_STATUS
++  LG_INST=$prev LG_PID=${LG_PIDS[$prev]:-} LG_NAME=${LG_NAMES[$prev]:-} LG_STATUS=${LG_STATUSES[$prev]:-}
 +  return $rc
 +}
  
@@ -1058,7 +1148,7 @@ index 27faac0..8a0aee5 100644
    mkdir -p "$STACK_DIR/artifacts" "$STACK_DIR/logs"
    rm -f "$STACK_DIR/artifacts/loadgen-$LG_NAME.json"
    setsid "${cmd[@]}" >"$STACK_DIR/logs/loadgen-$LG_NAME.log" 2>&1 &
-@@ -84,6 +145,15 @@ lg_wait_online() {
+@@ -84,6 +151,15 @@ lg_wait_online() {
    return 1
  }
  
@@ -1074,7 +1164,7 @@ index 27faac0..8a0aee5 100644
  lg_wait_back() {
    local end=$((SECONDS + $2))
    while [ $SECONDS -lt $end ]; do
-@@ -114,7 +184,13 @@ lg_stop() {
+@@ -114,7 +190,13 @@ lg_stop() {
    kill -KILL "$LG_PID" 2>/dev/null
    wait "$LG_PID" 2>/dev/null
    LG_STATUS=$?
@@ -1119,6 +1209,8 @@ Expected: `lib_test: all passed`, `loadgen_test: all passed`, `stack_test: all p
 - `a 5th instance` counted an instance named only in a subshell (Review Focus 4);
 - `the flood stopped` ran `kill -0` on the emptied `LG_PIDS[flood]`, which is `kill -0 0`, which always succeeds.
 
+The fake loadgen exits `$FAKE_EXIT` (3 for the flood, through `LG_ENV`), so main's and the flood's statuses differ. With `lg_in`'s `LG_STATUS` swap removed, the prototype failed exactly `LG_STATUS is main's after lg_in` (`got [[3]], want [[]]`) and `LG_STATUS is main's after lg_stop_all` (`got [3 3], want [0 3]`).
+
 - [ ] **Step 5: Commit**
 
 ```bash
@@ -1141,24 +1233,25 @@ git commit -m "feat: loadgen.sh instances: lg_in, lg_wait, lg_stop_all, control 
 
 ```diff
 diff --git a/scripts/load-probe.sh b/scripts/load-probe.sh
-index 098d56e..ca449c3 100755
+index 098d56e..b59d79d 100755
 --- a/scripts/load-probe.sh
 +++ b/scripts/load-probe.sh
-@@ -5,7 +5,12 @@
+@@ -5,7 +5,13 @@
  #
  #   1. light: 3,000 connections log in, Ping every 5s for 15s: every Ping
  #      answered, no connection lost
 -#   2. sdk:   2,000 SDK clients log in; loadgen SIGKILLs gw-1 (POST /kill):
-+#   2. floods (Plan 6b3a): beside 2,000 light clients, a loadgen instance
-+#      sends garbage handshakes at 2,000/s for 10s, then two more hold 500
-+#      slow-handshake and 500 slow-auth connections: the gateways fail and
-+#      close every garbage handshake, close every slow connection at its
-+#      5s timeout, and the light clients keep every Ping answered
++#   2. floods (Plan 6b3a): beside 2,000 light clients, loadgen instance
++#      flood sends garbage handshakes at 2,000/s for 10s, then runs again
++#      holding 500 slow-handshake connections beside flood2's 500 slow-auth
++#      ones: the gateways fail and close every garbage handshake, close
++#      every slow connection by its 5s timeout (held p99 ≤ 6.5s), and the
++#      light clients keep every Ping answered
 +#   3. sdk:   2,000 SDK clients log in; loadgen SIGKILLs gw-1 (POST /kill):
  #      99% of its clients log in again within 30s of T_death, and the
  #      killed gateway is the only process that did not stop cleanly
  #
-@@ -26,7 +31,7 @@ ok() { echo "ok   $1"; }
+@@ -26,7 +32,7 @@ ok() { echo "ok   $1"; }
  bad() { echo "FAIL $1"; fails=$((fails + 1)); }
  check() { if [ "$2" = true ]; then ok "$1"; else bad "$1: $3"; fi; }
  cleanup() {
@@ -1167,13 +1260,14 @@ index 098d56e..ca449c3 100755
    stack_down
    if [ "$fails" -eq 0 ] && [ "${PROBE_KEEP:-0}" != 1 ]; then rm -rf "$STACK_DIR"; else echo "probe: results in $STACK_DIR"; fi
  }
-@@ -50,7 +55,54 @@ check "light: every Ping answered" "$(lg_json 'd["pong_missing"] == 0 and d["pon
+@@ -50,7 +56,55 @@ check "light: every Ping answered" "$(lg_json 'd["pong_missing"] == 0 and d["pon
  check "light: none lost while held" "$(lg_json 'd["lost"] == {}')" "$(lg_json 'd["lost"]')"
  echo "     light: login p99 $(lg_json 'd["login_latency"]["p99_ms"]')ms, Pong p99 $(lg_json 'd["pong_rtt"]["p99_ms"]')ms, failed $(lg_json 'd["failed"]')"
  
 -# 2: sdk, and a gateway killed by loadgen.
-+# 2: floods beside light clients, each flood its own loadgen instance from
-+# its own source addresses.
++# 2: floods beside light clients, each flood on its own loadgen instance
++# from its own source addresses; instance flood runs garbage, then
++# slow-handshake (instances are named by role and reused, #120).
 +# gw_sum METRIC MATCH: over both gateways; a labelled counter has no sample
 +# before its first increment, which counts as 0.
 +gw_sum() {
@@ -1184,32 +1278,32 @@ index 098d56e..ca449c3 100755
 +if lg_wait_online 2000 60; then ok "floods: 2000 light clients online"; else bad "floods: light clients not all online"; fi
 +failed0=$(gw_sum goim_gateway_handshakes_total 'result="failed"')
 +limited0=$(gw_sum goim_gateway_admission_rejects_total 'reason="handshake_rate"')
-+lg_in garbage lg_start garbage -mode garbage -rate 2000 -clients 500 -source-net 1 || bad "garbage: loadgen did not start"
++lg_in flood lg_start garbage -mode garbage -rate 2000 -clients 500 -source-net 1 || bad "garbage: loadgen did not start"
 +sleep 10
-+lg_in garbage lg_stop
-+check "garbage: loadgen exited 0" "$([ "${LG_STATUSES[garbage]}" = 0 ] && echo true)" "status ${LG_STATUSES[garbage]}"
-+outcomes=$(lg_in garbage lg_json 'd["flood"]["outcomes"]')
-+closed=$(lg_in garbage lg_json 'd["flood"]["outcomes"].get("closed", 0)')
-+check "garbage: ≥ 15000 attempts, every one counted closed by a gateway" "$(lg_in garbage lg_true "$STACK_DIR/artifacts/loadgen-garbage.json" 'set(d["flood"]["outcomes"]) == {"closed"} and d["flood"]["outcomes"]["closed"] >= 15000')" "$outcomes"
++lg_in flood lg_stop
++check "garbage: loadgen exited 0" "$([ "${LG_STATUSES[flood]}" = 0 ] && echo true)" "status ${LG_STATUSES[flood]}"
++outcomes=$(lg_in flood lg_json 'd["flood"]["outcomes"]')
++closed=$(lg_in flood lg_json 'd["flood"]["outcomes"].get("closed", 0)')
++check "garbage: ≥ 15000 attempts, every one counted closed by a gateway" "$(lg_in flood lg_true "$STACK_DIR/artifacts/loadgen-garbage.json" 'set(d["flood"]["outcomes"]) == {"closed"} and d["flood"]["outcomes"]["closed"] >= 15000')" "$outcomes"
 +failed=$(($(gw_sum goim_gateway_handshakes_total 'result="failed"') - failed0))
 +limited=$(($(gw_sum goim_gateway_admission_rejects_total 'reason="handshake_rate"') - limited0))
 +check "garbage: the gateways failed (or limited) as many handshakes" "$([ $((failed + limited)) -ge "$closed" ] && [ "$failed" -gt 0 ] && echo true)" "failed $failed + handshake_rate $limited, closed $closed"
-+echo "     garbage: $(lg_in garbage lg_json 'd["flood"]["attempts"]') attempts, $(lg_in garbage lg_json 'd["flood"]["skipped"]') skipped, held p50 $(lg_in garbage lg_json 'd["flood"]["held"]["p50_ms"]')ms p99 $(lg_in garbage lg_json 'd["flood"]["held"]["p99_ms"]')ms; gateways: failed $failed, handshake_rate $limited"
++echo "     garbage: $(lg_in flood lg_json 'd["flood"]["attempts"]') attempts, $(lg_in flood lg_json 'd["flood"]["skipped"]') skipped, held p50 $(lg_in flood lg_json 'd["flood"]["held"]["p50_ms"]')ms p99 $(lg_in flood lg_json 'd["flood"]["held"]["p99_ms"]')ms; gateways: failed $failed, handshake_rate $limited"
 +hst0=$(gw_sum goim_gateway_admission_rejects_total 'reason="handshake_timeout"')
 +aut0=$(gw_sum goim_gateway_admission_rejects_total 'reason="auth_timeout"')
-+lg_in slowhs lg_start slowhs -mode slow-handshake -clients 500 -rate 500 -source-net 2 || bad "slow-handshake: loadgen did not start"
-+lg_in slowauth lg_start slowauth -mode slow-auth -clients 500 -rate 500 -source-net 3 || bad "slow-auth: loadgen did not start"
-+for inst in slowhs slowauth; do
++lg_in flood lg_start slowhs -mode slow-handshake -clients 500 -rate 500 -source-net 2 || bad "slow-handshake: loadgen did not start"
++lg_in flood2 lg_start slowauth -mode slow-auth -clients 500 -rate 500 -source-net 3 || bad "slow-auth: loadgen did not start"
++for inst in flood flood2; do
 +  lg_in "$inst" lg_wait 'd["flood"]["outcomes"].get("closed", 0) >= 500 and d["flood"]["open"] >= 450' 30 ||
 +    bad "$inst: not 500 closed with 450 open again: $(lg_in "$inst" lg_get /stats 'd["flood"]')"
 +done
-+lg_in slowhs lg_stop
-+lg_in slowauth lg_stop
++lg_in flood lg_stop
++lg_in flood2 lg_stop
 +for inst in slowhs slowauth; do
-+  check "$inst: every connection held 5–6.5s, then closed by a gateway" "$(lg_true "$STACK_DIR/artifacts/loadgen-$inst.json" 'set(d["flood"]["outcomes"]) == {"closed"} and d["flood"]["held"]["p50_ms"] >= 5000 and d["flood"]["held"]["max_ms"] <= 6500')" \
++  check "$inst: held p50 ≥ 5s, p99 ≤ 6.5s, max ≤ 7.5s, then closed by a gateway" "$(lg_true "$STACK_DIR/artifacts/loadgen-$inst.json" 'set(d["flood"]["outcomes"]) == {"closed"} and d["flood"]["held"]["p50_ms"] >= 5000 and d["flood"]["held"]["p99_ms"] <= 6500 and d["flood"]["held"]["max_ms"] <= 7500')" \
 +    "$(lg_py "$STACK_DIR/artifacts/loadgen-$inst.json" 'd["flood"]')"
 +done
-+echo "     slow: held p50/max: slow-handshake $(lg_in slowhs lg_json '[d["flood"]["held"]["p50_ms"], d["flood"]["held"]["max_ms"]]')ms, slow-auth $(lg_in slowauth lg_json '[d["flood"]["held"]["p50_ms"], d["flood"]["held"]["max_ms"]]')ms"
++echo "     slow: held p50/p99/max: slow-handshake $(lg_in flood lg_json '[d["flood"]["held"][k] for k in ("p50_ms", "p99_ms", "max_ms")]')ms, slow-auth $(lg_in flood2 lg_json '[d["flood"]["held"][k] for k in ("p50_ms", "p99_ms", "max_ms")]')ms"
 +hst=$(($(gw_sum goim_gateway_admission_rejects_total 'reason="handshake_timeout"') - hst0))
 +aut=$(($(gw_sum goim_gateway_admission_rejects_total 'reason="auth_timeout"') - aut0))
 +check "slow: the gateways closed them by their timeouts" "$([ "$hst" -ge 500 ] && [ "$aut" -ge 500 ] && echo true)" "handshake_timeout $hst, auth_timeout $aut"
@@ -1228,33 +1322,33 @@ index 098d56e..ca449c3 100755
 - [ ] **Step 2: Run the probe**
 
 Run: `make test-load-probe 2>&1 | tail -30`
-Expected: `load-probe: all passed`. Under the prototype the phase printed:
+Expected: `load-probe: all passed`. Under the prototype (`eb2639c`, after the review) the phase printed:
 
 ```
 ok   floods: 2000 light clients online
 ok   garbage: loadgen exited 0
 ok   garbage: ≥ 15000 attempts, every one counted closed by a gateway
 ok   garbage: the gateways failed (or limited) as many handshakes
-     garbage: 20012 attempts, 0 skipped, held p50 0ms p99 2ms; gateways: failed 20012, handshake_rate 0
-ok   slowhs: every connection held 5–6.5s, then closed by a gateway
-ok   slowauth: every connection held 5–6.5s, then closed by a gateway
-     slow: held p50/max: slow-handshake [5518, 6051]ms, slow-auth [5530, 6120]ms
+     garbage: 20009 attempts, 0 skipped, held p50 0ms p99 1ms; gateways: failed 20009, handshake_rate 0
+ok   slowhs: held p50 ≥ 5s, p99 ≤ 6.5s, max ≤ 7.5s, then closed by a gateway
+ok   slowauth: held p50 ≥ 5s, p99 ≤ 6.5s, max ≤ 7.5s, then closed by a gateway
+     slow: held p50/p99/max: slow-handshake [5506, 5996, 6007]ms, slow-auth [5507, 5998, 6010]ms
 ok   slow: the gateways closed them by their timeouts
 ok   floods: light loadgen exited 0
 ok   floods: every light Ping answered through the floods
-     floods: light Pong p99 24ms, max 107ms
+     floods: light Pong p99 8ms, max 27ms
 ```
 
 In the prototype's first two runs, two mistakes in the phase were found and fixed in the patch above:
 - The gateways' baseline read `null`, because a labelled counter has no sample before its first increment. `gw_sum` counts it as 0.
 - The Ping bound was `2000 × 4`, but the floods last ~18s at a 5s interval, so pongs came to 7,580. It is `2000 × 3` now.
 
-The light Pong p99 rose from 6ms (phase 1) to 24–52ms under the floods on 2 cores, with none missing. That is recorded only (`echo`), not gated: Tier 2's numbers are 6b3b's.
+Before the review, the slow holds' max reached 6,120ms against the old 6.5s max gate (O7). The light Pong p99 under the floods was 8ms in that run, and 24–52ms in earlier runs (phase 1: 6–9ms), with none missing. That is recorded only (`echo`), not gated: Tier 2's numbers are 6b3b's.
 
 - [ ] **Step 3: The record**
 
-- `README.md`, *What's in it*, the `cmd/loadgen` row: English `Load generator: light (raw connections) and SDK modes, garbage-handshake and slow-client flood modes, several instances per stack, histograms exact to 1 ms, kill/mark control API`; 中文 `压测工具：light（裸连接）和 SDK 两种模式，垃圾握手和慢客户端洪泛模式，同一栈上可运行多个实例，精确到 1 ms 的直方图，kill/mark 控制接口`. Recount the *Tests* row in both languages with `git ls-files '*_test.go' | xargs grep -c '^func Test' | awk -F: '{s += $2} END {print s}'` (the prototype counted 477; the README still says 467) and write that number.
-- Roadmap: in plan 6's row, after the 6b3a entry written with this plan, record its review and execution as they happened, and "next 6b3b". #119 and #120 under *Implementation choices* get their status after review (decided, amended).
+- `README.md`, *What's in it*, the `cmd/loadgen` row: English `Load generator: light (raw connections) and SDK modes, garbage-handshake and slow-client flood modes, several instances per stack, histograms exact to 1 ms, kill/mark control API`; 中文 `压测工具：light（裸连接）和 SDK 两种模式，垃圾握手和慢客户端洪泛模式，同一栈上可运行多个实例，精确到 1 ms 的直方图，kill/mark 控制接口`. Recount the *Tests* row in both languages with `git ls-files '*_test.go' | xargs grep -c '^func Test' | awk -F: '{s += $2} END {print s}'` (the prototype counted 479; the README still says 467) and write that number.
+- Roadmap: in plan 6's row, after the 6b3a entry written with this plan, record its review and execution as they happened, and "next 6b3b". #119, #120 and #121 are already listed as decided (the review, 2026-10-16); note there only that they are executed.
 - This plan's *Execution Notes*: each task's commit, the test output, the mutation results, the probe's floods lines.
 
 - [ ] **Step 4: Commit**
@@ -1266,7 +1360,7 @@ git commit -m "test: load probe floods phase: garbage, slow-handshake, slow-auth
 
 ## After this plan
 
-- **6b3b** (scenario `floods`, Tier 2 run 30) builds on: `lg_in` with a light or SDK `main` and up to three floods; `"flood"` stats; `-source-net` per flood. It decides the rates and sizes. It gates the achieved garbage rate (Review Focus 2), sizes slow-auth against the bucket (Review Focus 5), and records the gateway's TIME_WAIT (Review Focus 3). The spec's "a legitimate 20k/s storm is not rejected by the bucket" needs no flood: a light instance ramps at 20,000/s, and `failed["pre-handshake"]` together with the gateways' `handshake_rate` give the verdict.
+- **6b3b** (scenario `floods`, Tier 2 run 30) builds on: `lg_in` with a light or SDK `main` and up to three floods; `"flood"` stats; `-source-net` per flood. It decides the rates and sizes. It names instances by role and reuses them across phases (#120). It gates the delivered garbage rate on the gateways' handshake counters, as the probe's `failed + limited ≥ closed` check does (Review Focus 2), sizes slow-auth against the bucket (Review Focus 5), and records the gateway's TIME_WAIT (Review Focus 3). It runs the spec's 20k/s storm clause without a flood (#121). The limiter path has an in-process test here (Review Focus 6); run 30 is its first test at scale.
 - **6b3c** (`/reset`, `/network-change`, scenario `reconnect`) uses instances for its light heartbeat probe beside the SDK storm (P6a2bI-2). The 6b2a-pinger ruling applies there: an SDK Ping `Send` blocked on a full socket buffer holds back the Pong-timeout check. Heartbeats are checked from the light instance, but whether a blocked write matters at that scale should be checked, not assumed.
 
 ## Execution Notes
