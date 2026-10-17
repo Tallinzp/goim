@@ -550,3 +550,16 @@ The verdict's other branches gave all 8 table rows as expected on JSON. The sett
   - M4: `heartbeats` gates `v in (None, "valid")`, so a verdict computed as null would pass `slow_heartbeats`. No path to it today.
   - M5: `first_s.no_slot` and `no_slot_per_s` include slow-auth's own refusals. This is a caveat for reading run 30c.
   - M6: `gw_runq_ms_per_s` can go negative if a gateway thread exits or the gateway restarts.
+
+**Minors M1–M6 fixed 2026-10-17 on the user's request** (`e12f3de`). New `scripts/tier2/floods_test.sh` is in `make test-scripts`. It covers `in_set`, `heartbeats`' gate, `slow_verdict` and `slow_series` on synthetic sampler lines, and failed 14 of 27 checks before the fixes.
+- **M1.** `stack_metrics` now takes `STACK_CURL_TIMEOUT` (default 10, unchanged elsewhere), with a new `stack_test` case: a silent gateway reads null within 1s; the old code was cut off by the test's 10s `timeout`. The sampler scrapes each gateway with 1s, stamps `ms_end` right after the gateways, and asks `/stats` last.
+  - A sample whose scrapes trailed its clock by over 1.5s, or that lacks a gateway, gives no gateway readings. The next on-time sample's rates are taken against the last on-time one, so a refusal is dated late, never early (this also covers I1's lost interval).
+  - New column `scrape_ms`; new `first_s.scrape_late`.
+  - In the forced loadgen-saturated dry run the skew stayed ≤440ms. With `/stats` first, as before the reorder, it was ~1.3s.
+- **M2.** A gateway counter null in the earlier sample counts 0 there, once the later one has it.
+- **M3.** `in_set` refuses a list that expands to no CPU (`5-3`).
+- **M4.** `heartbeats` gates on `$# -ge 4`: with a verdict argument, even an empty one, only `"valid"` passes, and the `verdict` member is always written.
+- **M5.** The sampler reads the light instance's own `pre-handshake` failures (a gateway refusing it). New column `lg_refused_per_s`; new `first_s.light_refused`. `no_slot_per_s` still counts slow-auth's refusals too, as the header now says.
+- **M6.** A gateway whose run-queue total went down gives no reading that row, never a negative one.
+
+The series now has **19 columns** (`scrape_ms` after `t_s`, `lg_refused_per_s` after `lg_failed_per_s`) and `first_s` has **10 members**. Task 2's "all eight members" reads as all ten. Still 30 checks (17 `t2_check` calls, as before), no Go change. Suite green (`lib_test`, `floods_test`, `loadgen_test` and `stack_test` all passed; `make test`, `go vet`). Slow-only dry runs: valid 11/12 (only `no_swap_in_slow`, dev), skew max 183ms, `first_s` all null. Forced case: `loadgen-saturated`, labelled as before.
