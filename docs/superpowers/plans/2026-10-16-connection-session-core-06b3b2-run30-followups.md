@@ -1346,3 +1346,22 @@ Next: Task 5 on the host (the user): `sudo scripts/tier2/host-setup.sh` after th
 7. The pinger records once per visit (`Recorder.PingVisit`) instead of 2–3 times per Ping, covered by the existing pinger tests.
 
 Verified: `make test`, `make test-scripts`, `go vet ./...`, `go test -race` on loadgen, and a full `floods` dry run (30 checks, only dev swap failing).
+
+**Run 30b** (2026-10-17, the user, Tier 2 host; commit `85e79af`, `dirty` 0, 427s; `floods-20261017-015447`). **Failed 28/30**: `slow_legit` and `slow_heartbeats`. Host check before it: INPUT and OUTPUT policy `ACCEPT` (INPUT jumps only to Tailscale's `ts-input`, whose one drop is for 100.64.0.0/10 sources), no native nft table; `notrack-check` 0, the four `goim-notrack` rules in raw.
+
+What run 30's six failures did (Task 5 Step 2's expectations):
+- **NOTRACK:** `storm_conntrack` peak 18, `garbage_conntrack` 19, `slow_conntrack` 22 of 4,194,304 (`conns` 200,000, 420,000 and 520,000; `peak_per_conn` ≤ 0.0001). `conntrack_stat` null in every phase (the host has no `/proc/net/stat/nf_conntrack`). Review Focus 1 holds.
+- **`storm_rate`:** passes, `loadgen-bound`. `loadgen_cores_ramp` 7.929 of 8, `loadgen_cores` 6.782, `new_per_s` 15,945 (of 20,000), `seen_per_s` 20,780. gw-0 used 5.31 cores, and its 12-CPU set was 55.5% idle, so the gateway had room (Review Focus 4). `storm_bucket.no_slot_share` 0.2664 (run 30: 0.267).
+- **`garbage_delivered`:** passes. 7,206,236 attempts (want 6,840,000), `skipped` 0, `TCPSynRetrans` 8 (run 30: 437k), no softnet drops on any set. NOTRACK was the cure (Review Focus 5).
+- **`garbage_limited`:** passes. `bound_by` `slots` on both gateways (`no_slot` 1,747,883 and 1,603,317, `no_token` 0), `dh_per_s` 21,634 and 21,179, and a `not_covered` line per gateway for the bucket (25,000/s). These are #111's inputs.
+- **`garbage_heartbeats`:** passes. 1,497,990 Pongs, none missing, p99 4ms. `ping_gap_max_ms` 30,063, `ping_tick_lag_max_ms` 61, `ping_send_max_ms` 14, `ping_send_timeouts` 0.
+- **`slow_held`:** passes. slowhs max 6,542ms and slowauth 6,496ms (bound 7.5s; run 30: 7,782 in an invalid phase).
+- **`slow_legit`: fails.** 90,334 of 400,000 online, 19,097 gave up. Failures: `dial-timeout` 425,619, `handshake` 612,147, `pre-handshake` 284,561, `login` 159,389. The gateways refused legitimate logins too: `rejects_pending_mem` 63,006 and 66,026, `hs_no_slot` 157,018 and 154,271, `logins_busy` 0.
+- **`slow_heartbeats`: fails.** `lost` 142,250, `closes_heartbeat` 71,247 and 70,981, `pong_missing` 1,616, Pong p99 9,231ms. `ping_gap_max_ms` 155,087, `ping_tick_lag_max_ms` 123,302, `ping_send_max_ms` 121,559, `ping_send_timeouts` 37.
+
+Reading of the slow phase:
+- **Loadgen's CPU set was saturated:** 84% user, 3.6% idle over 244s. Its three processes used 7.94 of its 8 CPUs: the light instance 4.42 cores and 11.6GB RSS (3.5GB in garbage), slow-auth 2.68, slow-handshake 0.83. The gateways' set was 69.5% idle and logic's 94.6%.
+- **The pinger was starved, not blocked:** a 121s `Send` with a 1s write deadline, and only 37 timeouts, means the goroutine wasn't running, not that it waited on a socket. Hypothesis, not yet checked: the 8 pinger goroutines waited behind a large run queue of retrying light clients (Noise handshakes are CPU-heavy). This is the case Review Focus 3 names: large tick lag means a starved goroutine.
+- **Open questions:** how much of `slow_legit` is the gateways' own `pending_mem` and slot refusals (the spec's slow-client row expects no such refusals of legitimate clients), and how much is loadgen's saturation feeding retries. The run has no time series to order the two.
+- **Not changed:** `dmesg` wasn't sent. The README row waits.
+
