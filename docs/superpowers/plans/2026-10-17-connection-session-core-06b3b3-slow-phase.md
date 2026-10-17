@@ -540,3 +540,13 @@ Forced `loadgen-saturated` case (12 checks): the probe read `GOMAXPROCS=2` on CP
 - Early rows have `lg_online` null.
 
 The verdict's other branches gave all 8 table rows as expected on JSON. The settings check refused `FLOODS_SLOW_HS_CPUS=5`, `FLOODS_SLOW_AUTH_CPUS=0,x` and `FLOODS_SLOW_AUTH_PROCS=0` with the specified messages, before any stack started. No process was left behind.
+
+**Final review 2026-10-17** (fresh Opus reviewer, `19261bc..8e0c315`): 0 Critical, 1 Important, 6 Minor. Verdict "ready with fixes".
+- **I1, fixed in `42f9763`.** `slow_series`' `gsum` skipped a gateway whose scrape came back null, so one failed `/metrics` gave a row of negative rates, then a spike of that gateway's whole total. That planted a false `first_s.no_slot` or `first_s.pending_mem`, the very order the review-O3 ruling reads. Now a missing gateway nulls that row's sums, and the rates are null unless both samples hold the same gateways. A synthetic three-sample test (gw-1 null in the middle sample) gave −5000/+5000 and `first_s.no_slot` 2.0 before the fix, and nulls after it. Suite green; slow-only dry run 12 checks, only `no_swap_in_slow` (dev) failing, verdict `valid`, `first_s` all null.
+- **Minors, left for the user's call:**
+  - M1: a line's counters can trail its `ms` stamp by up to ~21s, because `stack_metrics` uses `curl -m 10` serially. Suggested: an `ms_end` field, or a short timeout for the sampler. The reviewer thought it worth taking before run 30c.
+  - M2: a counter family with no sample yet reads null to N at its first rise, so `first_s` can miss or delay it (`closes_heartbeat`). Suggested: treat null as 0 when the later reading is non-null.
+  - M3: `in_set` accepts a reversed range such as `5-3` (it expands to nothing), so `taskset` fails later inside `lg_start`.
+  - M4: `heartbeats` gates `v in (None, "valid")`, so a verdict computed as null would pass `slow_heartbeats`. No path to it today.
+  - M5: `first_s.no_slot` and `no_slot_per_s` include slow-auth's own refusals. This is a caveat for reading run 30c.
+  - M6: `gw_runq_ms_per_s` can go negative if a gateway thread exits or the gateway restarts.
