@@ -177,15 +177,6 @@ LOGIC_COUNTERS=(
   kick_dropped='goim_logic_kick_dropped_total'
 )
 
-# lease_floor SECONDS: the fewest renewals a window of SECONDS (whole) must
-# hold. A renewal counts when its call ends, at most 5s (the call timeout)
-# after its 10s tick, so (SECONDS - 6) // 10 of them (1s for SECONDS'
-# resolution), and never fewer than SECONDS // 10 - 1 (P6b2b-slowI-5).
-lease_floor() {
-  local s=$1
-  echo $((s / 10 - 1 > (s - 6) / 10 ? s / 10 - 1 : (s - 6) / 10))
-}
-
 # The other Logic login results (superseded, stale, kicked, error...) in a
 # stack_counters_delta of LOGIC_COUNTERS: Logic work that is neither T's nor
 # T''s (P6b2b-slowI-4).
@@ -361,7 +352,7 @@ t2_field calibrate "{\"clients\": $cal_clients, \"rate\": $cal_rate, \"queue_cap
 lease1=$(stack_counters logic "${LOGIC_COUNTERS[@]}") lease_s=$((SECONDS - lease_t))
 for g in gw-0 gw-1; do lg1[$g]=$(stack_counters "$g" "${GW_COUNTERS[@]}"); done
 # 1 over the ~16s calibration, where lease_s // 10 - 1 alone would be 0.
-lease_floor=$(lease_floor "$lease_s")
+lease_floor=$(t2_lease_floor "$lease_s")
 lease_d="{\"gw-0\": $(stack_counters_delta "${lg0[gw-0]}" "${lg1[gw-0]}"), \"gw-1\": $(stack_counters_delta "${lg0[gw-1]}" "${lg1[gw-1]}"), \"logic\": $(stack_counters_delta "$lease0" "$lease1")}"
 t2_check calibrate_lease "$(echo "$lease_d" | lg_true - 'all(d[g]["lease_error"] == 0 and d[g]["lease_missing"] == 0 and d[g]["lease_live"] >= '"$lease_floor"' for g in ("gw-0", "gw-1")) and d["logic"]["lease_error"] == 0')" \
   "\"elapsed_s\": $lease_s, \"live_floor\": $lease_floor, \"gateways\": $(echo "$lease_d" | lg_py - '{g: {"live": d[g]["lease_live"], "missing": d[g]["lease_missing"], "error": d[g]["lease_error"]} for g in ("gw-0", "gw-1")}'), \"logic_lease_error\": $(echo "$lease_d" | lg_py - 'd["logic"]["lease_error"]')"
@@ -454,7 +445,7 @@ gw_d=$(stack_counters_delta "$s0" "$s1")
 window_s=$(echo "$usage" | lg_py - 'd["window_s"]')
 slo=$STACK_DIR/artifacts/slo-death.json
 storm_floor=null # an unreadable window fails storm_lease
-[[ $window_s =~ ^[0-9]+(\.[0-9]+)?$ ]] && storm_floor=$(lease_floor "${window_s%.*}")
+[[ $window_s =~ ^[0-9]+(\.[0-9]+)?$ ]] && storm_floor=$(t2_lease_floor "${window_s%.*}")
 
 t2_check storm_busy "$(echo "$gw_d" | lg_true - '(d["logins_busy"] or 0) >= 0.1 * '"$victims")" \
   "\"busy\": $(echo "$gw_d" | lg_py - 'd["logins_busy"]'), \"floor\": $((victims / 10)), \"rejects_login_queue\": $(echo "$gw_d" | lg_py - 'd["rejects_login_queue"]'), \"queue_cap\": $qcap"

@@ -428,6 +428,16 @@ t2_tcpstat_json() {
           print "{" out "}" }' "$1" "$2"
 }
 
+# t2_lease_floor SECONDS: the fewest lease renewals a gateway must make in a
+# window of SECONDS (whole). A renewal counts when its call ends, at most 5s
+# (the call timeout) after its 10s tick, so (SECONDS - 6) // 10 of them (1s
+# for SECONDS' resolution), and never fewer than SECONDS // 10 - 1
+# (P6b2b-slowI-5; shared with floods, Plan 6b3b).
+t2_lease_floor() {
+  local s=$1
+  echo $((s / 10 - 1 > (s - 6) / 10 ? s / 10 - 1 : (s - 6) / 10))
+}
+
 t2_swap_pages() { awk '/^pswpin / { i = $2 } /^pswpout / { o = $2 } END { print i + 0, o + 0 }' /proc/vmstat; }
 
 # t2_clock_sampler FILE: appends "unix_s cpu khz" for every CPU every 5s.
