@@ -199,26 +199,33 @@ func (t *Transport) loopOf(el gnet.EventLoop) *loop {
 
 // OnOpen admits the socket in the core, before any crypto (spec: Admission
 // control). A rejected socket is closed at once; its OnClose finds no conn.
+// A held refusal (#131) stays open until the core closes it.
 func (t *Transport) OnOpen(gc gnet.Conn) ([]byte, gnet.Action) {
 	l := t.loopOf(gc.EventLoop())
 	c := &conn{t: t, l: l, gc: gc}
 	var reason string
 	l.run(func() { c.c, reason = t.g.Open(l, c) })
-	if reason != "" {
+	if c.c == nil {
 		return nil, gnet.Close
 	}
+	c.held = reason != ""
 	gc.SetContext(c)
 	c.hook("open")
 	return nil, gnet.None
 }
 
-// OnTraffic cuts and handles every whole frame buffered.
+// OnTraffic cuts and handles every whole frame buffered. A held refusal's
+// bytes are dropped unread.
 func (t *Transport) OnTraffic(gc gnet.Conn) gnet.Action {
 	c, ok := gc.Context().(*conn)
 	if !ok {
 		return gnet.Close
 	}
 	c.hook("traffic")
+	if c.held {
+		gc.Discard(-1)
+		return gnet.None
+	}
 	c.l.run(c.read)
 	return gnet.None
 }

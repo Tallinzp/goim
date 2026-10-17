@@ -118,3 +118,17 @@ func TestRejectReasonsExportedAtZero(t *testing.T) {
 		t.Fatalf("%d admission_rejects_total series before any reject, want 9 (err %v)", n, err)
 	}
 }
+
+func TestRefusalHoldIsValidated(t *testing.T) {
+	for name, mod := range map[string]func(*Config){
+		"negative hold":          func(c *Config) { c.RefuseHold = -time.Millisecond },
+		"hold ≥ handshake limit": func(c *Config) { c.RefuseHold = c.HandshakeTimeout },
+		"negative cap":           func(c *Config) { c.HeldCap = -1 },
+	} {
+		cfg := testConfig()
+		mod(&cfg)
+		if cfg.Validate() == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}

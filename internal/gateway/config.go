@@ -31,6 +31,11 @@ type Config struct {
 	MaxConns      int // connection cap: open sockets in any state (250k)
 	PendingCap    int // HANDSHAKE + AUTH_PENDING sockets, memory only (100k)
 	LoginQueueCap int // Logins waiting for or inside a Login RPC (8192)
+	// A pending_mem or draining refusal holds its socket until the first
+	// wheel tick RefuseHold after it (0.5–1.5s), so a least-connections LB
+	// counts the refusals (#131). Over HeldCap held, it closes at once.
+	RefuseHold time.Duration // (500ms; 0: no hold)
+	HeldCap    int           // (10k; 0: no hold), on top of nofile's MaxConns × (1 + Headroom)
 
 	HandshakeTimeout time.Duration // accept → handshake done (5s, 3–30s)
 	AuthTimeout      time.Duration // handshake done → LoginReq (5s, 3–30s)
@@ -108,6 +113,8 @@ func DefaultConfig() Config {
 		MaxConns:         250_000,
 		PendingCap:       100_000,
 		LoginQueueCap:    8192,
+		RefuseHold:       500 * time.Millisecond,
+		HeldCap:          10_000,
 		HandshakeTimeout: 5 * time.Second,
 		AuthTimeout:      5 * time.Second,
 		Heartbeat:        150 * time.Second,
@@ -186,6 +193,12 @@ func (c Config) Validate() error {
 	if c.MaxConns+c.LogoutQueue > pb.MaxTrackedConnIDs {
 		bad("MaxConns %d + LogoutQueue %d above %d: a ReconcileEnd would exceed Logic's %dMB message limit",
 			c.MaxConns, c.LogoutQueue, pb.MaxTrackedConnIDs, pb.MaxMsgBytes>>20)
+	}
+	if c.HeldCap < 0 {
+		bad("HeldCap %d must not be negative", c.HeldCap)
+	}
+	if c.RefuseHold < 0 || c.RefuseHold >= c.HandshakeTimeout {
+		bad("RefuseHold %v must be in [0, HandshakeTimeout %v)", c.RefuseHold, c.HandshakeTimeout)
 	}
 	if c.Reconcile.MaxRequeues < 0 {
 		bad("Reconcile.MaxRequeues %d must not be negative", c.Reconcile.MaxRequeues)

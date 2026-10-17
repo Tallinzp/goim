@@ -27,6 +27,7 @@ type Gateway struct {
 	pending     atomic.Int64 // HANDSHAKE + AUTH_PENDING sockets (pending cap)
 	tracked     atomic.Int64 // table entries
 	loginQueued atomic.Int64 // Logins waiting for or inside a Login RPC
+	held        atomic.Int64 // refusals held open (#131)
 	draining    atomic.Bool
 
 	loginCh  chan *loginItem
@@ -77,21 +78,23 @@ func New(cfg Config, d Deps) (*Gateway, error) {
 	return g, nil
 }
 
-// Open admits a new socket on loop l (spec: Admission control). It returns
-// the reject reason, already counted, when the transport must close the
-// socket before any crypto.
+// Open admits a new socket on loop l (spec: Admission control). On a refusal
+// it returns the reason, already counted. With no Conn, the transport closes
+// the socket before any crypto. With a Conn, the refusal is held (#131): the
+// transport keeps the socket, discards what it reads, and reports its close
+// through Closed; the core closes it after the hold.
 func (g *Gateway) Open(l Loop, link Link) (*Conn, string) {
 	ls := g.loops.bind(l)
 	switch {
 	case g.draining.Load():
-		return nil, g.reject(RejectDraining)
+		return g.refuse(ls, link, RejectDraining)
 	case g.open.Add(1) > int64(g.cfg.MaxConns):
 		g.open.Add(-1)
 		return nil, g.reject(RejectAtCapacity)
 	case g.pending.Add(1) > int64(g.cfg.PendingCap):
 		g.pending.Add(-1)
 		g.open.Add(-1)
-		return nil, g.reject(RejectPendingMem)
+		return g.refuse(ls, link, RejectPendingMem)
 	}
 	c := &Conn{id: ls.nextID(), ls: ls, link: link, state: stateHandshake}
 	c.onLife = func() { g.lifeExpired(c) }
@@ -102,6 +105,30 @@ func (g *Gateway) Open(l Loop, link Link) (*Conn, string) {
 	g.gauges[stateHandshake].inc()
 	ls.wheel.schedule(&c.life, g.now().Add(g.cfg.HandshakeTimeout), c.onLife)
 	return c, ""
+}
+
+// refuse counts a pending_mem or draining refusal and, while fewer than
+// HeldCap are held, holds the socket open until the first wheel tick
+// RefuseHold after now (#131). A refusing gateway's open sockets then grow
+// with its refusals, so a least-connections LB turns to the others, instead
+// of seeing its count fall and sending it every new dial. at_capacity is not
+// held: a gateway at the cap already has the most sockets.
+func (g *Gateway) refuse(ls *loopState, link Link, reason string) (*Conn, string) {
+	g.reject(reason)
+	if g.cfg.RefuseHold <= 0 || g.cfg.HeldCap <= 0 {
+		return nil, reason
+	}
+	if g.held.Add(1) > int64(g.cfg.HeldCap) {
+		g.held.Add(-1)
+		g.m.HeldTotal.WithLabelValues("full").Inc()
+		return nil, reason
+	}
+	g.m.HeldTotal.WithLabelValues("held").Inc()
+	g.m.Held.Inc()
+	c := &Conn{ls: ls, link: link, state: stateHeld}
+	c.onLife = func() { g.closeConn(c, "held") }
+	ls.wheel.schedule(&c.life, g.now().Add(g.cfg.RefuseHold), c.onLife)
+	return c, reason
 }
 
 func (g *Gateway) reject(reason string) string {
@@ -167,6 +194,13 @@ func (g *Gateway) Frame(c *Conn, cmd clientpb.Cmd, reqID uint32, body []byte) {
 // Closed is called once per accepted connection, after its socket closed.
 func (g *Gateway) Closed(c *Conn) {
 	if c.state == stateClosed {
+		return
+	}
+	if c.state == stateHeld {
+		c.ls.wheel.stop(&c.life)
+		c.state, c.closing, c.link = stateClosed, false, nil
+		g.held.Add(-1)
+		g.m.Held.Dec()
 		return
 	}
 	if !c.closing {

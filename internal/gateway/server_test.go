@@ -17,7 +17,7 @@ import (
 func TestLimitsSelfCheck(t *testing.T) {
 	m := NewMetrics(prometheus.NewRegistry())
 	cfg := testConfig()
-	cfg.MaxConns = 1000 // needs nofile ≥ 1100, nf_conntrack_max ≥ 2000
+	cfg.MaxConns, cfg.HeldCap = 1000, 100 // needs nofile ≥ 1100 + 100, nf_conntrack_max ≥ 2000
 	src := func(nofile uint64, conntrack string, err error) limitSource {
 		return limitSource{
 			nofile:   func() (uint64, error) { return nofile, nil },
@@ -30,12 +30,12 @@ func TestLimitsSelfCheck(t *testing.T) {
 		notrack bool
 		fail    string
 	}{
-		{"enough", src(1100, "2000\n", nil), false, ""},
-		{"nofile too low", src(1099, "2000\n", nil), false, "RLIMIT_NOFILE"},
-		{"conntrack too low", src(1100, "1999\n", nil), false, "nf_conntrack_max"},
-		{"conntrack too low but notrack", src(1100, "10\n", nil), true, ""},
-		{"conntrack not loaded", src(1100, "", fs.ErrNotExist), false, ""},
-		{"conntrack unreadable", src(1100, "", errors.New("permission denied")), false, "nf_conntrack_max"},
+		{"enough", src(1200, "2000\n", nil), false, ""},
+		{"nofile too low", src(1199, "2000\n", nil), false, "RLIMIT_NOFILE"},
+		{"conntrack too low", src(1200, "1999\n", nil), false, "nf_conntrack_max"},
+		{"conntrack too low but notrack", src(1200, "10\n", nil), true, ""},
+		{"conntrack not loaded", src(1200, "", fs.ErrNotExist), false, ""},
+		{"conntrack unreadable", src(1200, "", errors.New("permission denied")), false, "nf_conntrack_max"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := cfg

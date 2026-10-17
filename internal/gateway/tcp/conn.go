@@ -29,6 +29,7 @@ type conn struct {
 	c       *gateway.Conn
 	sess    *wire.Session // nil until the handshake completes
 	closing bool          // Close requested
+	held    bool          // a refusal the core holds open (#131): nothing is read
 }
 
 func (c *conn) hook(site string) {

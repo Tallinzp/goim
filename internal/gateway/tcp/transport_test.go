@@ -307,6 +307,27 @@ func TestRejectAtAcceptIsAPreHandshakeCloseForTheClient(t *testing.T) {
 	}
 }
 
+// A pending_mem refusal is held open (#131): the client's handshake goes
+// unread and it sees a pre-handshake close no sooner than RefuseHold.
+func TestHeldRefusalIsAPreHandshakeCloseAfterTheHold(t *testing.T) {
+	s := newServer(t, func(c *gateway.Config, _ *Config) { c.PendingCap = 1 })
+	s.hello() // AUTH_PENDING: the one pending socket
+	c := s.dial()
+	start := time.Now()
+	_, err := wire.ClientHandshake(c.nc, 1, s.keys[1].Public, uint16(clientpb.Cmd_CMD_HANDSHAKE))
+	took := time.Since(start)
+	if !errors.Is(err, wire.ErrClosedBeforeReply) {
+		t.Fatalf("err %v, want ErrClosedBeforeReply", err)
+	}
+	if took < 450*time.Millisecond || took > 3*time.Second {
+		t.Fatalf("closed after %v, want the hold: 0.5s to the next tick (≤ 1.5s, slack to 3s)", took)
+	}
+	if s.rejects(gateway.RejectPendingMem) != 1 || s.closes("held") != 1 {
+		t.Fatalf("pending_mem %d, closes{held} %d; want 1, 1", s.rejects(gateway.RejectPendingMem), s.closes("held"))
+	}
+	waitFor(t, "refusals_held back to 0", func() bool { return testutil.ToFloat64(s.m.Held) == 0 })
+}
+
 // TestListenBesideTimeWait: a gateway restarted on its port while the old
 // process's closed connections sit in TIME_WAIT (a SIGKILL closes them with
 // a FIN, as does a drain) must still bind: a container restarted in the same

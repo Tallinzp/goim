@@ -25,9 +25,10 @@ const (
 	stateAuthPending
 	stateOnline
 	stateClosed
+	stateHeld // a refusal held open (#131): not tracked, in neither cap
 )
 
-var stateLabel = [...]string{"handshake", "auth_pending", "online", "closed"}
+var stateLabel = [...]string{"handshake", "auth_pending", "online", "closed", "held"}
 
 // outcome is what the gateway knows about a connection's Login.
 type outcome uint8

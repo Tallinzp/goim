@@ -27,6 +27,8 @@ type Metrics struct {
 	Tracked        prometheus.Gauge       // every table entry
 	Rejects        *prometheus.CounterVec // reason
 	Closes         *prometheus.CounterVec // reason: client | heartbeat | kick | not_owner | logout | protocol | drain
+	Held           prometheus.Gauge       // refused sockets held open (#131)
+	HeldTotal      *prometheus.CounterVec // result: held | full (closed at once: HeldCap reached)
 
 	Logins       *prometheus.CounterVec // result
 	LoginQueue   prometheus.Gauge       // Logins waiting for or inside a Login RPC
@@ -97,6 +99,8 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		Tracked:        g("tracked", "Connection table entries (the tracked set)."),
 		Rejects:        cv("admission_rejects_total", "Connections rejected or closed by admission control.", "reason"),
 		Closes:         cv("closes_total", "Connections the gateway closed, by reason.", "reason"),
+		Held:           g("refusals_held", "pending_mem and draining refusals held open until their close."),
+		HeldTotal:      cv("refusals_held_total", "pending_mem and draining refusals: held, or closed at once with HeldCap reached (full).", "result"),
 
 		Logins:       cv("logins_total", "Logins by result, as the client sees it.", "result"),
 		LoginQueue:   g("login_queue", "Logins waiting for or inside a Login RPC."),
@@ -134,5 +138,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		RejectHandshakeTimeout, RejectAuthTimeout, RejectHandshakeRate, RejectBadVersion, RejectNoiseUnknownKey} {
 		m.Rejects.WithLabelValues(r)
 	}
+	m.HeldTotal.WithLabelValues("held")
+	m.HeldTotal.WithLabelValues("full")
 	return m
 }

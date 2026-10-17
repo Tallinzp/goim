@@ -30,20 +30,20 @@ var hostLimits = limitSource{
 }
 
 // checkLimits returns why the gateway must stay NotReady, or nil:
-// RLIMIT_NOFILE ≥ cap × (1 + headroom), and, unless conntrack is disabled for
+// RLIMIT_NOFILE ≥ cap × (1 + headroom) + HeldCap, and, unless conntrack is disabled for
 // the gateway port, nf_conntrack_max ≥ 2 × cap. An absent conntrack file means
 // conntrack isn't loaded, which passes.
 func checkLimits(cfg Config, src limitSource, m *Metrics) error {
 	var errs []error
-	needFiles := uint64(math.Ceil(float64(cfg.MaxConns) * (1 + cfg.Limits.Headroom)))
+	needFiles := uint64(math.Ceil(float64(cfg.MaxConns)*(1+cfg.Limits.Headroom))) + uint64(cfg.HeldCap)
 	switch n, err := src.nofile(); {
 	case err != nil:
 		errs = append(errs, fmt.Errorf("read RLIMIT_NOFILE: %w", err))
 	default:
 		m.Limits.WithLabelValues("nofile").Set(float64(n))
 		if n < needFiles {
-			errs = append(errs, fmt.Errorf("RLIMIT_NOFILE %d is below %d (cap %d + %.0f%% headroom)",
-				n, needFiles, cfg.MaxConns, cfg.Limits.Headroom*100))
+			errs = append(errs, fmt.Errorf("RLIMIT_NOFILE %d is below %d (cap %d + %.0f%% headroom + %d held)",
+				n, needFiles, cfg.MaxConns, cfg.Limits.Headroom*100, cfg.HeldCap))
 		}
 	}
 	if !cfg.Limits.Notrack {
