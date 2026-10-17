@@ -194,6 +194,11 @@ t2_exit() {
   local rc=$? i
   trap - EXIT
   trap '' INT TERM # a second Ctrl-C must not cut the teardown short
+  # After a signal the teardown can take a minute and a half (lg_stop gives
+  # loadgen 60s, stack_down the gateways 10s), so say it has started.
+  case $rc in
+    130 | 143) echo "stopping: loadgen, then the stack, then the report (up to ~90s); further Ctrl-C is ignored" >&"$T2_STDOUT" ;;
+  esac
   for ((i = ${#T2_EXIT_HOOKS[@]} - 1; i >= 0; i--)); do
     eval "${T2_EXIT_HOOKS[i]}" >/dev/null 2>&1
   done

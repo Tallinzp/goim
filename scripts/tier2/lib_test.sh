@@ -85,7 +85,10 @@ for sig in TERM INT; do
   rc=$(fake_run 't2_on_exit "echo hook >>$tmp/run/hooks"; kill -'$sig' $BASHPID; sleep 5')
   expect "exit: SIG$sig runs the hooks" "$(cat "$tmp/run/hooks" 2>/dev/null)" hook
   [ -s "$tmp/run/out.report.txt" ] && ok "exit: SIG$sig writes the report" || bad "exit: SIG$sig wrote no report"
+  contains "exit: SIG$sig says the teardown has started" "$(cat "$tmp/run/stdout")" "stopping: "
 done
+rc=$(fake_run 'exit 7')
+expect "exit: an early exit is not announced as a stop" "$(grep -c 'stopping: ' "$tmp/run/stdout")" 0
 # A second Ctrl-C or SIGTERM during teardown must not cut it short.
 rc=$(fake_run 't2_on_exit "echo first >>$tmp/run/hooks"; t2_on_exit "kill -TERM \$BASHPID; echo second >>$tmp/run/hooks"; exit 3')
 expect "exit: a signal during teardown keeps the exit code" "$rc" 3
