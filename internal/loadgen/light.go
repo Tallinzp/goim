@@ -167,21 +167,23 @@ func (lc *lightConn) read(rec *Recorder) string {
 }
 
 // pinger sends every light client a Ping each PingEvery, spread evenly:
-// clients sit in PingEvery/100ms slots by index, and one slot is pinged per
-// 100ms tick. A Ping due while the last one is unanswered is counted
-// missing.
+// clients sit in PingEvery/100ms slots by index, and one slot is due every
+// 100ms by the clock; a late tick pings every slot due since. A Ping due
+// while the last one is unanswered is counted missing.
 type pinger struct {
 	tick   time.Duration
 	rec    *Recorder
 	shards int // of the pingers it belongs to (1 alone)
 	mu     sync.Mutex
 	slots  []map[*lightConn]struct{}
+	send   func(*lightConn) // sends one Ping; tests replace it
 }
 
 const pingTick = 100 * time.Millisecond
 
 func newPinger(every time.Duration, rec *Recorder) *pinger {
-	p := &pinger{tick: pingTick, rec: rec, shards: 1, slots: make([]map[*lightConn]struct{}, max(1, int(every/pingTick)))}
+	p := &pinger{tick: pingTick, rec: rec, shards: 1, slots: make([]map[*lightConn]struct{}, max(1, int(every/pingTick))),
+		send: func(lc *lightConn) { lc.c.Send(clientpb.Cmd_CMD_PING, lc.reqID.Add(1), nil) }} // a failure ends read
 	for i := range p.slots {
 		p.slots[i] = map[*lightConn]struct{}{}
 	}
@@ -232,17 +234,29 @@ func (ps pingers) run(ctx context.Context) {
 func (p *pinger) run(ctx context.Context) {
 	t := time.NewTicker(p.tick)
 	defer t.Stop()
+	start, next := time.Now(), 0 // visit k (slot k % len) is due at start + (k+1) tick
 	var due []*lightConn
-	for n := 0; ; n++ {
+	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 		}
+		// Slots follow the clock: a Ticker drops the ticks a busy loop
+		// misses, so every visit due by now is made, at most one cycle's.
+		since := time.Since(start)
+		upto := int(since / p.tick)
+		if upto <= next {
+			continue
+		}
+		p.rec.PingLag(since - time.Duration(next+1)*p.tick)
+		next = max(next, upto-len(p.slots))
 		p.mu.Lock()
 		due = due[:0]
-		for lc := range p.slots[n%len(p.slots)] {
-			due = append(due, lc)
+		for ; next < upto; next++ {
+			for lc := range p.slots[next%len(p.slots)] {
+				due = append(due, lc)
+			}
 		}
 		p.mu.Unlock()
 		now := time.Now().UnixNano()
@@ -251,7 +265,9 @@ func (p *pinger) run(ctx context.Context) {
 				p.rec.PongMissing()
 			}
 			p.rec.PingGap(time.Duration(now - lc.lastPing.Swap(now)))
-			lc.c.Send(clientpb.Cmd_CMD_PING, lc.reqID.Add(1), nil) // a failure ends read
+			s := time.Now()
+			p.send(lc)
+			p.rec.PingSend(time.Since(s))
 		}
 	}
 }

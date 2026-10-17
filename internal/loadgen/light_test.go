@@ -37,6 +37,47 @@ func TestPingerCountsMissingPongs(t *testing.T) {
 	}
 }
 
+// A pinger that falls behind pings, at its next tick, every slot whose time
+// has passed, each once however long the stall: slots follow the clock, not
+// the ticks it got (run 30: dropped ticks stretched a 30s cycle to 126s, and
+// the gateways closed 177,743 clients for their heartbeat). How late it was
+// and its slowest Send are recorded. The Send stub sleeps on synctest's clock.
+func TestPingerCatchesUpOnMissedSlots(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		rec := NewRecorder(5, []string{"gw-0"})
+		p := newPinger(5*pingTick, rec) // five slots, one client each
+		var pings [5]int
+		p.send = func(lc *lightConn) {
+			pings[lc.i]++
+			if lc.i == 0 && pings[0] == 1 {
+				time.Sleep(10 * pingTick) // the first Send blocks for 1s
+			}
+		}
+		for i := range 5 {
+			p.add(&lightConn{i: i})
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() { p.run(ctx); close(done) }()
+		time.Sleep(12*pingTick + pingTick/2) // the stall ends at 1.1s
+		synctest.Wait()
+		for i, n := range pings {
+			if n < 1 || n > 2 {
+				t.Errorf("client %d pinged %d times by 1.25s, want 1 or 2", i, n)
+			}
+		}
+		c := rec.Counts()
+		if c.PingTickLagMaxMs < 900 {
+			t.Errorf("ping_tick_lag_max_ms %d, want >= 900", c.PingTickLagMaxMs)
+		}
+		if c.PingSendMaxMs < 1000 {
+			t.Errorf("ping_send_max_ms %d, want >= 1000", c.PingSendMaxMs)
+		}
+		cancel()
+		<-done
+	})
+}
+
 // A failed dial is counted by why it failed, so a run's report tells lost
 // SYNs (timeout) from refused connections and exhausted source ports (run 14).
 func TestDialFailuresAreCountedByReason(t *testing.T) {

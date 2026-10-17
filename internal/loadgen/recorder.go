@@ -32,6 +32,8 @@ type Recorder struct {
 	pongs          int64
 	missing        int64
 	gapMax         time.Duration
+	lagMax         time.Duration
+	sendMax        time.Duration
 	pongRTT        *hist
 	marks          []*mark // by index
 	byName         map[string]*mark
@@ -215,6 +217,22 @@ func (r *Recorder) PingGap(gap time.Duration) {
 	r.mu.Unlock()
 }
 
+// PingLag: a pinger reached a slot lag after its time (a dropped tick, a
+// starved goroutine); the longest is kept.
+func (r *Recorder) PingLag(lag time.Duration) {
+	r.mu.Lock()
+	r.lagMax = max(r.lagMax, lag)
+	r.mu.Unlock()
+}
+
+// PingSend: one Ping's Send took d (a full socket buffer blocks it); the
+// longest is kept.
+func (r *Recorder) PingSend(d time.Duration) {
+	r.mu.Lock()
+	r.sendMax = max(r.sendMax, d)
+	r.mu.Unlock()
+}
+
 // Mark records instant now as name, with the clients logged in on gateway
 // gw (-1: on any gateway) as its population, and returns its size. A client
 // belongs to its latest mark only. Names are unique. gw -1 is only for an
@@ -325,6 +343,8 @@ type Counts struct {
 	Pongs            int64            `json:"pongs"`
 	PongMissing      int64            `json:"pong_missing"`
 	PingGapMaxMs     int64            `json:"ping_gap_max_ms"`
+	PingTickLagMaxMs int64            `json:"ping_tick_lag_max_ms"` // a slot pinged late by the pinger itself
+	PingSendMaxMs    int64            `json:"ping_send_max_ms"`     // the slowest Ping Send
 	PongRTT          Dist             `json:"pong_rtt"`
 }
 
@@ -364,7 +384,8 @@ func (r *Recorder) Counts() Counts {
 		BackoffClients: r.backoffClients, BackoffWaits: map[string]int64{},
 		BackoffSinceMark: BackoffCount{Mark: r.since.Mark, Clients: r.since.Clients, Waits: map[string]int64{}},
 		StormSinceMark:   r.storm,
-		LoginLatency:     r.login.dist(r.login.n), Pongs: r.pongs, PongMissing: r.missing, PingGapMaxMs: r.gapMax.Milliseconds(), PongRTT: r.pongRTT.dist(r.pongRTT.n)}
+		LoginLatency:     r.login.dist(r.login.n), Pongs: r.pongs, PongMissing: r.missing, PingGapMaxMs: r.gapMax.Milliseconds(),
+		PingTickLagMaxMs: r.lagMax.Milliseconds(), PingSendMaxMs: r.sendMax.Milliseconds(), PongRTT: r.pongRTT.dist(r.pongRTT.n)}
 	for i, n := range r.online {
 		c.Online += n
 		c.OnlineByGateway[r.ids[i]] = n
