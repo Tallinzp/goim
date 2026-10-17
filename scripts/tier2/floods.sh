@@ -560,9 +560,11 @@ def busy(a, b, k):
     x, y = a["sets"].get(k, []), b["sets"].get(k, [])
     return round(100 * (y[0] - x[0]) / (y[1] - x[1]), 1) if len(x) == 2 and len(y) == 2 and y[1] > x[1] else None
 def gsum(b, k):
-    v = [g.get(k) for g in b["gw"].values() if g]
+    v = [g.get(k) if g else None for g in b["gw"].values()]
     return None if not v or None in v else sum(v)
 def per_s(a, b, k, dt):
+    if set(a["gw"]) != set(b["gw"]):
+        return None
     x, y = gsum(a, k), gsum(b, k)
     return None if x is None or y is None else round((y - x) / dt, 1)
 def runq(a, b, dt):
