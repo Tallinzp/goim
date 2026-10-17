@@ -714,7 +714,7 @@ git commit -m "feat(tier2): floods: profile gw-0 and loadgen over the storm's ra
 
 ---
 
-### Task 3: Tier 2 runs 30i (`floods`) and 30j (`gwloss`), and the record
+### Task 3: Tier 2 runs 30i (`floods`), 30j (`gwloss`), `race` and `capacity`, and the record
 
 **Files:**
 - Modify: this plan's *Execution Notes*, the roadmap (plan 6 row, #130), Plan 6b3b3's *Execution Notes* (one line pointing here). The README only if the user asks.
@@ -762,16 +762,26 @@ What to read, for the *Execution Notes*:
 
 Any outcome goes to the user before anything changes. Whether the handshake-concurrency trial is repeated at the new cost is the user's call after this run (#111, #116), not part of this plan.
 
-- [ ] **Step 3: Record**
+- [ ] **Step 3: Tier 2 `race` (the user, on the host, any time after Task 1)**
 
-- This plan's *Execution Notes*: run 30i's and run 30j's numbers above (Task 1's benchmarks are already there, P6b3b4I-3), each with the commit hash and `dirty` from `result.json`.
+Added after the interface review (the user, 2026-10-17). `make test` doesn't run `internal/racetest` (it needs `GOIM_RACE_SUITE=1`), so the multi-process suite with `-race` binaries hasn't run since every gateway event loop began sharing one parsed static key (Review Focus 1). Run `GOIM_TEST_TIER=2 make test-tier2 SCENARIO=race` and send back the `.report.txt` if anything fails (4 checks; last pass 58/58). The dev machine can run the same suite (`make test-race-suite`, slow on 2 cores).
+
+- [ ] **Step 4: Tier 2 `capacity`, phase `a_default` (the user, on the host, ~6 min)**
+
+Added after the interface review (the user, 2026-10-17; P6b3b4I-1). The README's *Gateway memory at 600k* row (~1.2 KB of live heap per connection, 1.25 GB RSS) is run 18's `a_default`, and run 19 read 1,208 B; each connection now keeps +96 B (the emptied suite). Run `GOIM_TEST_TIER=2 CAPACITY_PHASES=a_default:600000:150:default make test-tier2 SCENARIO=capacity` (run 19's phase without its Reconcile cycle) and send back the `.report.txt`.
+
+What to read, for the *Execution Notes*: `live_bytes_per_conn` (about 1,300 B expected against 1,208), `gateway_rss_mb`, `ramp_gateway_cores` (1.754 in run 19: the ramp's handshakes are now half the crypto), `gateway_us_per_pong` and `gc_mark_cpu_pct`, against runs 18 and 19.
+
+- [ ] **Step 5: Record**
+
+- This plan's *Execution Notes*: run 30i's, run 30j's, `race`'s and `capacity`'s numbers above (Task 1's benchmarks are already there, P6b3b4I-3), each with the commit hash and `dirty` from `result.json`.
 - Roadmap: #130 gets one line with the benchmarks and runs 30i and 30j. The plan 6 row says "6b3b4 executed, runs 30i, 30j …; next 6b3c (fresh session)", or the follow-up the runs call for.
 - Plan 6b3b3's *Execution Notes*: one line under the profile section, "Fixed by Plan 6b3b4; run 30i: see there".
-- The README's floods row quotes runs 30c–30h, and its 600k SIGKILL row the gwloss runs before 30j, all measured before this change. Whether runs 30i and 30j replace or join those numbers is the user's call. Ask, and change the rows (both languages) only if they say so.
+- The README's floods row quotes runs 30c–30h, its 600k SIGKILL row the gwloss runs before 30j, and its *Gateway memory at 600k* row run 18, all measured before this change. Whether runs 30i and 30j replace or join those numbers is the user's call. Ask, and change the rows (both languages) only if they say so.
 
 ```bash
 git add docs/superpowers/plans/2026-10-07-connection-session-core-00-roadmap.md docs/superpowers/plans/2026-10-17-connection-session-core-06b3b3-slow-phase.md docs/superpowers/plans/2026-10-17-connection-session-core-06b3b4-x25519-once.md
-git commit -m "docs: Plan 6b3b4 benchmarks and Tier 2 runs 30i, 30j recorded (#130)"
+git commit -m "docs: Plan 6b3b4 Tier 2 runs 30i, 30j, race and capacity recorded (#130)"
 ```
 
 Push the branch. Fast-forwarding `main` is the user's call.
