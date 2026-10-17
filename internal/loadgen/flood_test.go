@@ -2,7 +2,9 @@ package loadgen
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -124,8 +126,8 @@ func TestGarbageFloodIsClosedByTheGateway(t *testing.T) {
 
 // A slow client holds its connection until the gateway's timeout for its
 // state closes it (3s here, the shortest allowed; rounded up to the
-// wheel's 1s tick), then dials again at once, so the flood keeps Clients
-// connections open.
+// wheel's 1s tick), then dials again within a tick (redialWait), so the flood
+// keeps Clients connections open.
 func TestSlowFloodHeldUntilTheGatewaysTimeout(t *testing.T) {
 	for _, tc := range []struct{ mode, reason string }{
 		{ModeSlowHandshake, gateway.RejectHandshakeTimeout},
@@ -207,5 +209,82 @@ func TestSlowAuthRefusedAtTheLimitBacksOff(t *testing.T) {
 	}
 	if got := metric(t, id, "goim_gateway_handshakes_total", "result", "no_token"); got < clients {
 		t.Fatalf("gateway no_token %v, want ≥ %d", got, clients)
+	}
+}
+
+// A stop already in effect when awaitClose starts ends the wait at once:
+// the read deadline the stop sets is not pushed back to from + Timeout.
+func TestAwaitCloseEndsAtAStopAlreadyMade(t *testing.T) {
+	r := &Runner{cfg: Config{Timeout: 5 * time.Second}, flood: newFloodRec()}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for range 50 {
+		a, b := net.Pipe()
+		begin := time.Now()
+		r.awaitClose(ctx, a, begin)
+		a.Close()
+		b.Close()
+		if d := time.Since(begin); d > time.Second {
+			t.Fatalf("awaitClose after the stop took %v", d)
+		}
+	}
+	if f := r.flood.stats(); len(f.Outcomes) != 0 {
+		t.Fatalf("outcomes %v, want none counted at the stop", f.Outcomes)
+	}
+}
+
+// A stop ends slow-auth's handshake against a gateway that never replies,
+// rather than its Timeout.
+func TestSlowAuthHandshakeEndsAtTheStop(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close() // silent: never replies
+		}
+	}()
+	key, err := wire.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := Env{GatewayIDs: []string{"gw-0"}, GatewayAddrs: []string{ln.Addr().String()}, NoiseKeyID: 1, NoisePublic: key.Public}
+	r, err := New(Config{Mode: ModeSlowAuth, Clients: 1, Rate: 1, UIDPrefix: "x", Timeout: 5 * time.Second}, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	begin := time.Now()
+	r.slowOnce(ctx)
+	if d := time.Since(begin); d > time.Second {
+		t.Fatalf("slowOnce after the stop took %v", d)
+	}
+	if f := r.flood.stats(); len(f.Outcomes) != 0 || f.Open != 0 {
+		t.Fatalf("flood %+v, want nothing counted at the stop", f)
+	}
+}
+
+// failWrite fails every Write with an error that is not a close.
+type failWrite struct{ net.Conn }
+
+func (failWrite) Write([]byte) (int, error) { return 0, errors.New("write: no route") }
+
+// A garbage write that fails other than by a close is counted as error,
+// so attempts and outcomes still add up.
+func TestGarbageWriteErrorIsCounted(t *testing.T) {
+	r := &Runner{cfg: Config{Timeout: time.Second}, flood: newFloodRec()}
+	a, b := net.Pipe()
+	defer b.Close()
+	defer a.Close()
+	r.garbageOn(context.Background(), failWrite{a})
+	if f := r.flood.stats(); f.Outcomes[FloodError] != 1 || len(f.Outcomes) != 1 {
+		t.Fatalf("outcomes %v, want one error", f.Outcomes)
 	}
 }

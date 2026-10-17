@@ -115,6 +115,9 @@ PY
   lg_in flood lg_stop
   expect "inst: the flood stopped" "$(kill -0 "$flood_pid" 2>/dev/null && echo running || echo stopped) ${LG_STATUSES[flood]}" "stopped 3"
   expect "inst: LG_STATUS is main's after lg_in" "[$LG_STATUS]" "[]"
+  start=$SECONDS
+  lg_in flood lg_wait 'd["mode"] == "garbage"' 5 2>"$dir/wait.err"
+  expect "wait: a stopped instance fails at once" "$? $((SECONDS - start <= 1)) $(grep -c 'loadgen exited' "$dir/wait.err")" "1 1 1"
   expect "inst: main still runs" "$(kill -0 "$LG_PID" 2>/dev/null && echo running)" running
   expect "inst: the flood's result" "$(lg_in flood lg_json 'd["out"]')" '"loadgen-b.json"'
   lg_in flood lg_start b2 -mode slow-auth || echo "FAIL inst: a stopped instance did not start again"

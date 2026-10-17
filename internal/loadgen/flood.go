@@ -174,10 +174,19 @@ func (r *Runner) garbageOnce(ctx context.Context) {
 		return
 	}
 	defer r.floodClose(nc)
+	r.garbageOn(ctx, nc)
+}
+
+// garbageOn writes the garbage handshake on nc and waits for the close.
+func (r *Runner) garbageOn(ctx context.Context, nc net.Conn) {
 	sent := time.Now()
 	if _, err := nc.Write(garbageHandshake(r.env.NoiseKeyID)); err != nil {
-		if clientconn.IsClosed(err) && ctx.Err() == nil {
+		switch {
+		case ctx.Err() != nil:
+		case clientconn.IsClosed(err):
 			r.flood.outcome(FloodClosed, time.Since(sent))
+		default:
+			r.flood.outcome(FloodError, -1)
 		}
 		return
 	}
@@ -217,7 +226,10 @@ func (r *Runner) slowOnce(ctx context.Context) (held time.Duration, ok bool) {
 	}
 	defer r.floodClose(nc)
 	if r.cfg.Mode == ModeSlowAuth {
+		// Handshake sets its own deadline, so the stop closes nc instead.
+		stop := context.AfterFunc(ctx, func() { nc.Close() })
 		err := clientconn.New(nc).Handshake(r.env.NoiseKeyID, r.env.NoisePublic, time.Now().Add(r.cfg.Timeout))
+		stop()
 		switch {
 		case ctx.Err() != nil:
 			return 0, false
@@ -256,13 +268,14 @@ func (r *Runner) floodClose(nc net.Conn) {
 
 // awaitClose waits up to Timeout after from for the gateway to close nc,
 // counts the outcome, and returns the hold when the gateway closed it.
-// When ctx ends first the attempt is not counted.
+// When ctx ends first the attempt is not counted. The deadline is set
+// before the stop's hook, so a stop cannot have its deadline pushed back.
 func (r *Runner) awaitClose(ctx context.Context, nc net.Conn, from time.Time) (time.Duration, bool) {
-	stop := context.AfterFunc(ctx, func() { nc.SetReadDeadline(time.Now()) })
-	defer stop()
 	if err := nc.SetReadDeadline(from.Add(r.cfg.Timeout)); err != nil {
 		return 0, false
 	}
+	stop := context.AfterFunc(ctx, func() { nc.SetReadDeadline(time.Now()) })
+	defer stop()
 	var b [64]byte
 	n, err := nc.Read(b[:])
 	held := time.Since(from)

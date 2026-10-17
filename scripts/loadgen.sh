@@ -155,6 +155,7 @@ lg_wait() {
   local end=$((SECONDS + $2))
   while [ $SECONDS -lt $end ]; do
     [ "$(lg_get /stats "bool($1)")" = true ] && return 0
+    kill -0 "$LG_PID" 2>/dev/null || { echo "loadgen exited" >&2; return 1; }
     sleep 0.5
   done
   return 1

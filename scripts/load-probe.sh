@@ -60,15 +60,21 @@ echo "     light: login p99 $(lg_json 'd["login_latency"]["p99_ms"]')ms, Pong p9
 # from its own source addresses; instance flood runs garbage, then
 # slow-handshake (instances are named by role and reused, #120).
 # gw_sum METRIC MATCH: over both gateways; a labelled counter has no sample
-# before its first increment, which counts as 0.
+# before its first increment, which counts as 0. A gateway whose metrics
+# cannot be read prints 0 and fails, so the caller counts a FAIL.
 gw_sum() {
-  python3 -c 'import sys; print(sum(0 if x == "null" else int(float(x)) for x in sys.argv[1:]))' \
-    "$(stack_metric gw-0 "$1" "$2")" "$(stack_metric gw-1 "$1" "$2")"
+  local gw body vals=()
+  for gw in gw-0 gw-1; do
+    body=$(stack_metrics "$gw") || { echo "gw_sum: $gw's metrics unreadable" >&2; echo 0; return 1; }
+    vals+=("$(stack_metric_in "$body" "$1" "$2")")
+  done
+  python3 -c 'import sys; print(sum(0 if x == "null" else int(float(x)) for x in sys.argv[1:]))' "${vals[@]}" ||
+    { echo 0; return 1; }
 }
 lg_start floods-light -mode light -clients 2000 -rate 1000 -ping-every 5s -uid-prefix floods || { bad "floods: light loadgen did not start"; exit 1; }
 if lg_wait_online 2000 60; then ok "floods: 2000 light clients online"; else bad "floods: light clients not all online"; fi
-failed0=$(gw_sum goim_gateway_handshakes_total 'result="failed"')
-limited0=$(gw_sum goim_gateway_admission_rejects_total 'reason="handshake_rate"')
+failed0=$(gw_sum goim_gateway_handshakes_total 'result="failed"') || bad "garbage: gateway metrics unreadable"
+limited0=$(gw_sum goim_gateway_admission_rejects_total 'reason="handshake_rate"') || bad "garbage: gateway metrics unreadable"
 lg_in flood lg_start garbage -mode garbage -rate 2000 -clients 500 -source-net 1 || bad "garbage: loadgen did not start"
 sleep 10
 lg_in flood lg_stop
@@ -76,12 +82,13 @@ check "garbage: loadgen exited 0" "$([ "${LG_STATUSES[flood]}" = 0 ] && echo tru
 outcomes=$(lg_in flood lg_json 'd["flood"]["outcomes"]')
 closed=$(lg_in flood lg_json 'd["flood"]["outcomes"].get("closed", 0)')
 check "garbage: ≥ 15000 attempts, every one counted closed by a gateway" "$(lg_in flood lg_true "$STACK_DIR/artifacts/loadgen-garbage.json" 'set(d["flood"]["outcomes"]) == {"closed"} and d["flood"]["outcomes"]["closed"] >= 15000')" "$outcomes"
-failed=$(($(gw_sum goim_gateway_handshakes_total 'result="failed"') - failed0))
-limited=$(($(gw_sum goim_gateway_admission_rejects_total 'reason="handshake_rate"') - limited0))
+failed=$(gw_sum goim_gateway_handshakes_total 'result="failed"') || bad "garbage: gateway metrics unreadable"
+limited=$(gw_sum goim_gateway_admission_rejects_total 'reason="handshake_rate"') || bad "garbage: gateway metrics unreadable"
+failed=$((failed - failed0)) limited=$((limited - limited0))
 check "garbage: the gateways failed (or limited) as many handshakes" "$([ $((failed + limited)) -ge "$closed" ] && [ "$failed" -gt 0 ] && echo true)" "failed $failed + handshake_rate $limited, closed $closed"
 echo "     garbage: $(lg_in flood lg_json 'd["flood"]["attempts"]') attempts, $(lg_in flood lg_json 'd["flood"]["skipped"]') skipped, held p50 $(lg_in flood lg_json 'd["flood"]["held"]["p50_ms"]')ms p99 $(lg_in flood lg_json 'd["flood"]["held"]["p99_ms"]')ms; gateways: failed $failed, handshake_rate $limited"
-hst0=$(gw_sum goim_gateway_admission_rejects_total 'reason="handshake_timeout"')
-aut0=$(gw_sum goim_gateway_admission_rejects_total 'reason="auth_timeout"')
+hst0=$(gw_sum goim_gateway_admission_rejects_total 'reason="handshake_timeout"') || bad "slow: gateway metrics unreadable"
+aut0=$(gw_sum goim_gateway_admission_rejects_total 'reason="auth_timeout"') || bad "slow: gateway metrics unreadable"
 lg_in flood lg_start slowhs -mode slow-handshake -clients 500 -rate 500 -source-net 2 || bad "slow-handshake: loadgen did not start"
 lg_in flood2 lg_start slowauth -mode slow-auth -clients 500 -rate 500 -source-net 3 || bad "slow-auth: loadgen did not start"
 for inst in flood flood2; do
@@ -95,8 +102,9 @@ for inst in slowhs slowauth; do
     "$(lg_py "$STACK_DIR/artifacts/loadgen-$inst.json" 'd["flood"]')"
 done
 echo "     slow: held p50/p99/max: slow-handshake $(lg_in flood lg_json '[d["flood"]["held"][k] for k in ("p50_ms", "p99_ms", "max_ms")]')ms, slow-auth $(lg_in flood2 lg_json '[d["flood"]["held"][k] for k in ("p50_ms", "p99_ms", "max_ms")]')ms"
-hst=$(($(gw_sum goim_gateway_admission_rejects_total 'reason="handshake_timeout"') - hst0))
-aut=$(($(gw_sum goim_gateway_admission_rejects_total 'reason="auth_timeout"') - aut0))
+hst=$(gw_sum goim_gateway_admission_rejects_total 'reason="handshake_timeout"') || bad "slow: gateway metrics unreadable"
+aut=$(gw_sum goim_gateway_admission_rejects_total 'reason="auth_timeout"') || bad "slow: gateway metrics unreadable"
+hst=$((hst - hst0)) aut=$((aut - aut0))
 check "slow: the gateways closed them by their timeouts" "$([ "$hst" -ge 500 ] && [ "$aut" -ge 500 ] && echo true)" "handshake_timeout $hst, auth_timeout $aut"
 lg_stop
 check "floods: light loadgen exited 0" "$([ "$LG_STATUS" = 0 ] && echo true)" "status $LG_STATUS"

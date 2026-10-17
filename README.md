@@ -23,7 +23,7 @@ From the recorded Tier 2 benchmark runs (24-core host, all processes on one mach
 | Logic slowed to a 25% CPU quota (one process) | measured login throughput 3,503/s on fresh logins (2,696–3,710 over five runs, varying with the CPU clock) and 2,717/s in a kill storm of relogins that each Kick the dead gateway; with each gateway's Login-queue cap at 2 × that throughput (the spec's rule with a 3 s margin), a 105k-client storm onto one survivor was answered 160,504 times with `Busy` and never `EXPIRED` (login p99 3.10 s, max 3.66 s against the 5 s deadline); all clients back in 51 s (p99 35.8 s from the kill; no SLO gate at 30 × throughput); no lease renewal missed while Logic was throttled in 78% of 100 ms periods. At 4 × throughput (a 1 s margin) 2.7–19.6% came back `EXPIRED` in four of five runs: in the storm Logic ran at 0.69–1.04 of the calibrated throughput, with few-second dips below that |
 | A 600k gateway SIGKILLed | all 600,000 SDK clients back on two empty survivors in 179 s (from the kill p50 39 s, p99 98 s; no SLO at this size), with no swap; the survivors' handshake limiter turned ~3.9M handshake attempts away and never refused one at capacity; no lease renewal missed; the dead epoch swept 120 s after the kill. These times are an upper bound: on one host the load generator's 600k SDK clients used 12 of its 14 cores in the storm's first 30 s |
 | Race test suite | 58 fault-injection scenarios against real processes and a real redis-server, plus mutation checks |
-| Tests | 479 Go tests, about half of the ~32k lines of Go |
+| Tests | 482 Go tests, about half of the ~32k lines of Go |
 
 ## Architecture
 
@@ -112,7 +112,7 @@ This is sub-project 1 (connection and session core) of a larger IM system. Done:
 | Logic 限制在 25% CPU 配额（单进程） | 新登录实测吞吐 3,503/s（五次运行 2,696–3,710，随 CPU 频率变化），在重新登录风暴中（每次登录都要向死亡网关发 Kick）为 2,717/s；每个网关的 Login 队列上限设为该吞吐的 2 倍（3 s 余量，规格的 1 s 余量正在排查）时，10.5 万客户端涌向一个存活网关，被回复 `Busy` 160,504 次，没有一次 `EXPIRED`（登录 p99 3.10 s，最大 3.66 s，期限 5 s）；全部客户端 51 s 内重新上线（从 kill 起 p99 35.8 s；30 倍吞吐的规模不设 SLO 门限）；Logic 在 78% 的 100 ms 周期被限流，仍没有错过任何一次租约续期。上限为 4 倍吞吐（规格的 1 s 余量）时 3.5% 返回 `EXPIRED`：正在排查 |
 | SIGKILL 一个 60 万连接的网关 | 60 万个 SDK 客户端全部在两个空的存活网关上重新上线，用时 179 s（从 kill 起 p50 39 s、p99 98 s；此规模不设 SLO），无 swap；存活网关的握手限流拒绝了约 390 万次握手尝试，从未因容量满而拒绝；没有错过任何一次租约续期；死亡 epoch 在 kill 后 120 s 清扫完毕。这些时间是上界：在单台主机上，压测工具的 60 万个 SDK 客户端在风暴的前 30 s 用掉了其 14 核中的 12 核 |
 | 竞态测试集 | 58 个故障注入场景，运行在真实进程和真实 redis-server 上，并带变异测试 |
-| 测试 | 479 个 Go 测试，约占 3.2 万行 Go 代码的一半 |
+| 测试 | 482 个 Go 测试，约占 3.2 万行 Go 代码的一半 |
 
 ### 架构
 
