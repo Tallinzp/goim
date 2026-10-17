@@ -519,3 +519,24 @@ Push the branch. Fast-forwarding `main` is the user's call.
 - **The spec:** nothing here changes its text. A valid run with `pending_mem` rejects would be a spec question (`PendingCap` against a slow-client flood of this size). It would get a follow-up with #97, #101 and #125.
 
 ## Execution Notes
+
+**Task 1 executed 2026-10-17** (`6ae87bf`, from `19261bc`). The plan's patch applied cleanly (205 lines added, 15 removed in `floods.sh`). `bash -n` ok, no `t2_bool … ||`. `make test-scripts` (`lib_test`, `loadgen_test`, `stack_test` all passed), `make test` and `go vet ./...` green.
+
+Dry run on the dev machine (the plan's throwaway copy, `FLOODS_RATE=500`): 30 checks. Three failed, none in the slow checks this plan changes:
+- `no_swap_in_garbage` (37 pages) and `no_swap_in_slow` (2 pages): the dev machine's own swapping, as expected.
+- `storm_rate`: verdict `short` (`rate_per_s` 661 from a single sample, `new_per_s` null). The storm phase is untouched by this diff. A storm-only rerun gave `met` (`new_per_s` 989, 2 samples), so this was dev-machine noise. Ruled so; run 30c gates it on the host.
+- The slow phase as the prototype had it:
+  - `slow_legit` and `slow_heartbeats` passed with `verdict` `"valid"`. `garbage_heartbeats` has no `verdict` member.
+  - `slow.flood_cpus` `{"slowhs": "0-1", "slowauth": "0-1"}`. `slow.flood_procs` `{2, 4}`.
+  - `slow.window`: ramp 74.1% busy, hold 18.2% busy.
+  - `slow.series`: 35 samples, 34 rows, 17 columns. All eight `first_s` members are null. `gw_runq_ms_per_s` is non-null in every row (~570–650 in the ramp, under 10 once settled).
+  - `not_covered` has 3 lines, none starting with `slow:`.
+  - `garbage_limited` gave both `bound_by` `"bucket"`. `ping_gap_max_ms` was 30,002 (garbage) and 30,001 (slow).
+
+Forced `loadgen-saturated` case (12 checks): the probe read `GOMAXPROCS=2` on CPU 1 (slow-handshake) and `GOMAXPROCS=4` on CPU 1 (slow-auth) throughout.
+- `slow_legit` and `slow_heartbeats` failed with `"loadgen-saturated"`. `no_swap_in_slow` and `slow_held` failed too, as allowed.
+- Loadgen `idle_pct` was 0.0 in both windows, and the `not_covered` label is as specified.
+- `first_s`: `loadgen_saturated`, `gateway_set_saturated`, `logic_set_saturated` and `stats_unanswered` all at 1.5. `gave_up` was null, unlike the prototype's 94.0: here 2,669 of 20,000 got online against the prototype's 781. That is timing on the starved CPU, and `gave_up` is recorded, not gated.
+- Early rows have `lg_online` null.
+
+The verdict's other branches gave all 8 table rows as expected on JSON. The settings check refused `FLOODS_SLOW_HS_CPUS=5`, `FLOODS_SLOW_AUTH_CPUS=0,x` and `FLOODS_SLOW_AUTH_PROCS=0` with the specified messages, before any stack started. No process was left behind.
