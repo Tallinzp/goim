@@ -819,3 +819,27 @@ P6b3b4I-1..4, over what Task 3's runs and 6b3c build on (`wire.Key`, `Respond`/`
 - **P6b3b4I-2 (noted, for 6b3c):** `kill_tree` is now in both `floods.sh` (M4) and `gwloss.sh`: its second user, so it moves to `lib.sh` in 6b3c Task 1 with P6b3bI-3's and P6b3b3I-4's helpers.
 - **P6b3b4I-3 (fixed, plan):** the Execution Notes now name the benchmarks commit (`841fd75`), and Task 3 Step 3 records only the runs, the benchmarks being already here.
 - **P6b3b4I-4 (fixed, roadmap):** the plan 6 row ended "next: execute 6b3b4"; it now says executed, reviewed, and next runs 30i and 30j.
+
+### Run 30i, `floods` (2026-10-17, the user, Tier 2 host; commit `16f93e7`, `dirty` 0, 306s; `floods-20261017-085352`; `FLOODS_RATE=7500`)
+
+**Passed 30/30**, every phase on one stack (storm, garbage, slow at 7,500/s). No swap in any phase; conntrack peaks 29 / 30 / 24. `dmesg | grep -i conntrack` and the profile readings (Task 3 Step 1) not yet sent.
+- **Storm (against run 30c):** `storm_rate` verdict **`met`** (30c: `loadgen-bound`): `new_per_s` **19,998** of 20,000 (15,962), `loadgen_cores_ramp` **4.86** of 8 (7.94), `no_slot_share` **0.032** (0.274; `hs_no_slot` 6,540 against 200,000 `hs_ok`), `no_token` 0. gw-0 4.08 cores over the 11.6s window, loadgen 4.10, Logic 1.17. Login p50/p99/max 18 / 42 / 76ms; none gave up. The window includes the new 8s profiles (final review M3).
+- **Garbage (against run 30c):** `garbage_limited` **`bound_by` `bucket`** on both gateways (30c: `slots`): `dh_per_s` 24,990 / 25,028 against the 25,000/s bucket (21,629 / 21,256); `no_token` 1,406,313 / 796,404, `no_slot` 263,208 / 237,524. 7,207,404 attempts, `TCPSynRetrans` 0. gw-0 / gw-1 2.60 / 2.46 cores for ~25k DH/s each; gateway set 41.7% busy. The 400,000 Pinging clients: 1,588,167 Pongs, none missing, p99/max 3 / 17ms, no heartbeat close, `ping_gap_max_ms` 30,019.
+- **Slow at 7,500/s (against run 30e, which ran the slow phase alone; review O5):** verdict **`valid`** (30e: `gateway-set-saturated`), so `slow_legit` and `slow_heartbeats` pass.
+
+  | | 30e (before #130) | 30i |
+  |---|---|---|
+  | gateway set busy, ramp / hold | 88.1% / 55.2% | **53.6% / 35.6%** |
+  | gw-0 / gw-1 cores (`slow.usage`) | 2.58 / 2.58 | **1.67 / 1.67** |
+  | slow-auth cores (`flood2`, gateway set) | 3.34 | **1.92** |
+  | slow-handshake cores (`flood`, Logic's set) | 0.90 | 0.89 |
+  | `gw_runq_ms_per_s`, ramp | 1,450–2,420 | **130–920** |
+  | light handshakes refused (`pre-handshake`) | 50.6% (409,633) | **6.6% (28,286)** |
+  | slow-auth `pre-handshake` share | 27% | **7.9%** (73,807 of 932,249) |
+  | `hs_no_slot` per gateway | ~331k | **~51k** |
+  | gave up | 478 | **0** |
+  | login p50 / p99 / max | 9 / 220 / 368ms | **5 / 51 / 96ms** |
+  | Pong p99 / max | 55 / 124ms | **15 / 32ms** |
+
+  `pending_mem`, Busy, `at_capacity`, `login_queue`, `no_token` 0 on both gateways; 400,000 online; 1,209,345 Pongs, none missing, `ping_gap_max_ms` 30,013. `first_s`: only `no_slot` and `light_refused` (1.1, as in every healthy run); no saturation, `pending_mem`, gave-up or late scrape. Loadgen 20.7% busy over the ramp.
+- **Reading:** the gain shows wherever the handshake bound. The storm now meets its 20k/s with loadgen at 61% of its set (it was the bound), and the concurrency limit's loss fell from 27% to 3%: the slot hold halved, and the three-slot Erlang loss fell with it (#111's input). The garbage flood now reaches the 25,000/s bucket, the designed limit, on 2.5 cores per gateway. At 7,500/s the slow phase, which failed on the shared gateway set in run 30e, is valid with the set half idle: the gateways' cores fell 35% and slow-auth's 43% (both sides of each handshake), and the refused share fell from 51% to 7%. Profiles pending.
