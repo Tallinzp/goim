@@ -5,14 +5,17 @@
 #       clients ramped at 20,000/s against the gateway's default handshake
 #       limit (25,000/s bucket, burst 2,500, half the loops computing): the
 #       bucket shapes, it does not reject (#121 (2)). One gateway, since the
-#       bucket is per gateway and the spec's 20k/s is a storm's peak.
+#       bucket is per gateway and the spec's 20k/s is a storm's peak. The
+#       concurrency limit refuses (no_slot) without a queue, so its loss is
+#       recorded, as parked #111's input, not failed (O2).
 #   garbage: 2 x 200k light clients (the operating point per gateway) Ping
 #       every 30s, then loadgen instance flood sends garbage handshakes (a
 #       valid header and key_id, a random Noise message: each costs the
 #       gateway a DH) at 80,000/s for 90s from 253 sources, above both
 #       gateways' buckets (2 x 25,000/s) even when least-connections splits
 #       it 65/35 (the dry run's split: a refused attempt closes sooner, so
-#       its gateway gets more), so each limiter refuses part of it:
+#       its gateway gets more), so each bucket refuses part of what the
+#       concurrency limit lets through (the slot is taken first):
 #       every Ping is still answered on time and the gateways renew their
 #       leases (#121 (1)).
 #   slow: instances flood and flood2 hold 80k slow-handshake and 40k
@@ -20,7 +23,7 @@
 #       nothing), freed by the gateways' 5s timeouts and redialed, while
 #       400k light clients log in beside them and Ping: no Busy, no reject,
 #       no bucket refusal (slow-auth's ~7k handshakes/s fit the buckets,
-#       6b3a Review Focus 5).
+#       6b3a Review Focus 5); the concurrency limit's refusals are recorded.
 # Logic is one process (minReplicas, no HPA), unthrottled.
 #
 # Usage (on the Tier 2 host, from the repo root), after the one-time
@@ -56,11 +59,14 @@
 #
 # Checks (per phase run):
 #   storm_stack           redis, devtoken, Logic and the gateway become Ready
-#   storm_online          every client logs in, none gives up
-#   storm_rate            the gateway completed handshakes at >= 0.9 x the
-#                         rate, between 5% and 95% of the clients (so the
-#                         bucket saw the storm, not a loadgen-bound trickle);
-#                         its per-second series is recorded
+#   storm_online          every client logs in, or each one that did not gave
+#                         up after pre-handshake closes only (the concurrency
+#                         limit's loss, #111's input, O2); gave_up is recorded
+#   storm_rate            the gateway saw handshakes (ok + no_slot + no_token)
+#                         at >= 0.9 x the rate, between 5% and 95% of the
+#                         clients seen (so the limiter saw the storm, not a
+#                         loadgen-bound trickle); the completed (ok) rate
+#                         and both per-second series are recorded
 #   storm_bucket          the bucket refused nothing (no_token 0, #121);
 #                         the concurrency limit's refusals (no_slot, each a
 #                         pre-handshake close the client retries after
@@ -68,16 +74,21 @@
 #                         Busy are recorded
 #   no_swap_in_storm      no page swapped in from the ramp to the last login
 #   garbage_stack, slow_stack   as storm_stack, two gateways
-#   garbage_online        every light client logs in, each gateway holds 45-55%
+#   garbage_online        every light client logs in (or gave up as in
+#                         storm_online), each gateway holds 45-55%
 #   garbage_delivered     loadgen kept the schedule (attempts >= 0.95 x rate x
 #                         seconds) and the gateways saw it: failed + no_slot +
 #                         no_token >= 0.95 x rate x seconds (6b3a Review
 #                         Focus 2); outcomes, TIME_WAIT and kernel TCP
 #                         counters are recorded (Review Focus 3)
-#   garbage_limited       each gateway's limiter refused part of the flood
-#                         (no_slot + no_token > 0): it ran past the bucket
-#   garbage_heartbeats    every Ping answered (no Pong missing, every client
-#                         Pinged at least once), the slowest Pong under 10s
+#   garbage_limited       each gateway's bucket refused part of the flood
+#                         (no_token > 0): it ran past the bucket. The slot is
+#                         taken first, so the bucket sees only what the
+#                         concurrency limit lets through; its no_slot and
+#                         the DHs per second are recorded (O3)
+#   garbage_heartbeats    every Ping answered (no Pong missing, at least as
+#                         many Pongs over the light run as clients online: a
+#                         floor, not per client), the slowest Pong under 10s
 #                         (the SDK's Pong timeout), no connection lost, and no
 #                         gateway closed one for its heartbeat
 #   garbage_lease         each gateway renewed its lease every interval
@@ -87,10 +98,13 @@
 #                         slot freed at least once, before the light clients start
 #   slow_held             every slow connection was closed by a gateway, held
 #                         p50 >= 5s, p99 <= 6.5s, max <= 7.5s (5s + one tick of
-#                         the wheel, plus scheduling slack, 6b3a O7)
+#                         the wheel, plus scheduling slack, 6b3a O7); a
+#                         slow-auth handshake the limiter refused ends
+#                         pre-handshake, with no hold, and is counted (O1)
 #   slow_freed            the gateways counted at least as many
 #                         handshake_timeout and auth_timeout closes
-#   slow_legit            every light client logs in beside the floods: no
+#   slow_legit            every light client logs in beside the floods (or
+#                         gave up as in storm_online): no
 #                         Busy, no reject (login_queue, pending_mem: the
 #                         slots, at_capacity) and no bucket refusal
 #                         (no_token); the concurrency limit's (no_slot,
@@ -213,31 +227,53 @@ def delta(x, y):
 print(json.dumps({g: delta(a.get(g), y) for g, y in b.items()}))' "$1" "$2" 2>/dev/null || echo null
 }
 
-# hs_sampler NAME FILE: appends "unix_ms ok" every second, NAME's completed
-# handshakes, until killed.
+# hs_sampler NAME FILE: appends "unix_ms ok refused" every second, NAME's
+# completed handshakes and the limiter's refusals (no_slot + no_token, a
+# label with no sample yet read as 0), until killed.
 hs_sampler() {
-  local n
+  local c re='"ok": ([0-9]+), "slot": ([0-9]+|null), "token": ([0-9]+|null)'
   while :; do
-    n=$(stack_metric "$1" goim_gateway_handshakes_total 'result="ok"') &&
-      echo "$(date +%s%3N) $n" >>"$2"
+    c=$(stack_counters "$1" ok='goim_gateway_handshakes_total:result="ok"' \
+      slot='goim_gateway_handshakes_total:result="no_slot"' token='goim_gateway_handshakes_total:result="no_token"')
+    [[ $c =~ $re ]] &&
+      echo "$(date +%s%3N) ${BASH_REMATCH[1]} $((${BASH_REMATCH[2]/null/0} + ${BASH_REMATCH[3]/null/0}))" >>"$2"
     sleep 1
   done
 }
-# hs_rate FILE N: {"rate_per_s" (handshakes per second between the samples
-# where 5% and 95% of N had completed: the ramp's body, without the retries'
-# tail), "ramp_s", "peak_per_s", "series": [[s since the first sample,
-# handshakes/s], ...] (first 120)}; null when the samples never reach 95% of N.
+# hs_rate FILE N: {"seen_per_s" (handshakes the gateway saw, ok or refused,
+# per second between the samples where 5% and 95% of N had been seen: the
+# ramp's body, a refused client's retry included), "rate_per_s" (completed
+# per second between 5% and 95% of N completed, which the retries stretch),
+# "ramp_s" (of the completed), "peak_per_s" (completed), "series": [[s since
+# the first sample, completed/s, seen/s], ...] (first 120)}; null when the
+# samples never reach 95% of N completed.
 hs_rate() {
   python3 -c 'import json, sys
-rows = [tuple(int(x) for x in l.split()) for l in open(sys.argv[1]) if len(l.split()) == 2 and l.split()[1].isdigit()]
+rows = [tuple(int(x) for x in l.split()) for l in open(sys.argv[1]) if len(l.split()) == 3 and all(x.isdigit() for x in l.split())]
 n = int(sys.argv[2])
-lo = next((r for r in rows if r[1] >= 0.05 * n), None)
-hi = next((r for r in rows if r[1] >= 0.95 * n), None)
-if not lo or not hi or hi[0] <= lo[0]:
+def per_s(f):
+    lo = next((r for r in rows if f(r) >= 0.05 * n), None)
+    hi = next((r for r in rows if f(r) >= 0.95 * n), None)
+    if not lo or not hi or hi[0] <= lo[0]:
+        return None, None
+    return round((f(hi) - f(lo)) * 1000 / (hi[0] - lo[0])), round((hi[0] - lo[0]) / 1000, 1)
+rate, ramp = per_s(lambda r: r[1])
+seen, _ = per_s(lambda r: r[1] + r[2])
+if rate is None:
     print("null"); sys.exit()
-pts = [((t1 - rows[0][0]) / 1000, (c1 - c0) * 1000 / (t1 - t0)) for (t0, c0), (t1, c1) in zip(rows, rows[1:]) if t1 > t0]
-print(json.dumps({"rate_per_s": round((hi[1] - lo[1]) * 1000 / (hi[0] - lo[0])), "ramp_s": round((hi[0] - lo[0]) / 1000, 1),
-       "peak_per_s": round(max(p[1] for p in pts)), "series": [[round(t, 1), round(v)] for t, v in pts[:120]]}))' "$1" "$2" 2>/dev/null || echo null
+pts = [((t1 - rows[0][0]) / 1000, (c1 - c0) * 1000 / (t1 - t0), (c1 + x1 - c0 - x0) * 1000 / (t1 - t0)) for (t0, c0, x0), (t1, c1, x1) in zip(rows, rows[1:]) if t1 > t0]
+print(json.dumps({"seen_per_s": seen, "rate_per_s": rate, "ramp_s": ramp, "peak_per_s": round(max(p[1] for p in pts)),
+       "series": [[round(t, 1), round(v), round(w)] for t, v, w in pts[:120]]}))' "$1" "$2" 2>/dev/null || echo null
+}
+
+# settled N and logged_in N: /stats conditions for N light clients. Settled:
+# the ramp is done and each client is online or gave up. Logged in: all N
+# online, or each one that is not gave up after pre-handshake closes only,
+# the concurrency limit's loss that parked #111 is about (O2); any other
+# failure (Busy, a reject, a timeout) still fails.
+settled() { echo 'd["ramp_done"] and d["online"] + d["failed"].get("gave-up", 0) >= '"$1"; }
+logged_in() {
+  echo 'd["online"] == '"$1"' or (d["online"] + d["failed"].get("gave-up", 0) == '"$1"' and set(d["failed"]) <= {"pre-handshake", "gave-up"})'
 }
 
 # timewait: the host's TIME_WAIT sockets now (ss -s).
@@ -253,7 +289,9 @@ lease() {
 }
 
 # heartbeats PHASE N DELTA: checks PHASE_heartbeats over the light result of
-# N clients (instance main, stopped) and the gateways' counter delta.
+# N clients online (instance main, stopped) and the gateways' counter delta.
+# Pongs >= N is a floor over the whole light run, not per client: pong_missing
+# and lost catch a Ping left unanswered in the flood (O5).
 heartbeats() {
   local r=$STACK_DIR/artifacts/loadgen-$LG_NAME.json
   t2_check "${1}_heartbeats" "$(echo "{\"r\": $(lg_py "$r" d), \"g\": $3}" | lg_true - 'd["r"]["pong_missing"] == 0 and d["r"]["pongs"] >= '"$2"' and d["r"]["pong_rtt"]["max_ms"] < 10000 and d["r"]["lost"] == {} and all(v["closes_heartbeat"] == 0 for v in d["g"].values())')" \
@@ -281,7 +319,7 @@ phase_storm() {
   stack_usage_start loadgen="$LG_PID"
   hs_sampler gw-0 "$STACK_DIR/artifacts/handshakes-gw-0.tsv" &
   smp=$!
-  online=$(t2_bool lg_wait_online "$n" $((n / rate * 3 + 60)))
+  online=$(t2_bool lg_wait "$(settled "$n")" $((n / rate * 3 + 60)))
   kill "$smp" 2>/dev/null; wait "$smp" 2>/dev/null; smp=""
   usage=$(stack_usage_json)
   s1=$(gws_counters)
@@ -289,10 +327,10 @@ phase_storm() {
   stack_snapshot after
   d=$(gws_delta "$s0" "$s1")
   hs=$(hs_rate "$STACK_DIR/artifacts/handshakes-gw-0.tsv" "$n")
-  [ "$online" = true ] && online=$(lg_get /stats 'd["online"] == '"$n"' and "gave-up" not in d["failed"]')
-  t2_check storm_online "${online:-false}" "\"want\": $n, \"online\": $(lg_get /stats 'd["online"]'), \"failed\": $(lg_get /stats 'd["failed"]'), \"login_latency\": $(lg_get /stats 'd["login_latency"]')"
-  t2_check storm_rate "$(echo "$hs" | lg_true - 'd["rate_per_s"] >= 0.9 * '"$rate")" \
-    "\"rate\": $rate, \"handshakes\": $(echo "$hs" | lg_py - '{k: d[k] for k in ("rate_per_s", "ramp_s", "peak_per_s")}'), \"loadgen_cores\": $(echo "$usage" | lg_py - 'd["loadgen"]["cores"]'), \"gateway_cores\": $(echo "$usage" | lg_py - 'd["gw-0"]["cores"]')"
+  [ "$online" = true ] && online=$(lg_get /stats "$(logged_in "$n")")
+  t2_check storm_online "${online:-false}" "\"want\": $n, \"online\": $(lg_get /stats 'd["online"]'), \"gave_up\": $(lg_get /stats 'd["failed"].get("gave-up", 0)'), \"failed\": $(lg_get /stats 'd["failed"]'), \"login_latency\": $(lg_get /stats 'd["login_latency"]')"
+  t2_check storm_rate "$(echo "$hs" | lg_true - 'd["seen_per_s"] >= 0.9 * '"$rate")" \
+    "\"rate\": $rate, \"handshakes\": $(echo "$hs" | lg_py - '{k: d[k] for k in ("seen_per_s", "rate_per_s", "ramp_s", "peak_per_s")}'), \"loadgen_cores\": $(echo "$usage" | lg_py - 'd["loadgen"]["cores"]'), \"gateway_cores\": $(echo "$usage" | lg_py - 'd["gw-0"]["cores"]')"
   t2_check storm_bucket "$(echo "$d" | lg_true - 'd["gw-0"]["hs_no_token"] == 0')" \
     "\"gw-0\": $(echo "$d" | lg_py - '{k: d["gw-0"][k] for k in ("hs_ok", "hs_no_token", "hs_no_slot", "rejects_handshake_rate", "logins_busy", "rejects_pending_mem", "rejects_at_capacity")}'), \"no_slot_share\": $(echo "$d" | lg_py - 'round(d["gw-0"]["hs_no_slot"] / (d["gw-0"]["hs_ok"] + d["gw-0"]["hs_no_slot"]), 4)'), \"failed\": $(lg_get /stats 'd["failed"]')"
   t2_field storm "{\"clients\": $n, \"rate\": $rate, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"usage\": $usage, \"handshakes\": $hs, \"gateways\": $d, \"login_latency\": $(lg_get /stats 'd["login_latency"]'), \"failed\": $(lg_get /stats 'd["failed"]')}"
@@ -303,15 +341,16 @@ phase_storm() {
 phase_garbage() {
   local n=${FLOODS_CLIENTS:-400000} rate=${FLOODS_RATE:-10000} grate=${FLOODS_GARBAGE_RATE:-80000}
   local inflight=${FLOODS_GARBAGE_INFLIGHT:-20000} secs=${FLOODS_GARBAGE_SECONDS:-90}
-  local online s0 s1 d l0 l1 tw0 tw1 usage want flood prof t0 lease_s f
+  local online on s0 s1 d l0 l1 tw0 tw1 usage want flood prof t0 lease_s f
   STACK_GATEWAYS=2 STACK_GATEWAY_ARGS=(-max-conns $((n / 2 + n / 10 + inflight)) -heartbeat "${HB}s"
     ${FLOODS_GARBAGE_BUCKET:+-handshake-rate "$FLOODS_GARBAGE_BUCKET"})
   up garbage || { stack_down; return; }
   lg_start garbage-light -mode light -clients "$n" -rate "$rate" -ping-every "${HB}s" -uid-prefix garbage
   online=false
-  lg_wait_online "$n" $((n / rate * 3 + 60)) &&
-    online=$(lg_get /stats 'd["online"] == '"$n"' and min(d["online_by_gateway"].get(g, 0) for g in ("gw-0", "gw-1")) >= '"$n"' * 0.45')
-  t2_check garbage_online "${online:-false}" "\"want\": $n, \"by_gateway\": $(lg_get /stats 'd["online_by_gateway"]'), \"failed\": $(lg_get /stats 'd["failed"]')"
+  lg_wait "$(settled "$n")" $((n / rate * 3 + 60)) &&
+    online=$(lg_get /stats '('"$(logged_in "$n")"') and min(d["online_by_gateway"].get(g, 0) for g in ("gw-0", "gw-1")) >= '"$n"' * 0.45')
+  on=$(lg_get /stats 'd["online"]')
+  t2_check garbage_online "${online:-false}" "\"want\": $n, \"online\": $on, \"by_gateway\": $(lg_get /stats 'd["online_by_gateway"]'), \"gave_up\": $(lg_get /stats 'd["failed"].get("gave-up", 0)'), \"failed\": $(lg_get /stats 'd["failed"]')"
   [ "$online" = true ] || { down garbage; return; }
   stack_snapshot before
   s0=$(gws_counters) l0=$(stack_counters logic lease_error="$LOGIC_LEASE_ERROR")
@@ -340,9 +379,9 @@ phase_garbage() {
   want=$(python3 -c 'import sys; print(int(0.95 * int(sys.argv[1]) * int(sys.argv[2])))' "$grate" "$secs")
   t2_check garbage_delivered "$(echo "{\"g\": $d, \"f\": $flood}" | lg_true - 'd["f"]["attempts"] >= '"$want"' and sum(v["hs_failed"] + v["hs_no_slot"] + v["hs_no_token"] for v in d["g"].values()) >= '"$want")" \
     "\"rate\": $grate, \"seconds\": $secs, \"want\": $want, \"attempts\": $(echo "$flood" | lg_py - 'd["attempts"]'), \"skipped\": $(echo "$flood" | lg_py - 'd["skipped"]'), \"outcomes\": $(echo "$flood" | lg_py - 'd["outcomes"]'), \"held\": $(echo "$flood" | lg_py - 'd["held"]'), \"gateways\": $(echo "$d" | lg_py - '{g: {k: v[k] for k in ("hs_ok", "hs_failed", "hs_no_slot", "hs_no_token", "rejects_handshake_rate")} for g, v in d.items()}'), \"timewait\": [$tw0, $tw1], \"tcp\": $(t2_tcpstat_json "$STACK_DIR/tcp0" "$STACK_DIR/tcp1")"
-  t2_check garbage_limited "$(echo "$d" | lg_true - 'all(v["hs_no_slot"] + v["hs_no_token"] > 0 for v in d.values())')" \
+  t2_check garbage_limited "$(echo "$d" | lg_true - 'all(v["hs_no_token"] > 0 for v in d.values())')" \
     "\"refused\": $(echo "$d" | lg_py - '{g: {"no_slot": v["hs_no_slot"], "no_token": v["hs_no_token"]} for g, v in d.items()}'), \"dh_per_s\": $(echo "$d" | lg_py - '{g: round(v["hs_failed"] / '"$secs"') for g, v in d.items()}'), \"bucket\": ${FLOODS_GARBAGE_BUCKET:-25000}"
-  heartbeats garbage "$n" "$d"
+  heartbeats garbage "$on" "$d"
   lease garbage "$d" "$lease_s" "$(stack_counters_delta "$l0" "$l1")"
   t2_field garbage "{\"clients\": $n, \"rate\": $rate, \"garbage_rate\": $grate, \"inflight\": $inflight, \"seconds\": $secs, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"usage\": $usage, \"gateways\": $d, \"flood\": $flood}"
   down garbage
@@ -358,7 +397,7 @@ phase_garbage() {
 phase_slow() {
   local n=${FLOODS_CLIENTS:-400000} rate=${FLOODS_RATE:-10000} hs=${FLOODS_SLOW_HANDSHAKE:-80000}
   local au=${FLOODS_SLOW_AUTH:-40000} srate=${FLOODS_SLOW_RATE:-10000} hold=${FLOODS_SLOW_HOLD:-60}
-  local s0 s1 d l0 l1 t0 lease_s flooding=true online usage inst held f
+  local s0 s1 d l0 l1 t0 lease_s flooding=true online on usage inst held f
   STACK_GATEWAYS=2 STACK_GATEWAY_ARGS=(-max-conns $(((n + hs + au) / 2 + (n + hs + au) / 10)) -heartbeat "${HB}s")
   up slow || { stack_down; return; }
   stack_snapshot before
@@ -374,7 +413,8 @@ phase_slow() {
   lg_start slow-light -mode light -clients "$n" -rate "$rate" -ping-every "${HB}s" -uid-prefix slow
   stack_usage_start loadgen="$LG_PID" flood="${LG_PIDS[flood]}" flood2="${LG_PIDS[flood2]}"
   online=false
-  lg_wait_online "$n" $((n / rate * 3 + 60)) && online=$(lg_get /stats 'd["online"] == '"$n")
+  lg_wait "$(settled "$n")" $((n / rate * 3 + 60)) && online=$(lg_get /stats "$(logged_in "$n")")
+  on=$(lg_get /stats 'd["online"]')
   sleep "$hold"
   usage=$(stack_usage_json)
   lg_in flood lg_stop
@@ -385,16 +425,18 @@ phase_slow() {
   stack_snapshot after
   lg_stop
   d=$(gws_delta "$s0" "$s1")
+  # Slow-auth's handshakes meet the limiter: a refused one ends pre-handshake,
+  # with no hold, and the bounds are on the holds the timeouts ended (O1).
   held=true
-  for inst in slowhs slowauth; do
-    [ "$(lg_true "$STACK_DIR/artifacts/loadgen-$inst.json" 'set(d["flood"]["outcomes"]) == {"closed"} and d["flood"]["held"]["p50_ms"] >= 5000 and d["flood"]["held"]["p99_ms"] <= 6500 and d["flood"]["held"]["max_ms"] <= 7500')" = true ] || held=false
+  for inst in slowhs:'{"closed"}' slowauth:'{"closed", "pre-handshake"}'; do
+    [ "$(lg_true "$STACK_DIR/artifacts/loadgen-${inst%%:*}.json" 'set(d["flood"]["outcomes"]) <= '"${inst#*:}"' and "closed" in d["flood"]["outcomes"] and d["flood"]["held"]["p50_ms"] >= 5000 and d["flood"]["held"]["p99_ms"] <= 6500 and d["flood"]["held"]["max_ms"] <= 7500')" = true ] || held=false
   done
   t2_check slow_held "$held" "\"slowhs\": $(lg_py "$STACK_DIR/artifacts/loadgen-slowhs.json" '{k: d["flood"][k] for k in ("attempts", "open", "outcomes", "held")}'), \"slowauth\": $(lg_py "$STACK_DIR/artifacts/loadgen-slowauth.json" '{k: d["flood"][k] for k in ("attempts", "open", "outcomes", "held")}')"
   t2_check slow_freed "$(echo "{\"g\": $d, \"h\": $(lg_py "$STACK_DIR/artifacts/loadgen-slowhs.json" 'd["flood"]["outcomes"].get("closed", 0)'), \"a\": $(lg_py "$STACK_DIR/artifacts/loadgen-slowauth.json" 'd["flood"]["outcomes"].get("closed", 0)')}" | lg_true - 'sum(v["rejects_handshake_timeout"] for v in d["g"].values()) >= d["h"] and sum(v["rejects_auth_timeout"] for v in d["g"].values()) >= d["a"]')" \
     "\"handshake_timeout\": $(echo "$d" | lg_py - 'sum(v["rejects_handshake_timeout"] for v in d.values())'), \"slowhs_closed\": $(lg_py "$STACK_DIR/artifacts/loadgen-slowhs.json" 'd["flood"]["outcomes"].get("closed", 0)'), \"auth_timeout\": $(echo "$d" | lg_py - 'sum(v["rejects_auth_timeout"] for v in d.values())'), \"slowauth_closed\": $(lg_py "$STACK_DIR/artifacts/loadgen-slowauth.json" 'd["flood"]["outcomes"].get("closed", 0)')"
   t2_check slow_legit "$(echo "{\"g\": $d, \"o\": ${online:-false}}" | lg_true - 'd["o"] is True and all(v[k] == 0 for v in d["g"].values() for k in ("logins_busy", "rejects_login_queue", "rejects_pending_mem", "rejects_at_capacity", "hs_no_token"))')" \
-    "\"want\": $n, \"online\": ${online:-false}, \"failed\": $(lg_json 'd["failed"]'), \"login_latency\": $(lg_json 'd["login_latency"]'), \"gateways\": $(echo "$d" | lg_py - '{g: {k: v[k] for k in ("logins_ok", "logins_busy", "rejects_login_queue", "rejects_pending_mem", "rejects_at_capacity", "hs_no_slot", "hs_no_token")} for g, v in d.items()}')"
-  heartbeats slow "$n" "$d"
+    "\"want\": $n, \"online\": $on, \"gave_up\": $(lg_json 'd["failed"].get("gave-up", 0)'), \"failed\": $(lg_json 'd["failed"]'), \"login_latency\": $(lg_json 'd["login_latency"]'), \"gateways\": $(echo "$d" | lg_py - '{g: {k: v[k] for k in ("logins_ok", "logins_busy", "rejects_login_queue", "rejects_pending_mem", "rejects_at_capacity", "hs_no_slot", "hs_no_token")} for g, v in d.items()}')"
+  heartbeats slow "$on" "$d"
   lease slow "$d" "$lease_s" "$(stack_counters_delta "$l0" "$l1")"
   t2_field slow "{\"clients\": $n, \"rate\": $rate, \"slow_handshake\": $hs, \"slow_auth\": $au, \"slow_rate\": $srate, \"hold_s\": $hold, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"usage\": $usage, \"gateways\": $d}"
   down slow
