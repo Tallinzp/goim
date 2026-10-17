@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // limitSource reads the two limits the gateway can see (spec: Limits
@@ -63,4 +65,30 @@ func checkLimits(cfg Config, src limitSource, m *Metrics) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// conntrackCount is the node's nf_conntrack_count read from path at each
+// scrape (spec: Observability, limits), or nil when it can't be read at
+// startup: conntrack not loaded, or no permission. A later failed read
+// reports NaN.
+func conntrackCount(path string, src limitSource) prometheus.Collector {
+	read := func() (float64, error) {
+		b, err := src.readFile(path)
+		if err != nil {
+			return 0, err
+		}
+		n, err := strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64)
+		return float64(n), err
+	}
+	if _, err := read(); err != nil {
+		return nil
+	}
+	return prometheus.NewGaugeFunc(prometheus.GaugeOpts{Namespace: "goim_gateway", Name: "nf_conntrack_count",
+		Help: "The node's nf_conntrack_count, read at each scrape."}, func() float64 {
+		n, err := read()
+		if err != nil {
+			return math.NaN()
+		}
+		return n
+	})
 }
