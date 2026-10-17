@@ -137,4 +137,10 @@ PY
 ) | tee "$dir/inst.out"
 fails=$((fails + $(grep -c '^FAIL' "$dir/inst.out")))
 
+# LG_CPUS is lg_start's CPU list: a scenario sets it only as the prefix of
+# one lg_in/lg_start call, never as a global every later lg_start reads (run
+# 30j: gwloss set it to a CPU count, and taskset -c 8 pinned loadgen to one CPU).
+globals=$(grep -nE '^\s*(export\s+)?LG_CPUS=' scripts/tier2/*.sh | grep -vE 'LG_CPUS=\S+\s+lg_(in|start)\b')
+expect "lint: LG_CPUS only as an lg_in/lg_start prefix" "$globals" ""
+
 [ "$fails" -eq 0 ] && echo "loadgen_test: all passed" || { echo "loadgen_test: $fails failed"; exit 1; }

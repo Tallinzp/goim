@@ -88,7 +88,8 @@ SOURCES=${CAPACITY_SOURCES:-}
 export STACK_GATEWAYS=1 STACK_PIN=1
 STACK_PORT_BASE=${STACK_PORT_BASE:-17000}
 STACK_REDIS_SERVER=$PWD/.cache/redis/bin/redis-server
-LG_CPUS=$(t2_cpulist_expand "$T2_CPUS_LOADGEN" | wc -w)
+# A count, for usage_ok: not LG_CPUS, which lg_start reads as a CPU list.
+LG_NCPUS=$(t2_cpulist_expand "$T2_CPUS_LOADGEN" | wc -w)
 t2_on_exit 'stack_down'
 t2_on_exit 'lg_stop' # newest first: loadgen stops before the stack
 
@@ -120,7 +121,7 @@ lo_dropped() { cat /sys/class/net/lo/statistics/rx_dropped 2>/dev/null || echo n
 lo_drops_between() { [ "$1" = null ] || [ "$2" = null ] && echo null || echo $(($2 - $1)); }
 
 # usage_ok JSON: loadgen used under 3/4 of its CPU set.
-usage_ok() { [ "$(echo "$1" | lg_true - 'd["loadgen"]["cores"] < '"$LG_CPUS"' * 0.75')" = true ]; }
+usage_ok() { [ "$(echo "$1" | lg_true - 'd["loadgen"]["cores"] < '"$LG_NCPUS"' * 0.75')" = true ]; }
 
 t=$SECONDS
 if ! make redis-server >"$T2_OUT/redis-build.log" 2>&1; then
@@ -285,7 +286,7 @@ print(round(w["gw-0"]["cpu_s"] / p * 1e6, 1) if p > 0 and w.get("gw-0") else "nu
   headroom=false
   usage_ok "$ramp" && usage_ok "$win" && headroom=true
   t2_check "${name}_loadgen_headroom" "$headroom" \
-    "\"loadgen_cpus\": $LG_CPUS, \"ramp_cores\": $(echo "$ramp" | lg_py - 'd["loadgen"]["cores"]'), \"window_cores\": $(echo "$win" | lg_py - 'd["loadgen"]["cores"]')"
+    "\"loadgen_cpus\": $LG_NCPUS, \"ramp_cores\": $(echo "$ramp" | lg_py - 'd["loadgen"]["cores"]'), \"window_cores\": $(echo "$win" | lg_py - 'd["loadgen"]["cores"]')"
   t=$SECONDS
   idle=$(t2_bool stack_wait_idle 300 2>"$STACK_DIR/idle.err")
   stop_s=$((SECONDS - t))

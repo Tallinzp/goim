@@ -128,7 +128,8 @@
 # noted):
 #   b1_stack           redis, devtoken, Logic and the gateways become Ready
 #   b1_pinning         gateways, Logic + Redis and loadgen on their phase's CPU
-#                      sets (b_stress's differ, #108)
+#                      sets (b_stress's differ, #108); a failure ends the
+#                      run after the ramp
 #   b1_online          every client logs in, each gateway holds 45-55% of
 #                      them; b_stress: every client on gw-0, then gw-1 and
 #                      gw-2 are back in loadgen's balancer
@@ -359,7 +360,7 @@ t2_report_extra() {
 # lo_dropped: packets loopback dropped on input since boot (host-wide); as capacity.sh.
 lo_dropped() { cat /sys/class/net/lo/statistics/rx_dropped 2>/dev/null || echo null; }
 # usage_ok JSON: loadgen used under 3/4 of its CPU set.
-usage_ok() { [ "$(echo "$1" | lg_true - 'd["loadgen"]["cores"] < '"$LG_CPUS"' * 0.75')" = true ]; }
+usage_ok() { [ "$(echo "$1" | lg_true - 'd["loadgen"]["cores"] < '"$LG_NCPUS"' * 0.75')" = true ]; }
 # lg_heap WHEN: saves loadgen's heap after a forced GC to artifacts/WHEN/ and
 # prints {live_mb, sys_mb, live_bytes_per_client} from it (null: unreadable).
 lg_heap() {
@@ -448,7 +449,9 @@ for name in $PHASES; do
       online_rule='d["online"] == '"$clients"' and d["online_by_gateway"].get("gw-0") == '"$clients"
       ;;
   esac
-  LG_CPUS=$(t2_cpulist_expand "$T2_CPUS_LOADGEN" | wc -w)
+  # A count, for usage_ok: not LG_CPUS, which lg_start reads as the CPU
+  # list to pin loadgen to (run 30j pinned it to one CPU).
+  LG_NCPUS=$(t2_cpulist_expand "$T2_CPUS_LOADGEN" | wc -w)
   export STACK_DIR=$T2_OUT/$name
   mkdir -p "$STACK_DIR"
   ln -sfn ../bin "$STACK_DIR/bin"
@@ -499,6 +502,14 @@ for name in $PHASES; do
   have=$(taskset -pc "$LG_PID" 2>/dev/null)
   [ "$(t2_cpulist_expand "${have##*: }")" = "$(t2_cpulist_expand "$T2_CPUS_LOADGEN")" ] || wrong+=" loadgen"
   t2_check "${name}_pinning" "$(t2_bool [ -z "$wrong" ])" "\"gateway_cpus\": $(t2_json_str "$T2_CPUS_GATEWAY"), \"logic_cpus\": $(t2_json_str "$T2_CPUS_LOGIC"), \"loadgen_cpus\": $(t2_json_str "$T2_CPUS_LOADGEN"), \"gateway_procs\": $(. "$STACK_DIR/stack.env"; echo "$GATEWAY_PROCS"), \"wrong\": $(t2_json_str "${wrong# }")"
+  # A process on the wrong CPUs makes every later reading meaningless, so
+  # the run ends here rather than spend the other phases on it.
+  if [ -n "$wrong" ]; then
+    lg_stop
+    stack_down
+    t2_duration "$name" $((SECONDS - t0))
+    t2_finish
+  fi
   if [ "$online" != true ]; then
     lg_stop
     stack_down
@@ -797,7 +808,7 @@ print(json.dumps(out))' "$STACK_DIR/artifacts/ss-storm.jsonl" 2>/dev/null || ech
   # relogin times are recorded as loadgen-bound instead (#102).
   usage_ok "$ramp" && usage_ok "$storm" && { [ "$name" = b_stress ] || [ $loadgen_bound = false ]; } && headroom=true
   t2_check "${name}_loadgen_headroom" "$headroom" \
-    "\"loadgen_cpus\": $LG_CPUS, \"ramp_cores\": $(echo "$ramp" | lg_py - 'd["loadgen"]["cores"]'), \"storm_cores\": $(echo "$storm" | lg_py - 'd["loadgen"]["cores"]'), \"storm_first30_cores\": $(echo "$storm30" | lg_py - 'd["loadgen"]["cores"]'), \"loadgen_bound\": $loadgen_bound"
+    "\"loadgen_cpus\": $LG_NCPUS, \"ramp_cores\": $(echo "$ramp" | lg_py - 'd["loadgen"]["cores"]'), \"storm_cores\": $(echo "$storm" | lg_py - 'd["loadgen"]["cores"]'), \"storm_first30_cores\": $(echo "$storm30" | lg_py - 'd["loadgen"]["cores"]'), \"loadgen_bound\": $loadgen_bound"
 
   # The end: the result is written before any client stops (#84), then the
   # survivors drain to idle before the stack stops.
