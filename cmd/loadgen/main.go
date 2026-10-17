@@ -3,7 +3,10 @@
 // least-connections balancer from 127.0.0.2… (choices #69, #81), holds them,
 // and serves the control API on -control (GET /stats, POST /kill, POST /mark,
 // POST /up, GET /slo, GET /runtime; choice #84) until SIGTERM, Ctrl-C or -duration.
-// -down keeps gateways out of the balancer until POST /up (#93). It then writes
+// -down keeps gateways out of the balancer until POST /up (#93). The flood
+// modes (garbage, slow-handshake, slow-auth; Plan 6b3a) log nothing in: they
+// put a handshake flood or a slow-client flood beside another instance's
+// legitimate clients, from their own -source-net. It then writes
 // the result, the stats at that moment and every mark's SLO against
 // -within, as JSON to -out, and only then stops every client: stopping 200k
 // SDK clients can outlast the caller's wait, and the result must survive a
@@ -46,13 +49,14 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	fs.SetOutput(stderr)
 	var cfg loadgen.Config
 	envPath := fs.String("env", "", "stack.env written by scripts/stack.sh (required)")
-	fs.StringVar(&cfg.Mode, "mode", "light", "light (clientconn + shared pinger) or sdk (one SDK client each)")
-	fs.IntVar(&cfg.Clients, "clients", 1000, "clients; client i logs in as <uid-prefix>-<i>")
-	fs.Float64Var(&cfg.Rate, "rate", 1000, "clients started per second")
+	fs.StringVar(&cfg.Mode, "mode", "light", "light (clientconn + shared pinger), sdk (one SDK client each), or a flood: garbage, slow-handshake, slow-auth")
+	fs.IntVar(&cfg.Clients, "clients", 1000, "clients; client i logs in as <uid-prefix>-<i>; garbage: attempts in flight at most")
+	fs.Float64Var(&cfg.Rate, "rate", 1000, "clients started per second; garbage: attempts per second")
 	fs.StringVar(&cfg.UIDPrefix, "uid-prefix", "lg", "uid prefix, distinct per run")
-	fs.IntVar(&cfg.Sources, "sources", 0, "source addresses 127.0.0.2…; 0: one per 5,000 connections per gateway")
+	fs.IntVar(&cfg.Sources, "sources", 0, "source addresses 127.0.<source-net>.2…; 0: one per 5,000 connections per gateway (floods: 253)")
+	fs.IntVar(&cfg.SourceNet, "source-net", 0, "third octet of the source addresses, one per instance on a stack")
 	fs.DurationVar(&cfg.PingEvery, "ping-every", 150*time.Second, "light: Ping interval (the gateway's -heartbeat)")
-	fs.DurationVar(&cfg.Timeout, "timeout", 10*time.Second, "light: dial + handshake + Login per attempt")
+	fs.DurationVar(&cfg.Timeout, "timeout", 10*time.Second, "light: dial + handshake + Login per attempt; floods: dial, then the wait for the gateway's close")
 	down := fs.String("down", "", "gateway ids out of the balancer until POST /up, comma-separated")
 	fs.BoolVar(&cfg.Precompute, "precompute", false, "sdk: prepare each logged-in client's next handshake until the first mark (#106)")
 	control := fs.String("control", "", "control API listen address (none if empty)")

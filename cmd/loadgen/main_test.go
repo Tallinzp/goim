@@ -26,6 +26,8 @@ func TestRunRefusesBadFlags(t *testing.T) {
 		{[]string{"-nope"}, "flag provided but not defined"},
 		{[]string{"-env", "ENV", "-down", "gw-9"}, "down"},
 		{[]string{"-env", "ENV", "-precompute"}, "sdk mode"},
+		{[]string{"-env", "ENV", "-mode", "slow-auth", "-timeout", "0s"}, "Timeout"},
+		{[]string{"-env", "ENV", "-mode", "garbage", "-source-net", "256"}, "source net"},
 	} {
 		for i, a := range tc.args {
 			if a == "ENV" {

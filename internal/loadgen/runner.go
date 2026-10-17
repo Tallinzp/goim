@@ -29,15 +29,16 @@ const connsPerSource = 5_000
 
 // Config configures a run.
 type Config struct {
-	Mode       string        // "light" or "sdk" (choice #80)
-	Clients    int           // client i logs in as uid <UIDPrefix>-<i>
-	Rate       float64       // clients started per second
+	Mode       string        // "light" or "sdk" (choice #80), or a flood mode: ModeGarbage, ModeSlowHandshake, ModeSlowAuth
+	Clients    int           // client i logs in as uid <UIDPrefix>-<i>; ModeGarbage: attempts in flight at most
+	Rate       float64       // clients started per second; ModeGarbage: attempts per second
+	SourceNet  int           // source addresses 127.0.SourceNet.2…, so instances keep apart (Plan 6b3a)
 	UIDPrefix  string        // distinct per loadgen run, so runs never replace each other's sessions
-	Sources    int           // source addresses; 0: one per 5,000 connections per gateway, with one gateway gone or Down
+	Sources    int           // source addresses; 0: one per 5,000 connections per gateway, with one gateway gone or Down; flood modes: all 253
 	Down       []string      // gateway ids out of the balancer from the start, until POST /up (b_stress, #93)
 	Precompute bool          // sdk: prepare each logged-in client's next handshake until the first mark (#106)
 	PingEvery  time.Duration // light: the Ping interval (cmd/loadgen: 150s, the gateway's default heartbeat)
-	Timeout    time.Duration // light: dial + handshake + Login (cmd/loadgen: 10s)
+	Timeout    time.Duration // light: dial + handshake + Login; flood modes: dial, and then the wait for the close (cmd/loadgen: 10s)
 	windows    sdk.Windows   // tests only: the SDK's built-in reconnect windows
 }
 
@@ -50,6 +51,7 @@ type Stats struct {
 	RampDone   bool             `json:"ramp_done"`
 	ElapsedS   float64          `json:"elapsed_s"`
 	Precompute *PrecomputeStats `json:"precompute,omitempty"`
+	Flood      *FloodStats      `json:"flood,omitempty"`
 	Counts
 }
 
@@ -61,6 +63,7 @@ type Runner struct {
 	bal      *Balancer
 	pinger   pingers
 	pre      *precomputer // nil without Precompute
+	flood    *floodRec    // nil unless a flood mode
 	begin    atomic.Int64 // unix ns Run started, 0: not yet
 	started  atomic.Int64
 	rampDone atomic.Bool
@@ -73,8 +76,8 @@ type Runner struct {
 // New checks cfg and prepares a run against env's gateways.
 func New(cfg Config, env Env) (*Runner, error) {
 	switch {
-	case cfg.Mode != "light" && cfg.Mode != "sdk":
-		return nil, fmt.Errorf("loadgen: mode %q, want light or sdk", cfg.Mode)
+	case cfg.Mode != "light" && cfg.Mode != "sdk" && !floodMode(cfg.Mode):
+		return nil, fmt.Errorf("loadgen: mode %q, want light, sdk, %s, %s or %s", cfg.Mode, ModeGarbage, ModeSlowHandshake, ModeSlowAuth)
 	case cfg.Clients < 1 || cfg.Rate <= 0:
 		return nil, errors.New("loadgen: Clients and Rate must be positive")
 	case cfg.Precompute && cfg.Mode != "sdk":
@@ -83,6 +86,10 @@ func New(cfg Config, env Env) (*Runner, error) {
 		return nil, errors.New("loadgen: UIDPrefix is required")
 	case cfg.Mode == "light" && (cfg.PingEvery <= 0 || cfg.Timeout <= 0):
 		return nil, errors.New("loadgen: light mode needs PingEvery and Timeout")
+	case floodMode(cfg.Mode) && cfg.Timeout <= 0:
+		return nil, errors.New("loadgen: flood modes need Timeout")
+	case cfg.SourceNet < 0 || cfg.SourceNet > 255:
+		return nil, fmt.Errorf("loadgen: source net %d, want 0–255", cfg.SourceNet)
 	}
 	var down []int
 	for _, id := range cfg.Down {
@@ -97,6 +104,9 @@ func New(cfg Config, env Env) (*Runner, error) {
 	if len(down) >= len(env.GatewayAddrs) {
 		return nil, errors.New("loadgen: down: every gateway")
 	}
+	if cfg.Sources == 0 && floodMode(cfg.Mode) {
+		cfg.Sources = maxSources // "garbage handshakes from many sources" (spec: Load tests)
+	}
 	if cfg.Sources == 0 {
 		// Sized for the busiest gateway: one gateway gone, or every client on
 		// the gateways up at the start.
@@ -104,7 +114,7 @@ func New(cfg Config, env Env) (*Runner, error) {
 		perGW := (cfg.Clients + gws - 1) / gws
 		cfg.Sources = min(maxSources, (perGW+connsPerSource-1)/connsPerSource)
 	}
-	bal, err := NewBalancer(env.GatewayAddrs, cfg.Sources)
+	bal, err := NewBalancerIn(env.GatewayAddrs, cfg.SourceNet, cfg.Sources)
 	if err != nil {
 		return nil, err
 	}
@@ -117,6 +127,9 @@ func New(cfg Config, env Env) (*Runner, error) {
 	}
 	if cfg.Precompute {
 		r.pre = newPrecomputer(r, cfg.Clients, runtime.GOMAXPROCS(0)/2)
+	}
+	if floodMode(cfg.Mode) {
+		r.flood = newFloodRec()
 	}
 	return r, nil
 }
@@ -134,7 +147,8 @@ func (r *Runner) token(i int) (string, error) {
 func (r *Runner) uid(i int) string { return r.cfg.UIDPrefix + "-" + strconv.Itoa(i) }
 
 // Run starts client i at begin + i/Rate, then holds them until ctx ends,
-// and returns once every client is stopped.
+// and returns once every client is stopped. ModeGarbage has no ramp: its
+// attempts run at Rate until ctx ends.
 func (r *Runner) Run(ctx context.Context) {
 	begin := time.Now()
 	r.begin.Store(begin.UnixNano())
@@ -146,6 +160,13 @@ func (r *Runner) Run(ctx context.Context) {
 		for range r.pre.workers {
 			wg.Go(func() { r.pre.run(ctx) })
 		}
+	}
+	if r.cfg.Mode == ModeGarbage {
+		r.rampDone.Store(true)
+		close(r.ramped)
+		r.garbage(ctx, &wg)
+		wg.Wait()
+		return
 	}
 	for i := 0; i < r.cfg.Clients && ctx.Err() == nil; i++ {
 		due := begin.Add(time.Duration(float64(i) / r.cfg.Rate * float64(time.Second)))
@@ -187,11 +208,15 @@ func (r *Runner) Run(ctx context.Context) {
 
 func (r *Runner) start(ctx context.Context, wg *sync.WaitGroup, i int) {
 	var stop func()
-	if r.cfg.Mode == "light" {
+	switch {
+	case floodMode(r.cfg.Mode): // a slow client; ctx's end closes its connection
+		wg.Go(func() { r.slow(ctx) })
+		return
+	case r.cfg.Mode == "light":
 		lc := &lightConn{i: i}
 		stop = lc.stop
 		wg.Go(func() { r.light(ctx, lc) })
-	} else {
+	default:
 		c, err := r.newSDK(i)
 		if err != nil {
 			r.rec.Failed("sdk")
@@ -265,6 +290,9 @@ func (r *Runner) Stats() Stats {
 	}
 	if r.pre != nil {
 		s.Precompute = r.pre.stats()
+	}
+	if r.flood != nil {
+		s.Flood = r.flood.stats()
 	}
 	return s
 }

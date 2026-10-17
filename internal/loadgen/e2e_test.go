@@ -42,9 +42,18 @@ func (s staticKeys) Verify(tok string) (auth.Claims, error) {
 func (staticKeys) Ready() bool         { return true }
 func (staticKeys) Run(context.Context) {}
 
-// startStack starts Logic and n gateways; stop[i] stops gateway i's
-// transport (its clients see their connections close) and core.
-func startStack(t *testing.T, n int) (env Env, stop []func()) {
+// gatewayRegs holds each started gateway's registry by its id (stack
+// metrics for the flood tests).
+var gatewayRegs sync.Map
+
+// stackOpt changes each gateway's core and transport configs (the
+// handshake limit is the transport's).
+type stackOpt func(*gateway.Config, *tcp.Config)
+
+// startStack starts Logic and n gateways, each config passed through opts;
+// stop[i] stops gateway i's transport (its clients see their connections
+// close) and core.
+func startStack(t *testing.T, n int, opts ...stackOpt) (env Env, stop []func()) {
 	t.Helper()
 	jwt, err := auth.GenerateKey("k1")
 	if err != nil {
@@ -84,7 +93,11 @@ func startStack(t *testing.T, n int) (env Env, stop []func()) {
 		cfg.Limits.Notrack = true
 		tcfg := tcp.DefaultConfig(cfg.NumLoops)
 		tcfg.Addr = "tcp://127.0.0.1:0"
+		for _, o := range opts {
+			o(&cfg, &tcfg)
+		}
 		greg := prometheus.NewRegistry()
+		gatewayRegs.Store(cfg.GatewayID, greg)
 		var tr *tcp.Transport
 		g, err := gateway.New(cfg, gateway.Deps{Metrics: gateway.NewMetrics(greg), Registry: greg,
 			ReadyChecks: []func() error{func() error { return tr.Ready() }}})

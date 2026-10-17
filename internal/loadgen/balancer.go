@@ -38,20 +38,31 @@ const maxSources = 253
 
 // Sources are loadgen's source addresses 127.0.0.2, 127.0.0.3, … (choice
 // #69): Linux answers on all of 127/8 with no setup.
-func Sources(n int) ([]net.IP, error) {
+func Sources(n int) ([]net.IP, error) { return SourcesIn(0, n) }
+
+// SourcesIn are n source addresses 127.0.netOctet.2, 127.0.netOctet.3, …:
+// loadgen instances on one stack each take their own (Plan 6b3a), so a
+// flood's connections never use a legitimate instance's ports per
+// (source, gateway) pair.
+func SourcesIn(netOctet, n int) ([]net.IP, error) {
 	if n < 1 || n > maxSources {
 		return nil, fmt.Errorf("loadgen: %d sources, want 1–%d", n, maxSources)
 	}
 	ips := make([]net.IP, n)
 	for i := range ips {
-		ips[i] = net.IPv4(127, 0, 0, byte(2+i))
+		ips[i] = net.IPv4(127, 0, byte(netOctet), byte(2+i))
 	}
 	return ips, nil
 }
 
 // NewBalancer balances over addrs from n source addresses.
 func NewBalancer(addrs []string, sources int) (*Balancer, error) {
-	srcs, err := Sources(sources)
+	return NewBalancerIn(addrs, 0, sources)
+}
+
+// NewBalancerIn balances over addrs from SourcesIn(netOctet, sources).
+func NewBalancerIn(addrs []string, netOctet, sources int) (*Balancer, error) {
+	srcs, err := SourcesIn(netOctet, sources)
 	if err != nil {
 		return nil, err
 	}
