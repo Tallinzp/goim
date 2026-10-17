@@ -1388,3 +1388,12 @@ ok   floods: every light Ping answered through the floods
 
   The other phases: light login p99 180ms, Pong p99 10ms. SDK: gw-1's population of 1,000 was back from T_death at p50 10,359ms and p99 19,841ms. The README's test count was recounted to 479.
 
+**Final review** (fresh Opus reviewer, 2026-10-16, `4e2dfa3..9942e3d`): no Critical or Important findings, ready to merge. All six Review Focus items hold as the plan expects. For item 1, every `lg_start` in `smoke`, `capacity`, `gwloss` and `slowlogic` is preceded by an `lg_stop` on every path. Six minors, left open for the user to decide:
+1. `awaitClose` registers its `context.AfterFunc` before `SetReadDeadline(from + Timeout)`. A stop that lands between the two calls has its deadline pushed back, so `Run` can return up to `Timeout` late. The slow-auth `Handshake` has a fixed deadline too. The result is written before then.
+2. In garbage mode, a `Write` error that is not `IsClosed` (e.g. `ETIMEDOUT`) is counted in `attempts` but in no outcome. It could be counted as `error`.
+3. `lg_wait` has no `kill -0` liveness check, unlike `lg_wait_online`. A crashed instance waits out the whole deadline and then shows as a `null` stat.
+4. The plan's wording: `failed + {no_slot, no_token}` is the rate that reaches the limiter. The DH rate is `failed` alone. 6b3b should say which of the two it gates on.
+5. A stale test comment, `flood_test.go`'s "then dials again at once", predates the O1 jitter.
+6. If a gateway's metrics endpoint is unreadable, the probe's `gw_sum` causes a bash arithmetic error instead of a clean FAIL.
+
+The reviewer's notes for 6b3b: register `t2_on_exit 'lg_stop_all'` rather than `'lg_stop'` in any scenario with flood instances; always pass `-source-net` to a flood instance, since nothing enforces it; raise loadgen's `-timeout` (10s) if the gateway's timeouts are set above ~9s.
