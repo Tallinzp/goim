@@ -615,3 +615,21 @@ The series now has **19 columns** (`scrape_ms` after `t_s`, `lg_refused_per_s` a
 - Windows: ramp gateway 84.6%, loadgen 29.5%, Logic 41.5%; hold gateway 55.0%. `slow.usage` over 137s: gw-0 and gw-1 2.54 / 2.55 cores, light 1.41, slow-auth 3.40, slow-handshake 0.90. `first_s.gateway_set_saturated` 7.6 (per-second 84–90% through the ramp, under a valid window), `gave_up` 18.5; `loadgen_saturated`, `pending_mem`, `stats_unanswered`, `scrape_late`, `closes_heartbeat` null.
 - **The edge (#129): 5,500/s passes at 84.6%, 6,000/s fails at 85.0%.** With these floods on this host, the slow phase holds about 5,500 legitimate logins/s (2,750 per gateway), bound by the gateways' CPU set with slow-auth's ~3.4 cores on it. Light clients begin to give up at 5,500/s (8 of 400,000), which the gate allows.
 
+**Run 30h, slow-auth off the gateways' CPUs** (2026-10-17, the user, Tier 2 host; commit `d064dc3`, `dirty` 0, 140s; `floods-20261017-065901`; `FLOODS_PHASES=slow FLOODS_RATE=7500 FLOODS_SLOW_AUTH_CPUS=0-3,12-15`, slow-auth on loadgen's set; #129). **Failed 10/12**: `slow_legit` and `slow_heartbeats` on verdict `loadgen-saturated` alone (loadgen 85.0% busy over the ramp). `dmesg` not sent.
+- **Against run 30e (7,500/s, slow-auth on the gateway set):**
+
+  | | 30e | 30h |
+  |---|---|---|
+  | gateway set busy, ramp | 88.1% | **51.5%** |
+  | `gw_runq_ms_per_s`, ramp | 1,450–2,420 | **100–270** |
+  | light handshakes refused | 50.6% | **28.1%** |
+  | gave up | 478 | **2** |
+  | gw-0 / gw-1 cores | 2.58 / 2.58 | 2.32 / 2.32 |
+  | slow-auth cores | 3.34 (gateway set) | 2.43 (loadgen set, mean 4,313 MHz) |
+  | loadgen busy, ramp | 55.3% | 85.0% |
+  | login p99 / max | 220 / 368ms | 530 / 777ms |
+  | Pong p99 / max | 55 / 124ms | 155 / 309ms |
+
+- Gated readings clean: 399,998 online, 2 gave up, failures `pre-handshake` 156,535 and `gave-up` only; `pending_mem`, Busy, `at_capacity`, `login_queue`, `no_token` 0; no heartbeat close, none missing, `ping_gap_max_ms` 30,772, `ping_tick_lag_max_ms` 764. `first_s`: `loadgen_saturated` 2.2, `gateway_set_saturated` null, `gave_up` 52.6.
+- **Reading:** runs 30e–30g measured the shared CPU set, not the gateways. With the gateways alone on their set, 7,500/s used about half of it, the run-queue wait fell tenfold, and the concurrency limit's loss fell to 28%, the same as 5,000/s with slow-auth beside them (27.3%): that ~27% is the three slots' own loss at these rates (#111), not CPU contention. The slower logins and Pongs are loadgen's, now the bound. The gateways' own edge beside these floods is above 7,500/s and is not measurable on this host with all three loadgens on 8 CPUs; Tier 3 (Plan 6d) is where it can be.
+
