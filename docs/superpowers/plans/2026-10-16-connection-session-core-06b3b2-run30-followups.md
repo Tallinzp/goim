@@ -1363,6 +1363,6 @@ Reading of the slow phase:
 - **Loadgen's CPU set was saturated:** 84% user, 3.6% idle over 244s. Its three processes used 7.94 of its 8 CPUs: the light instance 4.42 cores and 11.6GB RSS (3.5GB in garbage), slow-auth 2.68, slow-handshake 0.83. The gateways' set was 69.5% idle and logic's 94.6%.
 - **The pinger was starved, not blocked:** a 121s `Send` with a 1s write deadline, and only 37 timeouts, means the goroutine wasn't running, not that it waited on a socket. Hypothesis, not yet checked: the 8 pinger goroutines waited behind a large run queue of retrying light clients (Noise handshakes are CPU-heavy). This is the case Review Focus 3 names: large tick lag means a starved goroutine.
 - **Open questions:** how much of `slow_legit` is the gateways' own `pending_mem` and slot refusals (the spec's slow-client row expects no such refusals of legitimate clients), and how much is loadgen's saturation feeding retries. The run has no time series to order the two.
-- **Not changed:** `dmesg` wasn't sent. The README row waits.
+- **`dmesg`:** no `table full` during run 30b. The last `table full` line is from Fri Oct 16 23:14:30 PDT (run 30); run 30b ran 2026-10-17 01:54:47–02:02 PDT. Clear the buffer before later runs (`sudo dmesg -C`) to keep this unambiguous. The README row waits.
 
 - **Decided (the user, 2026-10-17), #126:** Plan 6b3b3, with own CPUs for the slow floods, a per-second slow-phase series and a loadgen-saturation verdict, then run 30c.
