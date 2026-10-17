@@ -201,10 +201,13 @@ for v in FLOODS_STORM_CLIENTS FLOODS_STORM_RATE FLOODS_CLIENTS FLOODS_RATE FLOOD
   FLOODS_SLOW_HS_PROCS FLOODS_SLOW_AUTH_PROCS; do
   case ${!v-1} in ''|*[!0-9]*|0*) echo "floods: $v must be a positive whole number" >&2; exit 1 ;; esac
 done
-# in_set LIST SET: every CPU of LIST is in SET.
+# in_set LIST SET: LIST names a CPU, and every CPU of LIST is in SET (a
+# reversed range such as 5-3 names none).
 in_set() {
-  local c set=" $(t2_cpulist_expand "$2") "
-  for c in $(t2_cpulist_expand "$1"); do [[ $set == *" $c "* ]] || return 1; done
+  local c set=" $(t2_cpulist_expand "$2") " l
+  l=$(t2_cpulist_expand "$1")
+  [ -n "$l" ] || return 1
+  for c in $l; do [[ $set == *" $c "* ]] || return 1; done
 }
 # The slow floods' CPU lists, each inside one of the three sets, so the
 # verdict reads every CPU a flood runs on (6b3b3 review O5).
@@ -477,9 +480,11 @@ lease() {
 # Pongs >= N is a floor over the whole light run, not per client: pong_missing
 # and lost catch a Ping left unanswered in the flood (O5).
 heartbeats() {
-  local r=$STACK_DIR/artifacts/loadgen-$LG_NAME.json v=${4:-null}
-  t2_check "${1}_heartbeats" "$(echo "{\"r\": $(lg_py "$r" d), \"g\": $3, \"v\": $v}" | lg_true - 'd["v"] in (None, "valid") and d["r"]["pong_missing"] == 0 and d["r"]["pongs"] >= '"$2"' and d["r"]["pong_rtt"]["max_ms"] < 10000 and d["r"]["lost"] == {} and all(v["closes_heartbeat"] == 0 for v in d["g"].values()) and d["r"]["ping_gap_max_ms"] <= '"$(((HB + 5) * 1000))")" \
-    "\"pongs\": $(lg_json 'd["pongs"]'), \"pong_missing\": $(lg_json 'd["pong_missing"]'), \"pong_rtt\": $(lg_json 'd["pong_rtt"]'), \"lost\": $(lg_json 'd["lost"]'), \"closes_heartbeat\": $(echo "$3" | lg_py - '{g: v["closes_heartbeat"] for g, v in d.items()}'), \"ping_gap_max_ms\": $(lg_json 'd["ping_gap_max_ms"]'), \"ping_tick_lag_max_ms\": $(lg_json 'd["ping_tick_lag_max_ms"]'), \"ping_send_max_ms\": $(lg_json 'd["ping_send_max_ms"]'), \"ping_send_timeouts\": $(lg_json 'd["ping_send_timeouts"]')${4:+, \"verdict\": $4}"
+  local r=$STACK_DIR/artifacts/loadgen-$LG_NAME.json v=null gate=
+  # A verdict argument, even an empty one, gates: only "valid" passes.
+  [ $# -ge 4 ] && v=${4:-null} gate='d["v"] == "valid" and '
+  t2_check "${1}_heartbeats" "$(echo "{\"r\": $(lg_py "$r" d), \"g\": $3, \"v\": $v}" | lg_true - "$gate"'d["r"]["pong_missing"] == 0 and d["r"]["pongs"] >= '"$2"' and d["r"]["pong_rtt"]["max_ms"] < 10000 and d["r"]["lost"] == {} and all(v["closes_heartbeat"] == 0 for v in d["g"].values()) and d["r"]["ping_gap_max_ms"] <= '"$(((HB + 5) * 1000))")" \
+    "\"pongs\": $(lg_json 'd["pongs"]'), \"pong_missing\": $(lg_json 'd["pong_missing"]'), \"pong_rtt\": $(lg_json 'd["pong_rtt"]'), \"lost\": $(lg_json 'd["lost"]'), \"closes_heartbeat\": $(echo "$3" | lg_py - '{g: v["closes_heartbeat"] for g, v in d.items()}'), \"ping_gap_max_ms\": $(lg_json 'd["ping_gap_max_ms"]'), \"ping_tick_lag_max_ms\": $(lg_json 'd["ping_tick_lag_max_ms"]'), \"ping_send_max_ms\": $(lg_json 'd["ping_send_max_ms"]'), \"ping_send_timeouts\": $(lg_json 'd["ping_send_timeouts"]')$([ $# -ge 4 ] && echo ", \"verdict\": $v")"
 }
 
 # set_ticks LIST: "busy total" clock ticks of LIST's CPUs since boot
@@ -501,11 +506,13 @@ runq_ns() {
 # slow_sampler FILE LIGHT FLOOD FLOOD2: appends one JSON line a second to
 # FILE until killed (#126): {"ms", "ticks": [the three loadgens' CPU
 # ticks], "sets": {"loadgen", "gateway", "logic": [busy, total]}, "lg":
-# the light instance's {"online", "gave_up", "failed"} (null when /stats
-# does not answer within 1s: a saturated loadgen answers late), "gw":
-# {gateway: SERIES_COUNTERS plus "runq_ns"}}. The clock, CPU and run-queue
-# readings come first, side by side; the scrapes after them may trail by
-# up to ~1s.
+# the light instance's {"online", "gave_up", "failed", "refused": its own
+# pre-handshake failures, a gateway's refusals} (null when /stats does not
+# answer within 1s: a saturated loadgen answers late), "gw": {gateway:
+# SERIES_COUNTERS plus "runq_ns", null if its /metrics does not answer
+# within 1s}, "ms_end": the clock after the gateways' scrapes}. The clock,
+# CPU and run-queue readings come first, side by side; the gateways'
+# scrapes trail them by ms_end - ms (up to ~2s), and /stats comes last.
 SERIES_COUNTERS=(
   handshake='goim_gateway_connections:state="handshake"'
   auth_pending='goim_gateway_connections:state="auth_pending"'
@@ -516,7 +523,7 @@ SERIES_COUNTERS=(
   closes_heartbeat='goim_gateway_closes_total:reason="heartbeat"'
 )
 slow_sampler() {
-  local ms ticks sets lg gw g p t
+  local ms ms_end ticks sets lg gw g p t
   local -A rq
   while :; do
     ms=$(date +%s%3N) ticks=""
@@ -524,14 +531,15 @@ slow_sampler() {
     sets="\"loadgen\": [$(set_ticks "$T2_CPUS_LOADGEN" | tr ' ' ,)], \"gateway\": [$(set_ticks "$T2_CPUS_GATEWAY" | tr ' ' ,)], \"logic\": [$(set_ticks "$T2_CPUS_LOGIC" | tr ' ' ,)]"
     rq=()
     for g in $(stack_admins | awk '$1 ~ /^gw-/ { print $1 }'); do rq[$g]=$(runq_ns "${STACK_PIDS[$g]}"); done
-    lg=$(LG_CURL_TIMEOUT=1 lg_get /stats '{"online": d["online"], "gave_up": d["failed"].get("gave-up", 0), "failed": sum(d["failed"].values())}')
     gw=""
     for g in "${!rq[@]}"; do
-      t=$(stack_counters "$g" "${SERIES_COUNTERS[@]}")
+      t=$(STACK_CURL_TIMEOUT=1 stack_counters "$g" "${SERIES_COUNTERS[@]}")
       [ "$t" = null ] || t="${t%\}}, \"runq_ns\": ${rq[$g]:-null}}"
       gw+="${gw:+, }\"$g\": $t"
     done
-    echo "{\"ms\": $ms, \"ticks\": [$ticks], \"sets\": {$sets}, \"lg\": ${lg:-null}, \"gw\": {$gw}}" >>"$1"
+    ms_end=$(date +%s%3N)
+    lg=$(LG_CURL_TIMEOUT=1 lg_get /stats '{"online": d["online"], "gave_up": d["failed"].get("gave-up", 0), "failed": sum(d["failed"].values()), "refused": d["failed"].get("pre-handshake", 0)}')
+    echo "{\"ms\": $ms, \"ticks\": [$ticks], \"sets\": {$sets}, \"lg\": ${lg:-null}, \"gw\": {$gw}, \"ms_end\": $ms_end}" >>"$1"
     sleep 1
   done
 }
@@ -539,11 +547,17 @@ slow_sampler() {
 # slow_series FILE: slow_sampler's lines as {"columns", "rows" (one per
 # interval between samples, t_s since the first; a column null where a
 # reading is missing), "first_s" (when each sign of trouble first showed,
-# null if never: a CPU set at >= 85% busy, /stats unanswered, a
-# pending_mem reject, a no_slot refusal, a client given up, a heartbeat
-# close), "samples"}; null if unreadable. gw_runq_ms_per_s is the larger
-# gateway's run-queue wait per second, summed over its threads: recorded,
-# not gated (6b3b3 review O2).
+# null if never: a CPU set at >= 85% busy, /stats unanswered, a gateway
+# scrape late, a pending_mem reject, a no_slot refusal, a light client
+# refused, a client given up, a heartbeat close), "samples"}; null if
+# unreadable. A sample whose gateway scrapes trailed its clock by over
+# 1.5s, or missed a gateway, gives no gateway readings: the next on-time
+# sample's rates are taken from the last on-time one, so its refusals are
+# dated late rather than early (6b3b3 final review I1, M1). no_slot counts
+# slow-auth's own refusals too; lg_refused_per_s is the light clients'
+# alone (M5). gw_runq_ms_per_s is the larger gateway's run-queue wait per
+# second, summed over its threads, null for a gateway whose total went
+# down (a thread gone, M6): recorded, not gated (6b3b3 review O2).
 slow_series() {
   python3 -c 'import json, os, sys
 rows = []
@@ -553,37 +567,47 @@ for l in open(sys.argv[1]):
     except ValueError:
         pass
 hz = os.sysconf("SC_CLK_TCK")
-cols = ["t_s", "lg_online", "lg_gave_up", "lg_failed_per_s", "light_cores", "flood_cores", "flood2_cores",
+cols = ["t_s", "scrape_ms", "lg_online", "lg_gave_up", "lg_failed_per_s", "lg_refused_per_s", "light_cores", "flood_cores", "flood2_cores",
         "loadgen_set_busy_pct", "gateway_set_busy_pct", "logic_set_busy_pct", "gw_runq_ms_per_s", "pending_max",
         "online_conns", "pending_mem_per_s", "no_slot_per_s", "logins_ok_per_s", "closes_heartbeat_per_s"]
 def busy(a, b, k):
     x, y = a["sets"].get(k, []), b["sets"].get(k, [])
     return round(100 * (y[0] - x[0]) / (y[1] - x[1]), 1) if len(x) == 2 and len(y) == 2 and y[1] > x[1] else None
+def skew(b):
+    return b["ms_end"] - b["ms"] if b.get("ms_end") is not None else None
+def on_time(b):
+    return skew(b) is not None and skew(b) <= 1500 and len(b["gw"]) > 0 and all(b["gw"].values())
 def gsum(b, k):
-    v = [g.get(k) if g else None for g in b["gw"].values()]
-    return None if not v or None in v else sum(v)
-def per_s(a, b, k, dt):
-    if set(a["gw"]) != set(b["gw"]):
+    v = [g.get(k) for g in b["gw"].values()]
+    return None if None in v else sum(v)
+def per_s(p, b, k):
+    # A counter with no sample yet in p counts 0 there (M2).
+    if p is None or set(p["gw"]) != set(b["gw"]) or None in [g.get(k) for g in b["gw"].values()]:
         return None
-    x, y = gsum(a, k), gsum(b, k)
-    return None if x is None or y is None else round((y - x) / dt, 1)
+    return round(sum(b["gw"][g][k] - (p["gw"][g].get(k) or 0) for g in b["gw"]) / ((b["ms"] - p["ms"]) / 1000), 1)
 def runq(a, b, dt):
     v = [(b["gw"][g]["runq_ns"] - a["gw"][g]["runq_ns"]) / 1e6 / dt for g in b["gw"]
          if b["gw"][g] and (a["gw"].get(g) or {}).get("runq_ns") is not None and b["gw"][g].get("runq_ns") is not None]
+    v = [x for x in v if x >= 0]
     return round(max(v), 1) if v else None
+def lrate(a, b, k, dt):
+    return round((b["lg"][k] - a["lg"][k]) / dt, 1) if b["lg"] and a["lg"] and b["lg"].get(k) is not None and a["lg"].get(k) is not None else None
 out = []
+last = rows[0] if rows and on_time(rows[0]) else None
 for a, b in zip(rows, rows[1:]):
     dt = (b["ms"] - a["ms"]) / 1000
     if dt <= 0:
         continue
     cores = [None if x is None or y is None else round((y - x) / hz / dt, 2) for x, y in zip(a["ticks"], b["ticks"])]
-    pend = [g["handshake"] + g["auth_pending"] for g in b["gw"].values() if g and g.get("handshake") is not None and g.get("auth_pending") is not None]
     lg = b["lg"]
-    out.append([round((b["ms"] - rows[0]["ms"]) / 1000, 1), lg and lg["online"], lg and lg["gave_up"],
-                round((lg["failed"] - a["lg"]["failed"]) / dt, 1) if lg and a["lg"] else None] + cores +
-               [busy(a, b, "loadgen"), busy(a, b, "gateway"), busy(a, b, "logic"), runq(a, b, dt),
-                max(pend) if pend else None, gsum(b, "online"),
-                per_s(a, b, "pending_mem", dt), per_s(a, b, "no_slot", dt), per_s(a, b, "logins_ok", dt), per_s(a, b, "closes_heartbeat", dt)])
+    gwr = [None] * 6
+    if on_time(b):
+        pend = [g["handshake"] + g["auth_pending"] for g in b["gw"].values() if g.get("handshake") is not None and g.get("auth_pending") is not None]
+        gwr = [max(pend) if pend else None, gsum(b, "online")] + [per_s(last, b, k) for k in ("pending_mem", "no_slot", "logins_ok", "closes_heartbeat")]
+        last = b
+    out.append([round((b["ms"] - rows[0]["ms"]) / 1000, 1), skew(b), lg and lg["online"], lg and lg["gave_up"],
+                lrate(a, b, "failed", dt), lrate(a, b, "refused", dt)] + cores +
+               [busy(a, b, "loadgen"), busy(a, b, "gateway"), busy(a, b, "logic"), runq(a, b, dt)] + gwr)
 c = {k: i for i, k in enumerate(cols)}
 def first(f):
     return next((r[0] for r in out if f(r)), None)
@@ -593,7 +617,9 @@ print(json.dumps({"columns": cols, "rows": out, "samples": len(rows), "first_s":
     "loadgen_saturated": first(sat("loadgen_set_busy_pct")), "gateway_set_saturated": first(sat("gateway_set_busy_pct")),
     "logic_set_saturated": first(sat("logic_set_busy_pct")),
     "stats_unanswered": first(lambda r: r[c["lg_online"]] is None),
+    "scrape_late": first(lambda r: r[c["scrape_ms"]] is None or r[c["scrape_ms"]] > 1500),
     "pending_mem": first(pos("pending_mem_per_s")), "no_slot": first(pos("no_slot_per_s")),
+    "light_refused": first(pos("lg_refused_per_s")),
     "gave_up": first(pos("lg_gave_up")), "closes_heartbeat": first(pos("closes_heartbeat_per_s"))}}))' "$1" 2>/dev/null || echo null
 }
 

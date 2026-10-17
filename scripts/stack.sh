@@ -314,12 +314,13 @@ stack_metric() {
   stack_metric_in "$body" "$2" "${3:-}"
 }
 
-# stack_metrics NAME: NAME's /metrics, once; fails if NAME does not answer.
-# With stack_metric_in, several readings come from the same scrape.
+# stack_metrics NAME: NAME's /metrics, once; fails if NAME does not answer
+# within STACK_CURL_TIMEOUT seconds (default 10). With stack_metric_in,
+# several readings come from the same scrape.
 stack_metrics() {
   local admin
   admin=$(stack_admins | awk -v n="$1" '$1 == n { print $2 }')
-  [ -n "$admin" ] && curl -sf -m 10 "http://$admin/metrics"
+  [ -n "$admin" ] && curl -sf -m "${STACK_CURL_TIMEOUT:-10}" "http://$admin/metrics"
 }
 
 # stack_metric_in BODY METRIC [MATCH]: stack_metric over a scrape already taken.

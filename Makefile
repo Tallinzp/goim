@@ -26,6 +26,7 @@ test-race-suite:
 # Needs python3, curl and redis-server (make redis-server).
 test-scripts:
 	scripts/tier2/lib_test.sh
+	scripts/tier2/floods_test.sh
 	scripts/loadgen_test.sh
 	STACK_REDIS_SERVER=$(REDIS_SERVER) scripts/stack_test.sh
 

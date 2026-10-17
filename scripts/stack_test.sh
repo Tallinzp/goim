@@ -177,6 +177,19 @@ expect "metrics: an absent sample" "$(stack_metric_in "$body" goim_no_such_metri
 expect "metrics: a label filter" "$(stack_metric_in 'goim_x{r="done"} 5
 goim_x{r="dropped"} 2' goim_x 'r="done"')" 5
 stack_metrics gw-9 >/dev/null && bad "metrics: no such process must fail" || ok "metrics: no such process fails"
+# A gateway that accepts but never answers fails within STACK_CURL_TIMEOUT,
+# so floods' 1s sampler is not held 10s by one scrape (6b3b3 final review M1).
+port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+python3 -c 'import socket, sys, time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(8); time.sleep(30)' "$port" &
+mute=$!
+sleep 0.5
+start=$SECONDS
+got=$(STACK_PORT_BASE=$((port - 102)) STACK_CURL_TIMEOUT=1 timeout 10 bash -c '. scripts/stack.sh; declare -A STACK_PIDS=([gw-0]=1); stack_counters gw-0 conns=goim_gateway_connections')
+expect "metrics: a silent gateway is null" "$got" null
+expect "metrics: within STACK_CURL_TIMEOUT" "$((SECONDS - start < 5))" 1
+kill $mute 2>/dev/null; wait $mute 2>/dev/null
 
 # stack_counters: several counters from one scrape, as JSON (Plan 6b2a). A
 # metric with no sample is null (a typo must not read 0); a label value
