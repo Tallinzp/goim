@@ -852,3 +852,27 @@ P6b3b4I-1..4, over what Task 3's runs and 6b3c build on (`wire.Key`, `Respond`/`
   | garbage gw-0 (30s, 2.59 cores) | 48.3% | 20.3% | 48.6% | — | none |
 
   `NewPrivateKey` runs only under `GenerateKeypair` (equal times in both storm profiles), never under `suite.DH`: each side parses once per handshake, its ephemeral. On gw-0 in the storm `DH` is twice `GenerateKeypair` (es and ee against one key generation), the expected 3 multiplications. The garbage profile has no `NewPrivateKey` at all and `-peek 'NewPrivateKey$'` found nothing: a garbage handshake fails at message 1's tag after its one DH (es), before the server generates its ephemeral, so it costs 1 multiplication (was 2). X25519 is still the largest cost (48% of the gateway in garbage, against run 30c's 67.7% at the doubled cost; ~25k DH/s on 2.6 cores, about 50µs a multiplication). Key generation is ~21% of the storm's gateway and ~20% of loadgen: the fixed-base step (*After this plan*) would cut most of that, if wanted.
+
+### Run 30k, `floods` at its defaults (2026-10-17, the user, Tier 2 host; commit `16f93e7`, `dirty` 0, 277s; `floods-20261017-090627`; no settings, so the light clients at 10,000/s)
+
+Asked by the user after run 30i ("should it be 10000/s?"): 10,000/s is `FLOODS_RATE`'s default and the rate run 30c failed at. **Passed 30/30**, all three phases on one stack. No swap; conntrack peaks 19 / 32 / 35. `dmesg` not sent.
+- **Storm** as run 30i: `met`, `new_per_s` 19,995, `loadgen_cores_ramp` 4.71 of 8, `no_slot_share` 0.030 (6,141), gw-0 4.14 cores; login p99 52ms.
+- **Garbage** as run 30i: `bound_by` `bucket` on both (`dh_per_s` 25,046 / 25,022), 7,207,499 attempts, `TCPSynRetrans` 8; gw-0 / gw-1 2.61 / 2.45 cores; 400,000 Pinging clients (here started at 10,000/s): 1,496,749 Pongs, none missing, p99/max 4 / 28ms.
+- **Slow at 10,000/s against run 30c (the same settings, before #130):**
+
+  | | 30c (before #130) | 30k |
+  |---|---|---|
+  | verdict | `loadgen-saturated` | **`valid`** |
+  | gateway set busy, ramp / hold | 89.6% / 55.3% | **59.9% / 35.6%** |
+  | loadgen set busy, ramp | 85.0% | **27.7%** |
+  | gw-0 / gw-1 cores | — | 1.75 / 1.74 |
+  | slow-auth cores (`flood2`) | 3.29 | **1.96** |
+  | `gw_runq_ms_per_s`, ramp | 1,500–2,500 | **130–1,160** |
+  | light handshakes refused | 57.3% (537,444) | **10.7% (47,992)** |
+  | slow-auth `pre-handshake` share | 27% | **9.4%** (79,204 of 843,518) |
+  | gave up | 1,009 | **0** |
+  | login p50 / p99 / max | 1,924 / 5,053 / 5,123ms | **6 / 58 / 113ms** |
+  | Pong p99 / max | 1,822 / 1,896ms | **5 / 28ms** |
+
+  400,000 online; `pending_mem`, Busy, `at_capacity`, `login_queue`, `no_token` 0 on both gateways; `pending_max` ≤ 59,178 of 100k; no heartbeat close, `ping_gap_max_ms` 30,021. `first_s`: only `no_slot` and `light_refused` (1.2). Highest per-second gateway-set reading 76.2% (2.3s).
+- **Reading:** `floods` passes at its own defaults, the first time since the scenario was written (runs 30–30c failed; 30d passed only at 5,000/s). At 10,000 legitimate logins/s beside 80,000 slow-handshake and 40,000 slow-auth connections, the gateways' set (with slow-auth's ~2 cores on it) stays at 60% over the ramp, so the edge #129 put at 5,500–6,000/s is now above 10,000/s on this host. The concurrency limit still refuses 10.7% of the light handshakes (retried, none given up): #111's input at the new hold.
