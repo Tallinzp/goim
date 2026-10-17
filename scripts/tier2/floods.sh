@@ -256,10 +256,12 @@ hs_sampler() {
 # per second between the first sample at 5% of N seen and the last below 95%:
 # the ramp's body, a refused client's retry included), "new_per_s" (the same
 # less the pre-handshake closes 1s earlier, the retries made by then: new
-# clients only, final review I-1), "rate_per_s" (completed, between 5% and
-# 95% of N completed, which the retries stretch), "ramp_s" (of the completed,
-# 5% to 95% interpolated), "peak_per_s" (completed), "series": [[s since the
-# first sample, completed/s, seen/s], ...] (first 120)}; null when the
+# clients only, final review I-1), "samples" (the samples new_per_s rests
+# on and their median gap in ms: a saturated loadgen answers /stats late,
+# P6b3bI-1), "rate_per_s" (completed, between 5% and 95% of N completed,
+# which the retries stretch), "ramp_s" (of the completed, 5% to 95%
+# interpolated), "peak_per_s" (completed), "series": [[s since the first
+# sample, completed/s, seen/s, new/s], ...] (first 120)}; null when the
 # samples never reach 95% of N completed.
 hs_rate() {
   python3 -c 'import json, sys
@@ -295,19 +297,28 @@ def pre_at(t):
     return rows[-1][3]
 # A close is retried 0.5-1.5s later, so the retries made by a sample are
 # about the closes 1s before it; a close still waiting is no retry yet.
-new, _ = per_s(lambda r: r[1] + r[2] - pre_at(r[0] - 1000))
+fnew = lambda r: r[1] + r[2] - pre_at(r[0] - 1000)
+new, _ = per_s(fnew)
 if rate is None:
     print("null"); sys.exit()
-pts = [((t1 - rows[0][0]) / 1000, (c1 - c0) * 1000 / (t1 - t0), (c1 + x1 - c0 - x0) * 1000 / (t1 - t0)) for (t0, c0, x0, _), (t1, c1, x1, _) in zip(rows, rows[1:]) if t1 > t0]
-print(json.dumps({"seen_per_s": seen, "new_per_s": new, "rate_per_s": rate, "ramp_s": ramp, "peak_per_s": round(max(p[1] for p in pts)),
-       "series": [[round(t, 1), round(v), round(w)] for t, v, w in pts[:120]]}))' "$1" "$2" 2>/dev/null || echo null
+nb = [r[0] for r in rows if 0.05 * n <= fnew(r) < 0.95 * n]
+gaps = sorted(b - a for a, b in zip(nb, nb[1:]))
+pts = [((r1[0] - rows[0][0]) / 1000, (r1[1] - r0[1]) * 1000 / (r1[0] - r0[0]), (r1[1] + r1[2] - r0[1] - r0[2]) * 1000 / (r1[0] - r0[0]),
+        (fnew(r1) - fnew(r0)) * 1000 / (r1[0] - r0[0])) for r0, r1 in zip(rows, rows[1:]) if r1[0] > r0[0]]
+print(json.dumps({"seen_per_s": seen, "new_per_s": new, "samples": {"n": len(nb), "gap_ms": gaps[len(gaps) // 2] if gaps else None},
+       "rate_per_s": rate, "ramp_s": ramp, "peak_per_s": round(max(p[1] for p in pts)),
+       "series": [[round(t, 1), round(v), round(w), round(x)] for t, v, w, x in pts[:120]]}))' "$1" "$2" 2>/dev/null || echo null
 }
 
 # settled N and logged_in N: /stats conditions for N light clients. Settled:
 # the ramp is done and each client is online or gave up. Logged in: all N
 # online, or each one that is not gave up after pre-handshake closes only,
 # the concurrency limit's loss that parked #111 is about (O2); any other
-# failure (Busy, a reject, a timeout) still fails.
+# failure (Busy, a reject, a timeout) still fails. The failures are read
+# over all N, since loadgen keeps no reasons per client: with every client
+# online a failure some client recovered from passes, while with one client
+# given up the same failure anywhere fails (always on the failing side,
+# P6b3bI-4).
 settled() { echo 'd["ramp_done"] and d["online"] + d["failed"].get("gave-up", 0) >= '"$1"; }
 logged_in() {
   echo 'd["online"] == '"$1"' or (d["online"] + d["failed"].get("gave-up", 0) == '"$1"' and set(d["failed"]) <= {"pre-handshake", "gave-up"})'
@@ -368,7 +379,7 @@ phase_storm() {
   [ "$online" = true ] || online=false # a null /stats reading fails the check, not the run
   t2_check storm_online "$online" "\"want\": $n, \"online\": $(lg_get /stats 'd["online"]'), \"gave_up\": $(lg_get /stats 'd["failed"].get("gave-up", 0)'), \"failed\": $(lg_get /stats 'd["failed"]'), \"login_latency\": $(lg_get /stats 'd["login_latency"]')"
   t2_check storm_rate "$(echo "$hs" | lg_true - 'd["new_per_s"] >= 0.9 * '"$rate")" \
-    "\"rate\": $rate, \"handshakes\": $(echo "$hs" | lg_py - '{k: d[k] for k in ("new_per_s", "seen_per_s", "rate_per_s", "ramp_s", "peak_per_s")}'), \"loadgen_cores\": $(echo "$usage" | lg_py - 'd["loadgen"]["cores"]'), \"gateway_cores\": $(echo "$usage" | lg_py - 'd["gw-0"]["cores"]')"
+    "\"rate\": $rate, \"handshakes\": $(echo "$hs" | lg_py - '{k: d[k] for k in ("new_per_s", "samples", "seen_per_s", "rate_per_s", "ramp_s", "peak_per_s")}'), \"loadgen_cores\": $(echo "$usage" | lg_py - 'd["loadgen"]["cores"]'), \"gateway_cores\": $(echo "$usage" | lg_py - 'd["gw-0"]["cores"]')"
   t2_check storm_bucket "$(echo "$d" | lg_true - 'd["gw-0"]["hs_no_token"] == 0')" \
     "\"gw-0\": $(echo "$d" | lg_py - '{k: d["gw-0"][k] for k in ("hs_ok", "hs_no_token", "hs_no_slot", "rejects_handshake_rate", "logins_busy", "rejects_pending_mem", "rejects_at_capacity")}'), \"no_slot_share\": $(echo "$d" | lg_py - 'round(d["gw-0"]["hs_no_slot"] / (d["gw-0"]["hs_ok"] + d["gw-0"]["hs_no_slot"]), 4)'), \"failed\": $(lg_get /stats 'd["failed"]')"
   t2_field storm "{\"clients\": $n, \"rate\": $rate, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"usage\": $usage, \"handshakes\": $hs, \"gateways\": $d, \"login_latency\": $(lg_get /stats 'd["login_latency"]'), \"failed\": $(lg_get /stats 'd["failed"]')}"
