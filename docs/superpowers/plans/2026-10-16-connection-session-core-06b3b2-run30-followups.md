@@ -1365,3 +1365,4 @@ Reading of the slow phase:
 - **Open questions:** how much of `slow_legit` is the gateways' own `pending_mem` and slot refusals (the spec's slow-client row expects no such refusals of legitimate clients), and how much is loadgen's saturation feeding retries. The run has no time series to order the two.
 - **Not changed:** `dmesg` wasn't sent. The README row waits.
 
+- **Decided (the user, 2026-10-17), #126:** Plan 6b3b3, with own CPUs for the slow floods, a per-second slow-phase series and a loadgen-saturation verdict, then run 30c.
