@@ -597,8 +597,15 @@ The series now has **19 columns** (`scrape_ms` after `t_s`, `lg_refused_per_s` a
   | light rate | verdict | gateway set (ramp) | loadgen (ramp) | refused share of light handshakes | gave up | login p99 |
   |---|---|---|---|---|---|---|
   | 5,000/s (30d) | `valid` | 82.2% | 26.0% | 27.3% | 0 | 56ms |
+  | 6,000/s (30f) | `gateway-set-saturated` | 85.0% | 31.6% | 37.0% | 20 | 62ms |
   | 7,500/s (30e) | `gateway-set-saturated` | 88.1% | 55.3% | 50.6% | 478 | 220ms |
   | 10,000/s (30c) | `loadgen-saturated` | 89.6% | 85.0% | 57.3% | 1,009 | 5,053ms |
 
   On this host the edge lies between 5,000 and 7,500/s, and it is the gateways' CPU set, which slow-auth shares (3.3 cores of its 12), that binds first. At every rate no legitimate client was refused for memory, capacity or the Login queue and every Ping was answered; what grows is the concurrency limit's loss, which doubles past 5,000/s and makes clients give up in light mode's 10 attempts (the SDK backs off instead). That loss is #111's input; the spec has the client treat it as a `Busy` retry (*Admission control*), which the slow-client flood bullet's "no `Busy`" does not gate (#122, review O2).
+
+**Run 30f, the edge narrowed** (2026-10-17, the user, Tier 2 host; commit `d064dc3`, `dirty` 0, 153s; `floods-20261017-064445`; `FLOODS_PHASES=slow FLOODS_RATE=6000`, the user's choice over the suggested 6,250; #129). **Failed 10/12**: `slow_legit` and `slow_heartbeats` on verdict `gateway-set-saturated` alone, the gateway set at 85.0% busy over the ramp (15.0% idle), exactly the threshold. `dmesg | grep -i conntrack` empty; `slow_conntrack` peak 29.
+- **Gated readings clean:** 399,980 online and 20 gave up, failures `pre-handshake` 235,304 and `gave-up` only; `rejects_pending_mem`, `logins_busy`, `at_capacity`, `login_queue`, `no_token` 0 on both; `hs_no_slot` 239,019 / 240,857. Login p50/p99/max 7 / 62 / 193ms. 1,329,727 Pongs, none missing, Pong p99/max 6 / 86ms, no heartbeat close, `ping_gap_max_ms` 30,032.
+- **Windows:** ramp: gateway 85.0%, loadgen 31.6%, Logic 42.3%. Hold: gateway 55.2%, loadgen 4.2%. `slow.usage` over 132s: gw-0 and gw-1 2.55 cores each, light 1.56, slow-auth 3.38, slow-handshake 0.90.
+- **Order (`first_s`):** `gateway_set_saturated` 4.4 (85–93% per second through the ramp), `no_slot` and `light_refused` 1.1, `gave_up` 12.0; `loadgen_saturated`, `pending_mem`, `stats_unanswered`, `scrape_late`, `closes_heartbeat` null. `gw_runq_ms_per_s` 1,070–2,380 in the ramp.
+- **The edge (#129):** with these floods on this host, 5,000/s is valid and 6,000/s sits on the 85% line, so the slow phase's edge is about 5,000–6,000 legitimate logins/s (2,500–3,000 per gateway), bound by the gateways' CPU set with slow-auth's ~3.4 cores on it. The concurrency limit's loss grows with the rate (27% → 37% → 51% → 57%) and light clients start giving up from 6,000/s.
 
