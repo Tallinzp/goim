@@ -159,3 +159,27 @@ func TestConcurrentRespondsOnOneKey(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// A finished handshake forgets its keys: each Session keeps the suite in its
+// CipherStates for the whole connection, and needs only its cipher (final
+// review I1: +400 B and the ephemeral per live connection otherwise).
+func TestASessionKeepsNoHandshakeKeys(t *testing.T) {
+	k := key(t)
+	cli, srv := newSuite(nil), newSuite(k.priv)
+	in, f1, err := initiate(cli, 1, k.Public, cmdHandshake, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, f2, err := respond(srv, k, f1, cmdHandshake, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := in.Finish(f2); err != nil {
+		t.Fatal(err)
+	}
+	for name, s := range map[string]*suite{"client": cli, "server": srv} {
+		if s.keys != [2]*ecdh.PrivateKey{} || s.raw[0] != nil || s.raw[1] != nil {
+			t.Errorf("%s suite still keeps its keys", name)
+		}
+	}
+}

@@ -88,3 +88,32 @@ func benchKey(b *testing.B) Key {
 	}
 	return k
 }
+
+// BenchmarkSessionHeap reports the live heap one server Session keeps for its
+// connection's life (final review I1).
+func BenchmarkSessionHeap(b *testing.B) {
+	k := benchKey(b)
+	frames := make([][]byte, b.N)
+	for i := range frames {
+		_, f, err := Initiate(1, k.Public, cmdHandshake)
+		if err != nil {
+			b.Fatal(err)
+		}
+		frames[i] = f
+	}
+	ss := make([]*Session, b.N)
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	for i := range ss {
+		s, _, err := Respond(k, frames[i], cmdHandshake)
+		if err != nil {
+			b.Fatal(err)
+		}
+		ss[i] = s
+	}
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	b.ReportMetric(float64(int64(after.HeapAlloc)-int64(before.HeapAlloc))/float64(b.N), "heap-B/op")
+	runtime.KeepAlive(ss)
+}

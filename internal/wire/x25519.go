@@ -67,6 +67,11 @@ func (s *suite) GenerateKeypair(rng io.Reader) (noise.DHKey, error) {
 	return noise.DHKey{Private: b, Public: k.PublicKey().Bytes()}, nil
 }
 
+// forget drops the kept keys once the handshake's DHs are done. The Session's
+// CipherStates keep the suite for the connection's life and use only its
+// cipher (final review I1).
+func (s *suite) forget() { s.keys, s.raw = [2]*ecdh.PrivateKey{}, [2][]byte{} }
+
 // DH uses the kept key whose bytes are priv, else parses priv. Like
 // curve25519.X25519 it fails on a public key that isn't 32 bytes and on an
 // all-zero result (a low-order point).

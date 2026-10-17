@@ -160,6 +160,7 @@ func respond(cs noise.CipherSuite, key Key, frame []byte, cmd uint16, rng io.Rea
 	}
 	out := make([]byte, HeaderLen, HeaderLen+HandshakeMsgLen)
 	out, c1, c2, err := hs.WriteMessage(out, nil)
+	forget(cs)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -170,6 +171,7 @@ func respond(cs noise.CipherSuite, key Key, frame []byte, cmd uint16, rng io.Rea
 // Initiator is the client side of a handshake in progress.
 type Initiator struct {
 	hs  *noise.HandshakeState
+	cs  noise.CipherSuite
 	cmd uint16
 }
 
@@ -194,7 +196,7 @@ func initiate(cs noise.CipherSuite, keyID uint16, serverPub []byte, cmd uint16, 
 	if err != nil {
 		return nil, nil, err
 	}
-	return &Initiator{hs: hs, cmd: cmd}, frame, nil
+	return &Initiator{hs: hs, cs: cs, cmd: cmd}, frame, nil
 }
 
 // Finish completes the client side with the server's handshake frame. Its
@@ -205,6 +207,7 @@ func (i *Initiator) Finish(frame []byte) (*Session, error) {
 		return nil, ErrHandshake
 	}
 	payload, c1, c2, err := i.hs.ReadMessage(nil, frame[HeaderLen:])
+	forget(i.cs)
 	switch {
 	case err != nil:
 		return nil, fmt.Errorf("%w: %v", ErrHandshake, err)
@@ -212,6 +215,14 @@ func (i *Initiator) Finish(frame []byte) (*Session, error) {
 		return nil, ErrPayload
 	}
 	return &Session{send: c1, recv: c2}, nil
+}
+
+// forget drops a suite's kept keys after the handshake's last DH: the
+// Session keeps the suite (final review I1).
+func forget(cs noise.CipherSuite) {
+	if s, ok := cs.(*suite); ok {
+		s.forget()
+	}
 }
 
 // Seal appends one encrypted frame to dst: the header, then
