@@ -29,6 +29,7 @@ procs=$((ncpu / 2 > 1 ? ncpu / 2 : 1))
 
 # The ports checked before stack_up include loadgen's control port.
 grep -qx $((STACK_PORT_BASE + 5)) <<<"$(stack_ports)" && ok "ports: loadgen's control port" || bad "ports: loadgen's control port missing"
+grep -qx $((STACK_PORT_BASE + 8)) <<<"$(stack_ports)" && ok "ports: the 4th loadgen instance's control port" || bad "ports: the 4th loadgen instance's control port missing"
 
 # stack_metric prints byte-sized sums whole, as Prometheus writes them
 # (5.36870912e+09), also under an awk whose %d stops at 2^31 (busybox; 6b1

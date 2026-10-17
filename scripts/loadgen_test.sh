@@ -64,4 +64,68 @@ expect "wait_online: a 2s wait ends by its deadline" "$((SECONDS - start <= 5))"
 expect "wait_online: gave up on the deadline, not on loadgen" "$(grep -c "online and failed after" "$dir/online.err")" 1
 kill $slow 2>/dev/null; wait $slow 2>/dev/null
 
+# Instances (P6a2bI-1), with a fake loadgen that serves /stats on its
+# -control port, and at SIGTERM writes its -out and exits $FAKE_EXIT.
+(
+  STACK_DIR=$dir/stack
+  mkdir -p "$STACK_DIR/bin"
+  cat >"$STACK_DIR/bin/loadgen" <<'PY'
+#!/usr/bin/env python3
+import http.server, json, os, signal, sys
+a = sys.argv[1:]
+host, port = a[a.index("-control") + 1].rsplit(":", 1)
+out = a[a.index("-out") + 1]
+doc = json.dumps({"out": os.path.basename(out), "mode": a[a.index("-mode") + 1]}).encode()
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.send_header("Content-Length", str(len(doc))); self.end_headers(); self.wfile.write(doc)
+    def log_message(self, *x): pass
+def term(*_):
+    open(out, "wb").write(doc)
+    os._exit(int(os.environ.get("FAKE_EXIT", "0")))
+signal.signal(signal.SIGTERM, term)
+http.server.HTTPServer((host, int(port)), H).serve_forever()
+PY
+  chmod +x "$STACK_DIR/bin/loadgen"
+  STACK_PORT_BASE=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+  T2_OURS_PGIDS=()
+  lg_start a -mode light || echo "FAIL inst: main did not start"
+  main_pid=$LG_PID
+  LG_ENV=(FAKE_EXIT=3)
+  STACK_PIN=1 T2_CPUS_LOADGEN=0 LG_CPUS=1 lg_in flood lg_start b -mode garbage || echo "FAIL inst: flood did not start"
+  expect "inst: main's control port is base + 5" "$(lg_control)" "127.0.0.1:$((STACK_PORT_BASE + 5))"
+  expect "inst: flood's control port is base + 6" "$(lg_in flood lg_control)" "127.0.0.1:$((STACK_PORT_BASE + 6))"
+  expect "inst: main answers as main" "$(lg_get /stats 'd["out"]')" '"loadgen-a.json"'
+  expect "inst: flood answers as flood" "$(lg_in flood lg_get /stats 'd["mode"]')" '"garbage"'
+  expect "inst: LG_PID is main's again after lg_in" "$LG_PID" "$main_pid"
+  expect "inst: LG_CPUS pins the flood" "$(taskset -pc "${LG_PIDS[flood]}" | awk '{print $NF}')" 1
+  out=$(lg_start c -mode light 2>&1)
+  expect "inst: a second start of a running instance is refused" "$? $out" "1 loadgen: instance main already runs (a)"
+  out=$(lg_in probe lg_start a -mode light 2>&1)
+  expect "inst: another instance's running name is refused" "$? $out" "1 loadgen: name a is instance main's"
+  lg_in x3 true && lg_in x4 true # main, flood, x3, x4 (probe was named in a subshell only)
+  out=$(lg_in x5 true 2>&1)
+  expect "inst: a 5th instance is refused" "$? $out" "1 loadgen: instance x5: already 4 instances"
+  lg_wait 'd["mode"] == "light"' 2
+  expect "wait: a true expression" "$?" 0
+  start=$SECONDS
+  lg_wait 'd["mode"] == "sdk"' 1
+  expect "wait: a false one fails by its deadline" "$? $((SECONDS - start <= 2))" "1 1"
+  flood_pid=${LG_PIDS[flood]}
+  lg_in flood lg_stop
+  expect "inst: the flood stopped" "$(kill -0 "$flood_pid" 2>/dev/null && echo running || echo stopped) ${LG_STATUSES[flood]}" "stopped 3"
+  expect "inst: LG_STATUS is main's after lg_in" "[$LG_STATUS]" "[]"
+  expect "inst: main still runs" "$(kill -0 "$LG_PID" 2>/dev/null && echo running)" running
+  expect "inst: the flood's result" "$(lg_in flood lg_json 'd["out"]')" '"loadgen-b.json"'
+  lg_in flood lg_start b2 -mode slow-auth || echo "FAIL inst: a stopped instance did not start again"
+  LG_ENV=()
+  expect "inst: a stopped instance runs again under a new name" "$(lg_in flood lg_get /stats 'd["mode"]')" '"slow-auth"'
+  lg_stop_all
+  expect "inst: lg_stop_all stopped main" "$(kill -0 "$main_pid" 2>/dev/null && echo running || echo stopped) ${LG_STATUSES[main]} [$LG_PID]" "stopped 0 []"
+  expect "inst: LG_STATUS is main's after lg_stop_all" "$LG_STATUS ${LG_STATUSES[flood]}" "0 3"
+  expect "inst: the restarted instance's result" "$(lg_in flood lg_json 'd["out"]')" '"loadgen-b2.json"'
+  expect "inst: main's result" "$(lg_json 'd["out"]')" '"loadgen-a.json"'
+) | tee "$dir/inst.out"
+fails=$((fails + $(grep -c '^FAIL' "$dir/inst.out")))
+
 [ "$fails" -eq 0 ] && echo "loadgen_test: all passed" || { echo "loadgen_test: $fails failed"; exit 1; }

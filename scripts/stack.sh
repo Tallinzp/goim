@@ -104,12 +104,12 @@ stack_wait() {
 # that hangs (a DROP rule) counts as busy instead of blocking for minutes.
 stack_port_free() { timeout 2 bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$0"' "$1" 2>/dev/null; [ $? -eq 1 ]; }
 
-# stack_ports: every port stack_up listens on, and loadgen's control port
-# (base + 5, scripts/loadgen.sh): a leftover loadgen there would answer
-# lg_start's /stats in place of the new one.
+# stack_ports: every port stack_up listens on, and loadgen's control ports
+# (base + 5 … + 8, one per instance, scripts/loadgen.sh): a leftover loadgen
+# there would answer lg_start's /stats in place of the new one.
 stack_ports() {
   local base=${STACK_PORT_BASE:-17000} i
-  seq "$base" $((base + 5))
+  seq "$base" $((base + 8))
   for ((i = 0; i < ${STACK_GATEWAYS:-1}; i++)); do
     echo $((base + 100 + 10 * i)) $((base + 101 + 10 * i)) $((base + 102 + 10 * i))
   done
