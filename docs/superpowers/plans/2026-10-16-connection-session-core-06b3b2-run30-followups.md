@@ -1366,3 +1366,4 @@ Reading of the slow phase:
 - **`dmesg`:** no `table full` during run 30b. The last `table full` line is from Fri Oct 16 23:14:30 PDT (run 30); run 30b ran 2026-10-17 01:54:47–02:02 PDT. Clear the buffer before later runs (`sudo dmesg -C`) to keep this unambiguous. The README row waits.
 
 - **Decided (the user, 2026-10-17), #126:** Plan 6b3b3, with own CPUs for the slow floods, a per-second slow-phase series and a loadgen-saturation verdict, then run 30c.
+- **Run 30c: see Plan 6b3b3** (2026-10-17, failed 28/30 on the slow phase's verdict alone; #128 rerun 30d).
