@@ -254,6 +254,8 @@ t2_notrack_covers 17067 >/dev/null; expect "notrack range: 4 gateways' last port
 why=$(t2_notrack_covers 17068); expect "notrack range: past the end refused" "$?" 1
 contains "notrack range: says the range" "$why" "17000-17199"
 t2_notrack_covers 16999 >/dev/null; expect "notrack range: below refused" "$?" 1
+why=$(t2_notrack_covers 17x00 2>&1); expect "notrack range: not a number refused" "$?" 1
+contains "notrack range: not a number says so" "$why" "STACK_PORT_BASE 17x00 is not a port number"
 for bad_args in "add 80" "add 01167" "add 70000" "add 21100x" "add" "add 1 2" "drop 21100" "--print flush" "notrack 17000" "notrack-check x" "--print notrack-check"; do
   # shellcheck disable=SC2086
   scripts/tier2/goim-netdrop $bad_args >/dev/null 2>&1; expect "netdrop: refuses '$bad_args'" "$?" 2

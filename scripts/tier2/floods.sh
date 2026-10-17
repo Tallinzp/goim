@@ -327,6 +327,15 @@ hs_sampler() {
     sleep 1
   done
 }
+# storm_verdict RATE: the lg_py expression for storm_rate's verdict, on
+# {"h": hs_rate's reading, "cpus": loadgen's CPUs}: met, loadgen-bound (a
+# ramp reading at >= 85% of a non-empty CPU set) or short.
+storm_verdict() {
+  echo '"met" if ((d["h"] or {}).get("new_per_s") or 0) >= 0.9 * '"$1"' else "loadgen-bound" if d["cpus"] > 0 and (d["h"] or {}).get("loadgen_cores_ramp") is not None and d["h"]["loadgen_cores_ramp"] >= 0.85 * d["cpus"] else "short"'
+}
+# slots_only: the gateways whose bucket refused nothing while their slots did.
+slots_only='[g for g, v in d.items() if v["hs_no_token"] == 0 and v["hs_no_slot"] > 0]'
+
 # hs_rate FILE N: {"seen_per_s" (handshakes the gateway saw, ok or refused,
 # per second between the first sample at 5% of N seen and the last below 95%:
 # the ramp's body, a refused client's retry included), "new_per_s" (the same
@@ -463,12 +472,13 @@ phase_storm() {
   [ "$online" = true ] || online=false # a null /stats reading fails the check, not the run
   t2_check storm_online "$online" "\"want\": $n, \"online\": $(lg_get /stats 'd["online"]'), \"gave_up\": $(lg_get /stats 'd["failed"].get("gave-up", 0)'), \"failed\": $(lg_get /stats 'd["failed"]'), \"login_latency\": $(lg_get /stats 'd["login_latency"]')"
   # The verdict: met, loadgen-bound (loadgen at >= 85% of its CPUs over the
-  # ramp new_per_s reads) or short (a reading missing included).
-  rated=$(echo "{\"h\": $hs, \"cpus\": $(t2_cpulist_expand "$T2_CPUS_LOADGEN" | wc -w)}" | lg_py - \
-    '"met" if ((d["h"] or {}).get("new_per_s") or 0) >= 0.9 * '"$rate"' else "loadgen-bound" if ((d["h"] or {}).get("loadgen_cores_ramp") or 0) >= 0.85 * d["cpus"] else "short"')
+  # ramp new_per_s reads) or short (a reading missing included). The CPUs
+  # are the set lg_start pinned loadgen to.
+  lgcpus=$(t2_cpulist_expand "${LG_CPUS:-$T2_CPUS_LOADGEN}" | wc -w)
+  rated=$(echo "{\"h\": $hs, \"cpus\": $lgcpus}" | lg_py - "$(storm_verdict "$rate")")
   [ "$rated" = '"loadgen-bound"' ] && t2_not_covered "storm: $rate new clients/s at the gateway; loadgen was the bound (storm_rate.loadgen_cores_ramp)"
   t2_check storm_rate "$(echo "$rated" | lg_true - 'd in ("met", "loadgen-bound")')" \
-    "\"verdict\": $rated, \"rate\": $rate, \"handshakes\": $(echo "$hs" | lg_py - '{k: d[k] for k in ("new_per_s", "samples", "seen_per_s", "rate_per_s", "ramp_s", "peak_per_s")}'), \"loadgen_cores_ramp\": $(echo "$hs" | lg_py - 'd["loadgen_cores_ramp"]'), \"loadgen_cores\": $(echo "$usage" | lg_py - 'd["loadgen"]["cores"]'), \"loadgen_cpus\": $(t2_cpulist_expand "$T2_CPUS_LOADGEN" | wc -w), \"gateway_cores\": $(echo "$usage" | lg_py - 'd["gw-0"]["cores"]')"
+    "\"verdict\": $rated, \"rate\": $rate, \"handshakes\": $(echo "$hs" | lg_py - '{k: d[k] for k in ("new_per_s", "samples", "seen_per_s", "rate_per_s", "ramp_s", "peak_per_s")}'), \"loadgen_cores_ramp\": $(echo "$hs" | lg_py - 'd["loadgen_cores_ramp"]'), \"loadgen_cores\": $(echo "$usage" | lg_py - 'd["loadgen"]["cores"]'), \"loadgen_cpus\": $lgcpus, \"gateway_cores\": $(echo "$usage" | lg_py - 'd["gw-0"]["cores"]')"
   t2_check storm_bucket "$(echo "$d" | lg_true - 'd["gw-0"]["hs_no_token"] == 0')" \
     "\"gw-0\": $(echo "$d" | lg_py - '{k: d["gw-0"][k] for k in ("hs_ok", "hs_no_token", "hs_no_slot", "rejects_handshake_rate", "logins_busy", "rejects_pending_mem", "rejects_at_capacity")}'), \"no_slot_share\": $(echo "$d" | lg_py - 'round(d["gw-0"]["hs_no_slot"] / (d["gw-0"]["hs_ok"] + d["gw-0"]["hs_no_slot"]), 4)'), \"failed\": $(lg_get /stats 'd["failed"]')"
   t2_field storm "{\"clients\": $n, \"rate\": $rate, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"usage\": $usage, \"cpu_sets\": $(t2_cpusets_json "$STACK_DIR/cpustat-0" "$STACK_DIR/cpustat-1"), \"conntrack_stat\": $(ct_stat_json "$STACK_DIR/ctstat-0" "$STACK_DIR/ctstat-1"), \"handshakes\": $hs, \"gateways\": $d, \"login_latency\": $(lg_get /stats 'd["login_latency"]'), \"failed\": $(lg_get /stats 'd["failed"]')}"
@@ -525,8 +535,9 @@ phase_garbage() {
     "\"rate\": $grate, \"seconds\": $secs, \"want\": $want, \"attempts\": $(echo "$flood" | lg_py - 'd["attempts"]'), \"skipped\": $(echo "$flood" | lg_py - 'd["skipped"]'), \"outcomes\": $(echo "$flood" | lg_py - 'd["outcomes"]'), \"held\": $(echo "$flood" | lg_py - 'd["held"]'), \"gateways\": $(echo "$d" | lg_py - '{g: {k: v[k] for k in ("hs_ok", "hs_failed", "hs_no_slot", "hs_no_token", "rejects_handshake_rate")} for g, v in d.items()}'), \"timewait\": [$tw0, $tw1], \"tcp\": $(t2_tcpstat_json "$STACK_DIR/tcp0" "$STACK_DIR/tcp1"), \"cpu_sets\": $(t2_cpusets_json "$STACK_DIR/cpustat-0" "$STACK_DIR/cpustat-1"), \"conntrack_stat\": $(ct_stat_json "$STACK_DIR/ctstat-0" "$STACK_DIR/ctstat-1")"
   t2_check garbage_limited "$(echo "$d" | lg_true - 'all(v["hs_no_slot"] + v["hs_no_token"] > 0 for v in d.values())')" \
     "\"refused\": $(echo "$d" | lg_py - '{g: {"no_slot": v["hs_no_slot"], "no_token": v["hs_no_token"], "bound_by": "bucket" if v["hs_no_token"] > 0 else "slots" if v["hs_no_slot"] > 0 else None} for g, v in d.items()}'), \"dh_per_s\": $(echo "$d" | lg_py - '{g: round(v["hs_failed"] / '"$secs"') for g, v in d.items()}'), \"bucket\": ${FLOODS_GARBAGE_BUCKET:-25000}"
-  [ "$(echo "$d" | lg_true - 'all(v["hs_no_token"] == 0 and v["hs_no_slot"] > 0 for v in d.values())')" = true ] &&
-    t2_not_covered "garbage: the bucket (${FLOODS_GARBAGE_BUCKET:-25000}/s) refused nothing; the concurrency limit bound first (garbage_limited.dh_per_s)"
+  for g in $(echo "$d" | lg_py - "$slots_only" | tr -d '[]",'); do
+    t2_not_covered "garbage: the bucket (${FLOODS_GARBAGE_BUCKET:-25000}/s) refused nothing on $g; the concurrency limit bound first (garbage_limited.dh_per_s)"
+  done
   heartbeats garbage "$on" "$d"
   lease garbage "$d" "$lease_s" "$(stack_counters_delta "$l0" "$l1")"
   t2_field garbage "{\"clients\": $n, \"rate\": $rate, \"garbage_rate\": $grate, \"inflight\": $inflight, \"seconds\": $secs, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"usage\": $usage, \"cpu_sets\": $(t2_cpusets_json "$STACK_DIR/cpustat-0" "$STACK_DIR/cpustat-1"), \"conntrack_stat\": $(ct_stat_json "$STACK_DIR/ctstat-0" "$STACK_DIR/ctstat-1"), \"gateways\": $d, \"flood\": $flood}"

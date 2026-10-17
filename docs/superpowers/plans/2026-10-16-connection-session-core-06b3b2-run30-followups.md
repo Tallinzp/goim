@@ -1251,7 +1251,7 @@ Expected: `lib_test`, `loadgen_test` and `stack_test` print `all passed`, and `m
 - [ ] **Step 1: Host setup (the user, on the Tier 2 host, once)**
 
 After `git fetch && git switch feat/plan6b3 && git pull`:
-1. `sudo iptables -S INPUT`: `lo` is accepted before any `--ctstate` rule, or the policy is `ACCEPT`. Then `sudo nft list ruleset`: no input hook chain accepts only by `ct state` without an earlier `iifname "lo" accept` (Review Focus 2).
+1. `sudo iptables -S INPUT` and `sudo iptables -S OUTPUT`: in each, `lo` (`-i lo` in INPUT, `-o lo` in OUTPUT) is accepted before any `--ctstate` rule, or the policy is `ACCEPT` (final review M5: an OUTPUT chain that accepts only `ESTABLISHED` drops UNTRACKED packets too). Then `sudo nft list ruleset`: no input or output hook chain accepts only by `ct state` without an earlier `iifname "lo" accept` / `oifname "lo" accept` (Review Focus 2). `host-setup.sh` prints these three commands at its end.
 2. `sudo scripts/tier2/host-setup.sh`: expect `installed: /usr/local/sbin/goim-netdrop` (it changed), `applied: NOTRACK for ports 17000-17199 on lo`, `host-setup: done`.
 3. `sudo -n /usr/local/sbin/goim-netdrop notrack-check; echo $?` prints `0` only. `sudo iptables -t raw -S` shows the four `goim-notrack` rules.
 
@@ -1325,7 +1325,7 @@ Push the branch. Fast-forwarding `main` is the user's call.
 
 **Final review** (Opus, fresh context) found 0 Critical and 1 Important.
 - **I-1, fixed `f82adb2`:** no test ran the pinger's real `send`, so nothing would catch a missing `SetWriteDeadline`. The new test is `TestPingerTimesOutABlockedSend/the_real_Send`: a handshaken `net.Pipe` whose peer never reads. It fails with the deadline line removed and passes with it.
-- **Minors, deferred (the user decides):**
+- **Minors, all fixed on the user's request** (see the fix line below):
   1. The storm verdict counts `T2_CPUS_LOADGEN`, not `lg_start`'s `${LG_CPUS:-…}`. With an empty set and a null reading it would give `loadgen-bound`.
   2. The bucket's `not_covered` line is written only when every gateway is bound by the slots alone, so a mixed case writes none.
   3. The write deadline stays set after a Ping, so a write added later in `read()` would inherit it.
@@ -1335,3 +1335,14 @@ Push the branch. Fast-forwarding `main` is the user's call.
   7. Each Ping takes the Recorder lock 2–3 times. Watch `ping_send_max_ms` in run 30b.
 
 Next: Task 5 on the host (the user): `sudo scripts/tier2/host-setup.sh` after the firewall checks, then run 30b.
+
+**Minors fixed 2026-10-17** (the user: "fix all the minors"):
+1. `storm_verdict` counts `${LG_CPUS:-$T2_CPUS_LOADGEN}` and needs a non-empty set and a non-null reading. Checked on JSON: the old expression gave `loadgen-bound` with 0 CPUs and no reading, the new one `short`.
+2. The bucket's `not_covered` line is written per gateway bound by the slots alone (`slots_only`). Checked on JSON: mixed → `gw-1`, both → `gw-0 gw-1`, none → empty.
+3. `lightConn.c`'s comment says only the pinger writes after login and its deadline stays set.
+4. `start` is taken before `NewTicker`.
+5. Task 5's check covers `OUTPUT` too, and `host-setup.sh` names the three commands.
+6. `t2_notrack_covers` refuses a non-numeric base with a message. New `lib_test` checks went RED, then GREEN.
+7. The pinger records once per visit (`Recorder.PingVisit`) instead of 2–3 times per Ping, covered by the existing pinger tests.
+
+Verified: `make test`, `make test-scripts`, `go vet ./...`, `go test -race` on loadgen, and a full `floods` dry run (30 checks, only dev swap failing).

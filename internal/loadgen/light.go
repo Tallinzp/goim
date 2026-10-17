@@ -27,7 +27,7 @@ type lightConn struct {
 	lastPing atomic.Int64 // unix ns of the last Ping sent (or of add)
 	reqID    atomic.Uint32
 	mu       sync.Mutex
-	c        *clientconn.Conn
+	c        *clientconn.Conn // after login only the pinger writes; its write deadline stays set
 	stopped  bool
 }
 
@@ -241,9 +241,9 @@ func (ps pingers) run(ctx context.Context) {
 }
 
 func (p *pinger) run(ctx context.Context) {
-	t := time.NewTicker(p.tick)
-	defer t.Stop()
 	start, next := time.Now(), 0 // visit k (slot k % len) is due at start + (k+1) tick
+	t := time.NewTicker(p.tick)  // after start, so no tick comes before its visit
+	defer t.Stop()
 	var due []*lightConn
 	for {
 		select {
@@ -258,7 +258,7 @@ func (p *pinger) run(ctx context.Context) {
 		if upto <= next {
 			continue
 		}
-		p.rec.PingLag(since - time.Duration(next+1)*p.tick)
+		v := PingVisit{Lag: since - time.Duration(next+1)*p.tick}
 		next = max(next, upto-len(p.slots))
 		p.mu.Lock()
 		due = due[:0]
@@ -274,14 +274,15 @@ func (p *pinger) run(ctx context.Context) {
 			s := time.Now()
 			now := s.UnixNano()
 			if lc.pingAt.Swap(now) != 0 {
-				p.rec.PongMissing()
+				v.Missing++
 			}
-			p.rec.PingGap(time.Duration(now - lc.lastPing.Swap(now)))
+			v.Gap = max(v.Gap, time.Duration(now-lc.lastPing.Swap(now)))
 			if err := p.send(lc, s.Add(pingSendTimeout)); errors.Is(err, os.ErrDeadlineExceeded) {
-				p.rec.PingSendTimeout()
+				v.SendTimeouts++
 				lc.c.Close()
 			}
-			p.rec.PingSend(time.Since(s))
+			v.Send = max(v.Send, time.Since(s))
 		}
+		p.rec.PingVisit(v) // once per visit: the Recorder's lock, not per Ping
 	}
 }

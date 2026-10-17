@@ -552,6 +552,10 @@ T2_NOTRACK_LO=17000 T2_NOTRACK_HI=17199
 # (base … base + 132, the 4th gateway's last, stack.sh's stack_ports) leave
 # the NOTRACK range: they would be tracked again, unseen.
 t2_notrack_covers() {
+  if ! [[ $1 =~ ^[0-9]+$ ]]; then
+    echo "refused: STACK_PORT_BASE $1 is not a port number"
+    return 1
+  fi
   if [ "$1" -lt $T2_NOTRACK_LO ] || [ $(($1 + 132)) -gt $T2_NOTRACK_HI ]; then
     echo "refused: STACK_PORT_BASE $1 puts the stack's ports outside $T2_NOTRACK_LO-$T2_NOTRACK_HI, the ports host-setup.sh untracks (use $T2_NOTRACK_LO-$((T2_NOTRACK_HI - 132)))"
     return 1

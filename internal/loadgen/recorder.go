@@ -203,42 +203,23 @@ func (r *Recorder) Pong(rtt time.Duration) {
 	r.mu.Unlock()
 }
 
-// PongMissing: a Ping was due while the previous one had no Pong yet.
-func (r *Recorder) PongMissing() {
-	r.mu.Lock()
-	r.missing++
-	r.mu.Unlock()
+// PingVisit is what one pinger visit saw: how late it started, its longest
+// gap between a client's Pings, its slowest Send, the Pings sent while the
+// last was unanswered, and the Sends past their deadline (their clients
+// closed).
+type PingVisit struct {
+	Lag, Gap, Send        time.Duration
+	Missing, SendTimeouts int64
 }
 
-// PingGap: a client's Ping went out gap after its previous one (or after
-// it was added); the longest is kept.
-func (r *Recorder) PingGap(gap time.Duration) {
+// PingVisit adds one visit: counts add up, the maxima are kept.
+func (r *Recorder) PingVisit(v PingVisit) {
 	r.mu.Lock()
-	r.gapMax = max(r.gapMax, gap)
-	r.mu.Unlock()
-}
-
-// PingLag: a pinger reached a slot lag after its time (a dropped tick, a
-// starved goroutine); the longest is kept.
-func (r *Recorder) PingLag(lag time.Duration) {
-	r.mu.Lock()
-	r.lagMax = max(r.lagMax, lag)
-	r.mu.Unlock()
-}
-
-// PingSend: one Ping's Send took d (a full socket buffer blocks it); the
-// longest is kept.
-func (r *Recorder) PingSend(d time.Duration) {
-	r.mu.Lock()
-	r.sendMax = max(r.sendMax, d)
-	r.mu.Unlock()
-}
-
-// PingSendTimeout: a Ping's Send missed its deadline and its client was
-// closed.
-func (r *Recorder) PingSendTimeout() {
-	r.mu.Lock()
-	r.sendTimeouts++
+	r.lagMax = max(r.lagMax, v.Lag)
+	r.gapMax = max(r.gapMax, v.Gap)
+	r.sendMax = max(r.sendMax, v.Send)
+	r.missing += v.Missing
+	r.sendTimeouts += v.SendTimeouts
 	r.mu.Unlock()
 }
 

@@ -77,3 +77,4 @@ else
   exit 1
 fi
 echo "host-setup: done. Check: sudo -n /usr/local/sbin/goim-netdrop list; sudo -n /usr/local/sbin/goim-netdrop notrack-check"
+echo "host-setup: NOTRACKed packets are UNTRACKED, not ESTABLISHED: check that iptables -S INPUT, iptables -S OUTPUT and nft list ruleset accept lo before any conntrack-state rule"
