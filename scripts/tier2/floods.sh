@@ -62,11 +62,14 @@
 #   storm_online          every client logs in, or each one that did not gave
 #                         up after pre-handshake closes only (the concurrency
 #                         limit's loss, #111's input, O2); gave_up is recorded
-#   storm_rate            the gateway saw handshakes (ok + no_slot + no_token)
-#                         at >= 0.9 x the rate, between 5% and 95% of the
-#                         clients seen (so the limiter saw the storm, not a
-#                         loadgen-bound trickle); the completed (ok) rate
-#                         and both per-second series are recorded
+#   storm_rate            new clients reached the gateway (handshakes it saw,
+#                         ok + no_slot + no_token, less loadgen's
+#                         pre-handshake closes, which each come back as a
+#                         retry) at >= 0.9 x the rate, between 5% and 95% of
+#                         them (so the limiter saw the storm, not a
+#                         loadgen-bound trickle that retries inflate: final
+#                         review I-1); the seen and completed (ok) rates and
+#                         the per-second series are recorded
 #   storm_bucket          the bucket refused nothing (no_token 0, #121);
 #                         the concurrency limit's refusals (no_slot, each a
 #                         pre-handshake close the client retries after
@@ -127,19 +130,24 @@ t2_need curl taskset sudo python3 ss
 t2_require_host_setup
 
 PHASES=${FLOODS_PHASES:-storm garbage slow}
+named=" "
 for p in $PHASES; do
   case $p in storm | garbage | slow) ;; *) echo "floods: unknown phase '$p' (storm, garbage, slow)" >&2; exit 1 ;; esac
+  case $named in *" $p "*) echo "floods: phase '$p' named twice in FLOODS_PHASES" >&2; exit 1 ;; esac
+  named+="$p "
 done
 for v in FLOODS_STORM_CLIENTS FLOODS_STORM_RATE FLOODS_CLIENTS FLOODS_RATE FLOODS_HEARTBEAT \
   FLOODS_GARBAGE_RATE FLOODS_GARBAGE_INFLIGHT FLOODS_GARBAGE_SECONDS FLOODS_GARBAGE_BUCKET \
   FLOODS_SLOW_HANDSHAKE FLOODS_SLOW_AUTH FLOODS_SLOW_RATE FLOODS_SLOW_HOLD; do
-  case ${!v-1} in ''|*[!0-9]*|0) echo "floods: $v must be a positive whole number" >&2; exit 1 ;; esac
+  case ${!v-1} in ''|*[!0-9]*|0*) echo "floods: $v must be a positive whole number" >&2; exit 1 ;; esac
 done
 [ "${FLOODS_GARBAGE_SECONDS:-90}" -ge 45 ] || { echo "floods: FLOODS_GARBAGE_SECONDS must be at least 45 (the flood's profile)" >&2; exit 1; }
-# Light clients cost loadgen ~10KB each and the gateway less; the garbage
-# phase's 400k are the most at once (capacity's 600k on one gateway ran
-# within 16).
-t2_mem_budget 12
+[ "${FLOODS_HEARTBEAT:-30}" -ge 30 ] && [ "${FLOODS_HEARTBEAT:-30}" -le 300 ] ||
+  { echo "floods: FLOODS_HEARTBEAT must be 30 to 300 (the gateway's -heartbeat)" >&2; exit 1; }
+# Light clients cost loadgen ~10KB each and the gateway less; the slow
+# phase's 400k light and 120k slow connections are the most at once, near
+# capacity's 600k on one gateway, which ran within 16.
+t2_mem_budget 16
 t2_nofile 1048576
 
 export STACK_PIN=1
@@ -147,8 +155,9 @@ STACK_PORT_BASE=${STACK_PORT_BASE:-17000}
 STACK_REDIS_SERVER=$PWD/.cache/redis/bin/redis-server
 t2_on_exit 'stack_down'
 t2_on_exit 'lg_stop_all' # newest first: every loadgen instance stops before the stack
-smp=""
+smp="" prof=""
 t2_on_exit '[ -n "$smp" ] && kill "$smp" 2>/dev/null'
+t2_on_exit '[ -n "$prof" ] && kill "$prof" 2>/dev/null'
 
 GW_COUNTERS=(
   hs_ok='goim_gateway_handshakes_total:result="ok"'
@@ -227,42 +236,70 @@ def delta(x, y):
 print(json.dumps({g: delta(a.get(g), y) for g, y in b.items()}))' "$1" "$2" 2>/dev/null || echo null
 }
 
-# hs_sampler NAME FILE: appends "unix_ms ok refused" every second, NAME's
-# completed handshakes and the limiter's refusals (no_slot + no_token, a
-# label with no sample yet read as 0), until killed.
+# hs_sampler NAME FILE: appends "unix_ms ok refused pre" every second, NAME's
+# completed handshakes, the limiter's refusals (no_slot + no_token, a label
+# with no sample yet read as 0) and the current loadgen's pre-handshake
+# closes (each a retry to come, final review I-1), until killed. A second
+# with an unreadable loadgen is skipped.
 hs_sampler() {
-  local c re='"ok": ([0-9]+), "slot": ([0-9]+|null), "token": ([0-9]+|null)'
+  local c pre re='"ok": ([0-9]+), "slot": ([0-9]+|null), "token": ([0-9]+|null)'
   while :; do
+    pre=$(lg_get /stats 'd["failed"].get("pre-handshake", 0)')
     c=$(stack_counters "$1" ok='goim_gateway_handshakes_total:result="ok"' \
       slot='goim_gateway_handshakes_total:result="no_slot"' token='goim_gateway_handshakes_total:result="no_token"')
-    [[ $c =~ $re ]] &&
-      echo "$(date +%s%3N) ${BASH_REMATCH[1]} $((${BASH_REMATCH[2]/null/0} + ${BASH_REMATCH[3]/null/0}))" >>"$2"
+    [[ $pre =~ ^[0-9]+$ ]] && [[ $c =~ $re ]] && # c last: BASH_REMATCH is its
+      echo "$(date +%s%3N) ${BASH_REMATCH[1]} $((${BASH_REMATCH[2]/null/0} + ${BASH_REMATCH[3]/null/0})) $pre" >>"$2"
     sleep 1
   done
 }
 # hs_rate FILE N: {"seen_per_s" (handshakes the gateway saw, ok or refused,
-# per second between the samples where 5% and 95% of N had been seen: the
-# ramp's body, a refused client's retry included), "rate_per_s" (completed
-# per second between 5% and 95% of N completed, which the retries stretch),
-# "ramp_s" (of the completed), "peak_per_s" (completed), "series": [[s since
-# the first sample, completed/s, seen/s], ...] (first 120)}; null when the
+# per second between the first sample at 5% of N seen and the last below 95%:
+# the ramp's body, a refused client's retry included), "new_per_s" (the same
+# less the pre-handshake closes 1s earlier, the retries made by then: new
+# clients only, final review I-1), "rate_per_s" (completed, between 5% and
+# 95% of N completed, which the retries stretch), "ramp_s" (of the completed,
+# 5% to 95% interpolated), "peak_per_s" (completed), "series": [[s since the
+# first sample, completed/s, seen/s], ...] (first 120)}; null when the
 # samples never reach 95% of N completed.
 hs_rate() {
   python3 -c 'import json, sys
-rows = [tuple(int(x) for x in l.split()) for l in open(sys.argv[1]) if len(l.split()) == 3 and all(x.isdigit() for x in l.split())]
+rows = [tuple(int(x) for x in l.split()) for l in open(sys.argv[1]) if len(l.split()) == 4 and all(x.isdigit() for x in l.split())]
 n = int(sys.argv[2])
+def cross(f, x):
+    # When f reached x, interpolated between the samples around it: a sample
+    # well past the end of a short ramp would read the rate low.
+    for i, r in enumerate(rows):
+        if f(r) >= x:
+            if i == 0 or f(r) == f(rows[i - 1]):
+                return r[0]
+            p = rows[i - 1]
+            return p[0] + (x - f(p)) * (r[0] - p[0]) / (f(r) - f(p))
+    return None
 def per_s(f):
-    lo = next((r for r in rows if f(r) >= 0.05 * n), None)
-    hi = next((r for r in rows if f(r) >= 0.95 * n), None)
-    if not lo or not hi or hi[0] <= lo[0]:
+    # The rate between the first sample at 5% of N and the last below 95%,
+    # both inside the ramp: an interval holding its start or end reads low.
+    body = [r for r in rows if 0.05 * n <= f(r) < 0.95 * n]
+    lo, hi = cross(f, 0.05 * n), cross(f, 0.95 * n)
+    if len(body) < 2 or body[-1][0] <= body[0][0] or lo is None or hi is None:
         return None, None
-    return round((f(hi) - f(lo)) * 1000 / (hi[0] - lo[0])), round((hi[0] - lo[0]) / 1000, 1)
+    return round((f(body[-1]) - f(body[0])) * 1000 / (body[-1][0] - body[0][0])), round((hi - lo) / 1000, 1)
 rate, ramp = per_s(lambda r: r[1])
 seen, _ = per_s(lambda r: r[1] + r[2])
+def pre_at(t):
+    # Pre-handshake closes by time t, interpolated (0 before the first sample).
+    if not rows or t < rows[0][0]:
+        return 0
+    for p, r in zip(rows, rows[1:]):
+        if t < r[0]:
+            return p[3] + (r[3] - p[3]) * (t - p[0]) / (r[0] - p[0])
+    return rows[-1][3]
+# A close is retried 0.5-1.5s later, so the retries made by a sample are
+# about the closes 1s before it; a close still waiting is no retry yet.
+new, _ = per_s(lambda r: r[1] + r[2] - pre_at(r[0] - 1000))
 if rate is None:
     print("null"); sys.exit()
-pts = [((t1 - rows[0][0]) / 1000, (c1 - c0) * 1000 / (t1 - t0), (c1 + x1 - c0 - x0) * 1000 / (t1 - t0)) for (t0, c0, x0), (t1, c1, x1) in zip(rows, rows[1:]) if t1 > t0]
-print(json.dumps({"seen_per_s": seen, "rate_per_s": rate, "ramp_s": ramp, "peak_per_s": round(max(p[1] for p in pts)),
+pts = [((t1 - rows[0][0]) / 1000, (c1 - c0) * 1000 / (t1 - t0), (c1 + x1 - c0 - x0) * 1000 / (t1 - t0)) for (t0, c0, x0, _), (t1, c1, x1, _) in zip(rows, rows[1:]) if t1 > t0]
+print(json.dumps({"seen_per_s": seen, "new_per_s": new, "rate_per_s": rate, "ramp_s": ramp, "peak_per_s": round(max(p[1] for p in pts)),
        "series": [[round(t, 1), round(v), round(w)] for t, v, w in pts[:120]]}))' "$1" "$2" 2>/dev/null || echo null
 }
 
@@ -328,9 +365,10 @@ phase_storm() {
   d=$(gws_delta "$s0" "$s1")
   hs=$(hs_rate "$STACK_DIR/artifacts/handshakes-gw-0.tsv" "$n")
   [ "$online" = true ] && online=$(lg_get /stats "$(logged_in "$n")")
-  t2_check storm_online "${online:-false}" "\"want\": $n, \"online\": $(lg_get /stats 'd["online"]'), \"gave_up\": $(lg_get /stats 'd["failed"].get("gave-up", 0)'), \"failed\": $(lg_get /stats 'd["failed"]'), \"login_latency\": $(lg_get /stats 'd["login_latency"]')"
-  t2_check storm_rate "$(echo "$hs" | lg_true - 'd["seen_per_s"] >= 0.9 * '"$rate")" \
-    "\"rate\": $rate, \"handshakes\": $(echo "$hs" | lg_py - '{k: d[k] for k in ("seen_per_s", "rate_per_s", "ramp_s", "peak_per_s")}'), \"loadgen_cores\": $(echo "$usage" | lg_py - 'd["loadgen"]["cores"]'), \"gateway_cores\": $(echo "$usage" | lg_py - 'd["gw-0"]["cores"]')"
+  [ "$online" = true ] || online=false # a null /stats reading fails the check, not the run
+  t2_check storm_online "$online" "\"want\": $n, \"online\": $(lg_get /stats 'd["online"]'), \"gave_up\": $(lg_get /stats 'd["failed"].get("gave-up", 0)'), \"failed\": $(lg_get /stats 'd["failed"]'), \"login_latency\": $(lg_get /stats 'd["login_latency"]')"
+  t2_check storm_rate "$(echo "$hs" | lg_true - 'd["new_per_s"] >= 0.9 * '"$rate")" \
+    "\"rate\": $rate, \"handshakes\": $(echo "$hs" | lg_py - '{k: d[k] for k in ("new_per_s", "seen_per_s", "rate_per_s", "ramp_s", "peak_per_s")}'), \"loadgen_cores\": $(echo "$usage" | lg_py - 'd["loadgen"]["cores"]'), \"gateway_cores\": $(echo "$usage" | lg_py - 'd["gw-0"]["cores"]')"
   t2_check storm_bucket "$(echo "$d" | lg_true - 'd["gw-0"]["hs_no_token"] == 0')" \
     "\"gw-0\": $(echo "$d" | lg_py - '{k: d["gw-0"][k] for k in ("hs_ok", "hs_no_token", "hs_no_slot", "rejects_handshake_rate", "logins_busy", "rejects_pending_mem", "rejects_at_capacity")}'), \"no_slot_share\": $(echo "$d" | lg_py - 'round(d["gw-0"]["hs_no_slot"] / (d["gw-0"]["hs_ok"] + d["gw-0"]["hs_no_slot"]), 4)'), \"failed\": $(lg_get /stats 'd["failed"]')"
   t2_field storm "{\"clients\": $n, \"rate\": $rate, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"usage\": $usage, \"handshakes\": $hs, \"gateways\": $d, \"login_latency\": $(lg_get /stats 'd["login_latency"]'), \"failed\": $(lg_get /stats 'd["failed"]')}"
@@ -341,7 +379,7 @@ phase_storm() {
 phase_garbage() {
   local n=${FLOODS_CLIENTS:-400000} rate=${FLOODS_RATE:-10000} grate=${FLOODS_GARBAGE_RATE:-80000}
   local inflight=${FLOODS_GARBAGE_INFLIGHT:-20000} secs=${FLOODS_GARBAGE_SECONDS:-90}
-  local online on s0 s1 d l0 l1 tw0 tw1 usage want flood prof t0 lease_s f
+  local online on s0 s1 d l0 l1 tw0 tw1 usage want flood t0 lease_s f
   STACK_GATEWAYS=2 STACK_GATEWAY_ARGS=(-max-conns $((n / 2 + n / 10 + inflight)) -heartbeat "${HB}s"
     ${FLOODS_GARBAGE_BUCKET:+-handshake-rate "$FLOODS_GARBAGE_BUCKET"})
   up garbage || { stack_down; return; }
@@ -350,7 +388,8 @@ phase_garbage() {
   lg_wait "$(settled "$n")" $((n / rate * 3 + 60)) &&
     online=$(lg_get /stats '('"$(logged_in "$n")"') and min(d["online_by_gateway"].get(g, 0) for g in ("gw-0", "gw-1")) >= '"$n"' * 0.45')
   on=$(lg_get /stats 'd["online"]')
-  t2_check garbage_online "${online:-false}" "\"want\": $n, \"online\": $on, \"by_gateway\": $(lg_get /stats 'd["online_by_gateway"]'), \"gave_up\": $(lg_get /stats 'd["failed"].get("gave-up", 0)'), \"failed\": $(lg_get /stats 'd["failed"]')"
+  [ "$online" = true ] || online=false
+  t2_check garbage_online "$online" "\"want\": $n, \"online\": $on, \"by_gateway\": $(lg_get /stats 'd["online_by_gateway"]'), \"gave_up\": $(lg_get /stats 'd["failed"].get("gave-up", 0)'), \"failed\": $(lg_get /stats 'd["failed"]')"
   [ "$online" = true ] || { down garbage; return; }
   stack_snapshot before
   s0=$(gws_counters) l0=$(stack_counters logic lease_error="$LOGIC_LEASE_ERROR")
@@ -371,6 +410,7 @@ phase_garbage() {
   tw1=$(timewait)
   lg_in flood lg_stop
   wait "$prof"
+  prof=""
   t2_record_end garbage
   stack_snapshot after
   lg_stop
