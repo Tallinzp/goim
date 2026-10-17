@@ -16,11 +16,11 @@
 
 Inputs: Plan 6b3a (`2026-10-16-connection-session-core-06b3a-loadgen-floods.md`): its *Review Focus* 2, 3 and 5, its *After this plan*, and the final reviewer's notes and P6b3aI-6/7 in its *Execution Notes*.
 
-**Decisions:** #118 (the user, 2026-10-16) makes this plan scenario `floods` and Tier 2 run 30. #121 (decided 2026-10-16) splits the handshake-flood bullet into two tests. **Proposed with this plan, for review:** #122 (the phases, their sizes and their gates), under *Implementation choices* below.
+**Decisions:** #118 (the user, 2026-10-16) makes this plan scenario `floods` and Tier 2 run 30. #121 (decided 2026-10-16) splits the handshake-flood bullet into two tests. #122 (the phases, their sizes and their gates, under *Implementation choices* below) was reviewed 2026-10-16: O1–O5 accepted (`objections/connection-session-core-06b3b-floods.md` and `-dispositions.md`), and #122 is decided as amended by O1–O3. #111 (parked by the user 2026-10-15: a handshake that finds no free slot waits instead of being rejected) is the open question that run 30 feeds (O4).
 
 **Branch:** `feat/plan6b3`. Execute from its head, `cc7c636` or later.
 
-**Size:** 3 tasks, about 440 lines changed (one new script of 415 lines). The prototype `proto-6b3b` (from `cc7c636`: `f1ce460`, then `c99b8bc` after its own dry run) ran every block. Its code is replayed here byte for byte: `floods.sh` in full, every other change as a `git apply` patch against `cc7c636`. On the dev machine the prototype passed `make test-scripts`, and the `floods` dry run (Task 2, Step 3) ran all three phases at small scale.
+**Size:** 3 tasks, about 490 lines changed (one new script of 462 lines). The prototype `proto-6b3b` (from `cc7c636`: `f1ce460`, then `c99b8bc` after its own dry run, then `86b99bc` with the review's O1–O3 and O5) ran every block. Its code is replayed here byte for byte: `floods.sh` in full, every other change as a `git apply` patch against `cc7c636`. On the dev machine the prototype passed `make test-scripts`, and the `floods` dry run (Task 2, Step 3) ran all three phases at small scale. The review's checks were run too: a forced refusal in `slow`, a bucket above the flood, and a loadgen-bound storm.
 
 ## Global Constraints
 
@@ -35,18 +35,32 @@ Inputs: Plan 6b3a (`2026-10-16-connection-session-core-06b3a-loadgen-floods.md`)
 
 ## Review Focus
 
-1. **The concurrency limit refuses legitimate handshakes.** The limiter's semaphore has no wait queue: a handshake that finds every slot busy is closed (`no_slot`, counted as `handshake_rate`), and the client retries after 0.5–1.5s. That is an Erlang loss. In `storm`, one gateway has 6 slots, and at 20,000/s × ~100µs that is 2 Erlangs, so ~1.2% are refused. In `slow`, each gateway has 3 slots at ~8.6k handshakes/s (slow-auth's redials plus the light ramp): ~0.9 Erlang, ~4.5%. The dev dry run, with 1 slot, refused 33–38% at 1,000/s and 6% at 200/s. Expected: every client still logs in (light retries up to 10 times), and `storm_bucket`/`slow_legit` gate only the **bucket** (`no_token` 0), which is the spec's clause. `no_slot`, its share (`storm_bucket.no_slot_share`) and loadgen's `failed["pre-handshake"]` are recorded, not gated (#122 (2)). If run 30's share is large, the spec's "shapes load rather than rejecting it" does not hold for the semaphore. Whether to size it differently or let a handshake wait briefly for a slot is the user's decision after the run, not this plan's.
+1. **The concurrency limit refuses legitimate handshakes.** The limiter's semaphore has no wait queue. A handshake that finds every slot busy is closed (`no_slot`, counted as `handshake_rate`), and the client retries after 0.5–1.5s. That is an Erlang loss, and it depends on how long a handshake holds its slot. The project's measurements put the hold at ~300–500µs, not ~100µs (O2):
+   - This plan's dev dry run, with 1 slot, refused 33–38% at 1,000/s and 6% at 200/s. By Erlang B on one slot, that is a hold of ~500µs and ~320µs.
+   - #111's b_stress: ~8.7k handshakes/s through 4 saturated slots, ~2.2k/s per slot, so ~460µs.
+
+   At that hold, `storm` (6 slots at 20,000/s, 6–9 Erlangs) and `slow` (3 slots per gateway at ~8.6k/s, slow-auth's redials plus the light ramp, 2.6–4 Erlangs) can refuse 20–45%, before the retries add load. So run 30 records the semaphore's loss rather than failing on it:
+   - `storm_rate` gates the rate the gateway *saw*: `ok + no_slot + no_token` per second ≥ 0.9 × rate, between 5% and 95% of the clients seen. The completed rate is recorded beside it.
+   - `storm_online`, `garbage_online` and `slow_legit` pass when every client logs in, or when each client that did not gave up after pre-handshake closes only (light clients try 10 times). `gave_up` is recorded. Any other failure (Busy, a reject, a timeout) still fails.
+   - `storm_bucket`/`slow_legit` gate only the **bucket** (`no_token` 0), which is the spec's clause.
+   - Recorded, not gated: `no_slot`, its share (`storm_bucket.no_slot_share`), loadgen's `failed["pre-handshake"]` and slow-auth's `pre-handshake` outcomes (#122 (2)).
+
+   If run 30's share is large, the spec's "shapes load rather than rejecting it" does not hold for the semaphore. That question is #111, parked by the user on 2026-10-15, and run 30 is its input (O4). Raising the concurrency instead collapsed b_stress (594s), so sizing up is not the open option.
 2. **Loadgen as the bound.** `storm` needs ~20,000 X25519 handshakes/s from loadgen's 8 CPUs, and `garbage` needs 80,000 TCP connects per second with no crypto. If loadgen falls short, the gateway sees less than the test claims. Expected: `storm_rate` (the gateway's completed handshakes ≥ 0.9 × rate, between 5% and 95% of the clients) and `garbage_delivered` (the gateways' `failed + no_slot + no_token` ≥ 0.95 × rate × seconds, 6b3a Review Focus 2) fail rather than pass on a trickle. On a failure, read `usage.loadgen`/`usage.flood` cores and `garbage/loadgen-flood.cpu.pb.gz`. Lower `FLOODS_GARBAGE_RATE` only while `garbage_limited` still passes.
-3. **Least connections splits the garbage unevenly.** A refused attempt closes sooner than one that runs a DH, so its gateway has fewer open connections and gets more of the flood. The dry run split it 65/35 (gw-0 refused 34,737, gw-1 5,389, each computing at its bucket's rate). At 60,000/s that split would leave one gateway at ~21,000/s, under its 25,000/s bucket. Expected: the default of 80,000/s keeps the smaller share at ~28,000/s, so `garbage_limited`, which is gated per gateway, passes. If it fails for one gateway while the other refused, raise `FLOODS_GARBAGE_RATE`.
+3. **Which limit refuses the garbage, and how least connections splits it.** A refused attempt closes sooner than one that runs a DH, so its gateway has fewer open connections and gets more of the flood. The dry run split it 65/35 (gw-0 refused 33,051, gw-1 7,095, each computing at its bucket's rate). At 80,000/s the smaller share is ~28,000/s. The slot is taken before the token (`limiter.go`), so the bucket sees only what a gateway's 3 slots let through: at most ≈ 3 / hold per second, minus the Erlang loss. 80,000/s therefore reaches the 25,000/s bucket only if the slots carry more than that. `garbage_limited` gates the **bucket** per gateway (`no_token > 0`, O3), because the spec's flood row names both limits and `no_slot` alone happens at almost any rate (the dry run's storm at 200/s, with no flood, refused 5%). Expected: both gateways' buckets refuse part of the flood. If `garbage_limited` fails for a gateway with `dh_per_s` under 25,000 and `no_slot` large, the semaphore bound first. That is a finding and #111's input. It is not fixed by raising `FLOODS_GARBAGE_RATE`. If it fails with `no_slot` small (an uneven split), raise the rate.
 4. **TIME_WAIT on the gateway's side.** The gateway closes every garbage attempt first (6b3a), so the gateway holds one TIME_WAIT per attempt for 60s. At 80,000/s that is ~4.8M, far past `net.ipv4.tcp_max_tw_buckets`, so the kernel drops the excess (`TCPTimeWaitOverflow`). Expected: harmless. The flood's outcomes stay `closed` only, with no `dial-timeout` or `dial-no-port`, and `ListenOverflows` stays 0. All of it is recorded in `garbage_delivered` (`timewait` before and after, `tcp` deltas, `outcomes`), not gated. The dev dry run hit the dev machine's 8,192 buckets with 65k overflows and every outcome `closed`.
-5. **"On time" for a heartbeat.** The light client's Pong RTT is one distribution over its whole run. It covers its ramp as well as the flood, so a phase has no clean baseline. Expected: `<phase>_heartbeats` gates what the spec makes a failure. No Pong is missing (a Ping was due while the last one was unanswered). Every client was Pinged at least once. The slowest Pong is under 10s, the SDK's Pong timeout above the heartbeat. No connection was lost, and no gateway closed one for its heartbeat. p50/p99/max are recorded, for the README. The 6b2a-pinger ruling (an SDK Ping write with no deadline) does not apply: these are light clients, and the gateways keep reading them.
+5. **"On time" for a heartbeat.** The light client's Pong RTT is one distribution over its whole run. It covers its ramp as well as the flood, so a phase has no clean baseline. Expected: `<phase>_heartbeats` gates what the spec makes a failure. No Pong is missing (a Ping was due while the last one was unanswered). There were at least as many Pongs over the light run as clients online. That is a floor, not per-client coverage of the flood (O5). The slowest Pong is under 10s, the SDK's Pong timeout above the heartbeat. No connection was lost, and no gateway closed one for its heartbeat. p50/p99/max are recorded, for the README. The 6b2a-pinger ruling (an SDK Ping write with no deadline) does not apply: these are light clients, and the gateways keep reading them.
 
 ## Implementation choices this plan makes
 
 1. **#122 (proposed): three phases, each on a fresh stack.** `FLOODS_PHASES` (default `storm garbage slow`) picks them, as `GWLOSS_PHASES` does, so one phase can be rerun alone. A phase's counters, swap window and loadgen results are its own, and no flood's TIME_WAIT or half-open state reaches the next phase's numbers.
-2. **#122 (proposed): `storm` is #121 (2) on one gateway, with the bucket gated and the semaphore recorded.** 200,000 light clients ramp at 20,000/s onto gw-0, so 10s at the spec's peak. That stays under the 250,000 connection cap. The gateway runs its default limiter with 6 slots. The bucket is per gateway, so with two gateways each would see only 10,000/s, and the test would not test the bucket. `storm_bucket` passes on `no_token` 0. `no_slot` is recorded with its share (Review Focus 1). *Alternative:* gate `no_slot` 0 too. That turns the semaphore's Erlang loss into a failure of this plan, when it is a question for the spec.
-3. **#122 (proposed): `garbage` is #121 (1) at 80,000/s for 90s beside 400,000 light clients.** That is the operating point, 200,000 per gateway. The clients Ping every 30s, the gateway's lowest heartbeat, so each client Pings three times during the flood. The gates are: loadgen kept the schedule and the gateways saw it (`garbage_delivered`), each gateway's limiter refused part of it (`garbage_limited`, so the flood ran past the limit), heartbeats (Review Focus 5), and each gateway renewed its lease through the flood (`garbage_lease`, `t2_lease_floor`, as `slowlogic`). The gateways' and the flood's CPU are profiled from 10s to 40s into the flood. `FLOODS_GARBAGE_BUCKET` lowers `-handshake-rate` for this phase only, so the dev dry run's small flood reaches the limiter. On the host it stays unset.
-4. **#122 (proposed): `slow` holds 80,000 slow-handshake and 40,000 slow-auth connections while 400,000 light clients log in.** That is 60,000 pending per gateway, under the 100,000 pending cap, so the light clients find slots. Slow-auth's redials cost ~7,300 handshakes/s (40,000 every ~5.5s). With the light ramp's 10,000/s, that is ~8,600/s per gateway, a third of the bucket (6b3a Review Focus 5). The light clients start only once both floods hold ≥ 85% of their connections and have had every slot freed once (`slow_flood`). The phase then holds 60s. The gates are: the holds by the timeouts, with the probe's bounds (p50 ≥ 5s, p99 ≤ 6.5s, max ≤ 7.5s, 6b3a O7), the gateways' `handshake_timeout`/`auth_timeout` counts (`slow_freed`), the legitimate clients (`slow_legit`: all online, no Busy, no `login_queue`/`pending_mem`/`at_capacity` reject, no `no_token`; `no_slot` recorded), heartbeats and leases. `-max-conns` is raised to fit the floods and the clients.
+2. **#122 (proposed): `storm` is #121 (2) on one gateway, with the bucket gated and the semaphore recorded.** 200,000 light clients ramp at 20,000/s onto gw-0, so 10s at the spec's peak. That stays under the 250,000 connection cap. The gateway runs its default limiter with 6 slots. The bucket is per gateway, so with two gateways each would see only 10,000/s, and the test would not test the bucket. `storm_bucket` passes on `no_token` 0. `no_slot` is recorded with its share (Review Focus 1). `storm_rate` gates the rate the gateway saw (ok + refused), so it fails on a loadgen-bound trickle and not on the semaphore. `storm_online` lets a client give up after pre-handshake closes only, with `gave_up` recorded (O2). *Alternative:* gate `no_slot` 0 too. That turns the semaphore's Erlang loss into a failure of this plan, when it is a question for the spec (#111).
+3. **#122 (proposed): `garbage` is #121 (1) at 80,000/s for 90s beside 400,000 light clients.** That is the operating point, 200,000 per gateway. The clients Ping every 30s, the gateway's lowest heartbeat, so each client Pings three times during the flood. The gates are: loadgen kept the schedule and the gateways saw it (`garbage_delivered`), each gateway's bucket refused part of it (`garbage_limited`, `no_token > 0`, so the flood ran past the bucket, with `no_slot` recorded, O3), heartbeats (Review Focus 5), and each gateway renewed its lease through the flood (`garbage_lease`, `t2_lease_floor`, as `slowlogic`). The gateways' and the flood's CPU are profiled from 10s to 40s into the flood. `FLOODS_GARBAGE_BUCKET` lowers `-handshake-rate` for this phase only, so the dev dry run's small flood reaches the limiter. On the host it stays unset.
+4. **#122 (proposed): `slow` holds 80,000 slow-handshake and 40,000 slow-auth connections while 400,000 light clients log in.** That is 60,000 pending per gateway, under the 100,000 pending cap, so the light clients find slots. Slow-auth's redials cost ~7,300 handshakes/s (40,000 every ~5.5s). With the light ramp's 10,000/s, that is ~8,600/s per gateway, a third of the bucket (6b3a Review Focus 5). The light clients start only once both floods hold ≥ 85% of their connections and have had every slot freed once (`slow_flood`). The phase then holds 60s. The gates are:
+   - The holds ended by the timeouts, with the probe's bounds (p50 ≥ 5s, p99 ≤ 6.5s, max ≤ 7.5s, 6b3a O7). A slow-auth handshake that the limiter refused ends `pre-handshake`, with no hold. That outcome is allowed and counted (O1).
+   - The gateways' `handshake_timeout`/`auth_timeout` counts (`slow_freed`).
+   - The legitimate clients (`slow_legit`): all online, or gave up after pre-handshake closes only (O2). No Busy, no `login_queue`/`pending_mem`/`at_capacity` reject, no `no_token`. `no_slot` is recorded.
+   - Heartbeats and leases. `-max-conns` is raised to fit the floods and the clients.
 5. **#122 (proposed): "answered on time" means under the Pong timeout,** gated as Review Focus 5 says, with the RTT quantiles recorded. *Alternative:* a baseline window before each flood. That needs a second light instance per phase, because a run's `pong_rtt` is cumulative.
 6. **`t2_lease_floor` in `lib.sh`.** `slowlogic`'s `lease_floor` (P6b2b-slowI-5) moves unchanged, with a `lib_test` case, because `floods` needs the same floor.
 
@@ -197,14 +211,17 @@ git commit -m "refactor(tier2): lease_floor into lib.sh as t2_lease_floor, for f
 #       clients ramped at 20,000/s against the gateway's default handshake
 #       limit (25,000/s bucket, burst 2,500, half the loops computing): the
 #       bucket shapes, it does not reject (#121 (2)). One gateway, since the
-#       bucket is per gateway and the spec's 20k/s is a storm's peak.
+#       bucket is per gateway and the spec's 20k/s is a storm's peak. The
+#       concurrency limit refuses (no_slot) without a queue, so its loss is
+#       recorded, as parked #111's input, not failed (O2).
 #   garbage: 2 x 200k light clients (the operating point per gateway) Ping
 #       every 30s, then loadgen instance flood sends garbage handshakes (a
 #       valid header and key_id, a random Noise message: each costs the
 #       gateway a DH) at 80,000/s for 90s from 253 sources, above both
 #       gateways' buckets (2 x 25,000/s) even when least-connections splits
 #       it 65/35 (the dry run's split: a refused attempt closes sooner, so
-#       its gateway gets more), so each limiter refuses part of it:
+#       its gateway gets more), so each bucket refuses part of what the
+#       concurrency limit lets through (the slot is taken first):
 #       every Ping is still answered on time and the gateways renew their
 #       leases (#121 (1)).
 #   slow: instances flood and flood2 hold 80k slow-handshake and 40k
@@ -212,7 +229,7 @@ git commit -m "refactor(tier2): lease_floor into lib.sh as t2_lease_floor, for f
 #       nothing), freed by the gateways' 5s timeouts and redialed, while
 #       400k light clients log in beside them and Ping: no Busy, no reject,
 #       no bucket refusal (slow-auth's ~7k handshakes/s fit the buckets,
-#       6b3a Review Focus 5).
+#       6b3a Review Focus 5); the concurrency limit's refusals are recorded.
 # Logic is one process (minReplicas, no HPA), unthrottled.
 #
 # Usage (on the Tier 2 host, from the repo root), after the one-time
@@ -248,11 +265,14 @@ git commit -m "refactor(tier2): lease_floor into lib.sh as t2_lease_floor, for f
 #
 # Checks (per phase run):
 #   storm_stack           redis, devtoken, Logic and the gateway become Ready
-#   storm_online          every client logs in, none gives up
-#   storm_rate            the gateway completed handshakes at >= 0.9 x the
-#                         rate, between 5% and 95% of the clients (so the
-#                         bucket saw the storm, not a loadgen-bound trickle);
-#                         its per-second series is recorded
+#   storm_online          every client logs in, or each one that did not gave
+#                         up after pre-handshake closes only (the concurrency
+#                         limit's loss, #111's input, O2); gave_up is recorded
+#   storm_rate            the gateway saw handshakes (ok + no_slot + no_token)
+#                         at >= 0.9 x the rate, between 5% and 95% of the
+#                         clients seen (so the limiter saw the storm, not a
+#                         loadgen-bound trickle); the completed (ok) rate
+#                         and both per-second series are recorded
 #   storm_bucket          the bucket refused nothing (no_token 0, #121);
 #                         the concurrency limit's refusals (no_slot, each a
 #                         pre-handshake close the client retries after
@@ -260,16 +280,21 @@ git commit -m "refactor(tier2): lease_floor into lib.sh as t2_lease_floor, for f
 #                         Busy are recorded
 #   no_swap_in_storm      no page swapped in from the ramp to the last login
 #   garbage_stack, slow_stack   as storm_stack, two gateways
-#   garbage_online        every light client logs in, each gateway holds 45-55%
+#   garbage_online        every light client logs in (or gave up as in
+#                         storm_online), each gateway holds 45-55%
 #   garbage_delivered     loadgen kept the schedule (attempts >= 0.95 x rate x
 #                         seconds) and the gateways saw it: failed + no_slot +
 #                         no_token >= 0.95 x rate x seconds (6b3a Review
 #                         Focus 2); outcomes, TIME_WAIT and kernel TCP
 #                         counters are recorded (Review Focus 3)
-#   garbage_limited       each gateway's limiter refused part of the flood
-#                         (no_slot + no_token > 0): it ran past the bucket
-#   garbage_heartbeats    every Ping answered (no Pong missing, every client
-#                         Pinged at least once), the slowest Pong under 10s
+#   garbage_limited       each gateway's bucket refused part of the flood
+#                         (no_token > 0): it ran past the bucket. The slot is
+#                         taken first, so the bucket sees only what the
+#                         concurrency limit lets through; its no_slot and
+#                         the DHs per second are recorded (O3)
+#   garbage_heartbeats    every Ping answered (no Pong missing, at least as
+#                         many Pongs over the light run as clients online: a
+#                         floor, not per client), the slowest Pong under 10s
 #                         (the SDK's Pong timeout), no connection lost, and no
 #                         gateway closed one for its heartbeat
 #   garbage_lease         each gateway renewed its lease every interval
@@ -279,10 +304,13 @@ git commit -m "refactor(tier2): lease_floor into lib.sh as t2_lease_floor, for f
 #                         slot freed at least once, before the light clients start
 #   slow_held             every slow connection was closed by a gateway, held
 #                         p50 >= 5s, p99 <= 6.5s, max <= 7.5s (5s + one tick of
-#                         the wheel, plus scheduling slack, 6b3a O7)
+#                         the wheel, plus scheduling slack, 6b3a O7); a
+#                         slow-auth handshake the limiter refused ends
+#                         pre-handshake, with no hold, and is counted (O1)
 #   slow_freed            the gateways counted at least as many
 #                         handshake_timeout and auth_timeout closes
-#   slow_legit            every light client logs in beside the floods: no
+#   slow_legit            every light client logs in beside the floods (or
+#                         gave up as in storm_online): no
 #                         Busy, no reject (login_queue, pending_mem: the
 #                         slots, at_capacity) and no bucket refusal
 #                         (no_token); the concurrency limit's (no_slot,
@@ -405,31 +433,53 @@ def delta(x, y):
 print(json.dumps({g: delta(a.get(g), y) for g, y in b.items()}))' "$1" "$2" 2>/dev/null || echo null
 }
 
-# hs_sampler NAME FILE: appends "unix_ms ok" every second, NAME's completed
-# handshakes, until killed.
+# hs_sampler NAME FILE: appends "unix_ms ok refused" every second, NAME's
+# completed handshakes and the limiter's refusals (no_slot + no_token, a
+# label with no sample yet read as 0), until killed.
 hs_sampler() {
-  local n
+  local c re='"ok": ([0-9]+), "slot": ([0-9]+|null), "token": ([0-9]+|null)'
   while :; do
-    n=$(stack_metric "$1" goim_gateway_handshakes_total 'result="ok"') &&
-      echo "$(date +%s%3N) $n" >>"$2"
+    c=$(stack_counters "$1" ok='goim_gateway_handshakes_total:result="ok"' \
+      slot='goim_gateway_handshakes_total:result="no_slot"' token='goim_gateway_handshakes_total:result="no_token"')
+    [[ $c =~ $re ]] &&
+      echo "$(date +%s%3N) ${BASH_REMATCH[1]} $((${BASH_REMATCH[2]/null/0} + ${BASH_REMATCH[3]/null/0}))" >>"$2"
     sleep 1
   done
 }
-# hs_rate FILE N: {"rate_per_s" (handshakes per second between the samples
-# where 5% and 95% of N had completed: the ramp's body, without the retries'
-# tail), "ramp_s", "peak_per_s", "series": [[s since the first sample,
-# handshakes/s], ...] (first 120)}; null when the samples never reach 95% of N.
+# hs_rate FILE N: {"seen_per_s" (handshakes the gateway saw, ok or refused,
+# per second between the samples where 5% and 95% of N had been seen: the
+# ramp's body, a refused client's retry included), "rate_per_s" (completed
+# per second between 5% and 95% of N completed, which the retries stretch),
+# "ramp_s" (of the completed), "peak_per_s" (completed), "series": [[s since
+# the first sample, completed/s, seen/s], ...] (first 120)}; null when the
+# samples never reach 95% of N completed.
 hs_rate() {
   python3 -c 'import json, sys
-rows = [tuple(int(x) for x in l.split()) for l in open(sys.argv[1]) if len(l.split()) == 2 and l.split()[1].isdigit()]
+rows = [tuple(int(x) for x in l.split()) for l in open(sys.argv[1]) if len(l.split()) == 3 and all(x.isdigit() for x in l.split())]
 n = int(sys.argv[2])
-lo = next((r for r in rows if r[1] >= 0.05 * n), None)
-hi = next((r for r in rows if r[1] >= 0.95 * n), None)
-if not lo or not hi or hi[0] <= lo[0]:
+def per_s(f):
+    lo = next((r for r in rows if f(r) >= 0.05 * n), None)
+    hi = next((r for r in rows if f(r) >= 0.95 * n), None)
+    if not lo or not hi or hi[0] <= lo[0]:
+        return None, None
+    return round((f(hi) - f(lo)) * 1000 / (hi[0] - lo[0])), round((hi[0] - lo[0]) / 1000, 1)
+rate, ramp = per_s(lambda r: r[1])
+seen, _ = per_s(lambda r: r[1] + r[2])
+if rate is None:
     print("null"); sys.exit()
-pts = [((t1 - rows[0][0]) / 1000, (c1 - c0) * 1000 / (t1 - t0)) for (t0, c0), (t1, c1) in zip(rows, rows[1:]) if t1 > t0]
-print(json.dumps({"rate_per_s": round((hi[1] - lo[1]) * 1000 / (hi[0] - lo[0])), "ramp_s": round((hi[0] - lo[0]) / 1000, 1),
-       "peak_per_s": round(max(p[1] for p in pts)), "series": [[round(t, 1), round(v)] for t, v in pts[:120]]}))' "$1" "$2" 2>/dev/null || echo null
+pts = [((t1 - rows[0][0]) / 1000, (c1 - c0) * 1000 / (t1 - t0), (c1 + x1 - c0 - x0) * 1000 / (t1 - t0)) for (t0, c0, x0), (t1, c1, x1) in zip(rows, rows[1:]) if t1 > t0]
+print(json.dumps({"seen_per_s": seen, "rate_per_s": rate, "ramp_s": ramp, "peak_per_s": round(max(p[1] for p in pts)),
+       "series": [[round(t, 1), round(v), round(w)] for t, v, w in pts[:120]]}))' "$1" "$2" 2>/dev/null || echo null
+}
+
+# settled N and logged_in N: /stats conditions for N light clients. Settled:
+# the ramp is done and each client is online or gave up. Logged in: all N
+# online, or each one that is not gave up after pre-handshake closes only,
+# the concurrency limit's loss that parked #111 is about (O2); any other
+# failure (Busy, a reject, a timeout) still fails.
+settled() { echo 'd["ramp_done"] and d["online"] + d["failed"].get("gave-up", 0) >= '"$1"; }
+logged_in() {
+  echo 'd["online"] == '"$1"' or (d["online"] + d["failed"].get("gave-up", 0) == '"$1"' and set(d["failed"]) <= {"pre-handshake", "gave-up"})'
 }
 
 # timewait: the host's TIME_WAIT sockets now (ss -s).
@@ -445,7 +495,9 @@ lease() {
 }
 
 # heartbeats PHASE N DELTA: checks PHASE_heartbeats over the light result of
-# N clients (instance main, stopped) and the gateways' counter delta.
+# N clients online (instance main, stopped) and the gateways' counter delta.
+# Pongs >= N is a floor over the whole light run, not per client: pong_missing
+# and lost catch a Ping left unanswered in the flood (O5).
 heartbeats() {
   local r=$STACK_DIR/artifacts/loadgen-$LG_NAME.json
   t2_check "${1}_heartbeats" "$(echo "{\"r\": $(lg_py "$r" d), \"g\": $3}" | lg_true - 'd["r"]["pong_missing"] == 0 and d["r"]["pongs"] >= '"$2"' and d["r"]["pong_rtt"]["max_ms"] < 10000 and d["r"]["lost"] == {} and all(v["closes_heartbeat"] == 0 for v in d["g"].values())')" \
@@ -473,7 +525,7 @@ phase_storm() {
   stack_usage_start loadgen="$LG_PID"
   hs_sampler gw-0 "$STACK_DIR/artifacts/handshakes-gw-0.tsv" &
   smp=$!
-  online=$(t2_bool lg_wait_online "$n" $((n / rate * 3 + 60)))
+  online=$(t2_bool lg_wait "$(settled "$n")" $((n / rate * 3 + 60)))
   kill "$smp" 2>/dev/null; wait "$smp" 2>/dev/null; smp=""
   usage=$(stack_usage_json)
   s1=$(gws_counters)
@@ -481,10 +533,10 @@ phase_storm() {
   stack_snapshot after
   d=$(gws_delta "$s0" "$s1")
   hs=$(hs_rate "$STACK_DIR/artifacts/handshakes-gw-0.tsv" "$n")
-  [ "$online" = true ] && online=$(lg_get /stats 'd["online"] == '"$n"' and "gave-up" not in d["failed"]')
-  t2_check storm_online "${online:-false}" "\"want\": $n, \"online\": $(lg_get /stats 'd["online"]'), \"failed\": $(lg_get /stats 'd["failed"]'), \"login_latency\": $(lg_get /stats 'd["login_latency"]')"
-  t2_check storm_rate "$(echo "$hs" | lg_true - 'd["rate_per_s"] >= 0.9 * '"$rate")" \
-    "\"rate\": $rate, \"handshakes\": $(echo "$hs" | lg_py - '{k: d[k] for k in ("rate_per_s", "ramp_s", "peak_per_s")}'), \"loadgen_cores\": $(echo "$usage" | lg_py - 'd["loadgen"]["cores"]'), \"gateway_cores\": $(echo "$usage" | lg_py - 'd["gw-0"]["cores"]')"
+  [ "$online" = true ] && online=$(lg_get /stats "$(logged_in "$n")")
+  t2_check storm_online "${online:-false}" "\"want\": $n, \"online\": $(lg_get /stats 'd["online"]'), \"gave_up\": $(lg_get /stats 'd["failed"].get("gave-up", 0)'), \"failed\": $(lg_get /stats 'd["failed"]'), \"login_latency\": $(lg_get /stats 'd["login_latency"]')"
+  t2_check storm_rate "$(echo "$hs" | lg_true - 'd["seen_per_s"] >= 0.9 * '"$rate")" \
+    "\"rate\": $rate, \"handshakes\": $(echo "$hs" | lg_py - '{k: d[k] for k in ("seen_per_s", "rate_per_s", "ramp_s", "peak_per_s")}'), \"loadgen_cores\": $(echo "$usage" | lg_py - 'd["loadgen"]["cores"]'), \"gateway_cores\": $(echo "$usage" | lg_py - 'd["gw-0"]["cores"]')"
   t2_check storm_bucket "$(echo "$d" | lg_true - 'd["gw-0"]["hs_no_token"] == 0')" \
     "\"gw-0\": $(echo "$d" | lg_py - '{k: d["gw-0"][k] for k in ("hs_ok", "hs_no_token", "hs_no_slot", "rejects_handshake_rate", "logins_busy", "rejects_pending_mem", "rejects_at_capacity")}'), \"no_slot_share\": $(echo "$d" | lg_py - 'round(d["gw-0"]["hs_no_slot"] / (d["gw-0"]["hs_ok"] + d["gw-0"]["hs_no_slot"]), 4)'), \"failed\": $(lg_get /stats 'd["failed"]')"
   t2_field storm "{\"clients\": $n, \"rate\": $rate, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"usage\": $usage, \"handshakes\": $hs, \"gateways\": $d, \"login_latency\": $(lg_get /stats 'd["login_latency"]'), \"failed\": $(lg_get /stats 'd["failed"]')}"
@@ -495,15 +547,16 @@ phase_storm() {
 phase_garbage() {
   local n=${FLOODS_CLIENTS:-400000} rate=${FLOODS_RATE:-10000} grate=${FLOODS_GARBAGE_RATE:-80000}
   local inflight=${FLOODS_GARBAGE_INFLIGHT:-20000} secs=${FLOODS_GARBAGE_SECONDS:-90}
-  local online s0 s1 d l0 l1 tw0 tw1 usage want flood prof t0 lease_s f
+  local online on s0 s1 d l0 l1 tw0 tw1 usage want flood prof t0 lease_s f
   STACK_GATEWAYS=2 STACK_GATEWAY_ARGS=(-max-conns $((n / 2 + n / 10 + inflight)) -heartbeat "${HB}s"
     ${FLOODS_GARBAGE_BUCKET:+-handshake-rate "$FLOODS_GARBAGE_BUCKET"})
   up garbage || { stack_down; return; }
   lg_start garbage-light -mode light -clients "$n" -rate "$rate" -ping-every "${HB}s" -uid-prefix garbage
   online=false
-  lg_wait_online "$n" $((n / rate * 3 + 60)) &&
-    online=$(lg_get /stats 'd["online"] == '"$n"' and min(d["online_by_gateway"].get(g, 0) for g in ("gw-0", "gw-1")) >= '"$n"' * 0.45')
-  t2_check garbage_online "${online:-false}" "\"want\": $n, \"by_gateway\": $(lg_get /stats 'd["online_by_gateway"]'), \"failed\": $(lg_get /stats 'd["failed"]')"
+  lg_wait "$(settled "$n")" $((n / rate * 3 + 60)) &&
+    online=$(lg_get /stats '('"$(logged_in "$n")"') and min(d["online_by_gateway"].get(g, 0) for g in ("gw-0", "gw-1")) >= '"$n"' * 0.45')
+  on=$(lg_get /stats 'd["online"]')
+  t2_check garbage_online "${online:-false}" "\"want\": $n, \"online\": $on, \"by_gateway\": $(lg_get /stats 'd["online_by_gateway"]'), \"gave_up\": $(lg_get /stats 'd["failed"].get("gave-up", 0)'), \"failed\": $(lg_get /stats 'd["failed"]')"
   [ "$online" = true ] || { down garbage; return; }
   stack_snapshot before
   s0=$(gws_counters) l0=$(stack_counters logic lease_error="$LOGIC_LEASE_ERROR")
@@ -532,9 +585,9 @@ phase_garbage() {
   want=$(python3 -c 'import sys; print(int(0.95 * int(sys.argv[1]) * int(sys.argv[2])))' "$grate" "$secs")
   t2_check garbage_delivered "$(echo "{\"g\": $d, \"f\": $flood}" | lg_true - 'd["f"]["attempts"] >= '"$want"' and sum(v["hs_failed"] + v["hs_no_slot"] + v["hs_no_token"] for v in d["g"].values()) >= '"$want")" \
     "\"rate\": $grate, \"seconds\": $secs, \"want\": $want, \"attempts\": $(echo "$flood" | lg_py - 'd["attempts"]'), \"skipped\": $(echo "$flood" | lg_py - 'd["skipped"]'), \"outcomes\": $(echo "$flood" | lg_py - 'd["outcomes"]'), \"held\": $(echo "$flood" | lg_py - 'd["held"]'), \"gateways\": $(echo "$d" | lg_py - '{g: {k: v[k] for k in ("hs_ok", "hs_failed", "hs_no_slot", "hs_no_token", "rejects_handshake_rate")} for g, v in d.items()}'), \"timewait\": [$tw0, $tw1], \"tcp\": $(t2_tcpstat_json "$STACK_DIR/tcp0" "$STACK_DIR/tcp1")"
-  t2_check garbage_limited "$(echo "$d" | lg_true - 'all(v["hs_no_slot"] + v["hs_no_token"] > 0 for v in d.values())')" \
+  t2_check garbage_limited "$(echo "$d" | lg_true - 'all(v["hs_no_token"] > 0 for v in d.values())')" \
     "\"refused\": $(echo "$d" | lg_py - '{g: {"no_slot": v["hs_no_slot"], "no_token": v["hs_no_token"]} for g, v in d.items()}'), \"dh_per_s\": $(echo "$d" | lg_py - '{g: round(v["hs_failed"] / '"$secs"') for g, v in d.items()}'), \"bucket\": ${FLOODS_GARBAGE_BUCKET:-25000}"
-  heartbeats garbage "$n" "$d"
+  heartbeats garbage "$on" "$d"
   lease garbage "$d" "$lease_s" "$(stack_counters_delta "$l0" "$l1")"
   t2_field garbage "{\"clients\": $n, \"rate\": $rate, \"garbage_rate\": $grate, \"inflight\": $inflight, \"seconds\": $secs, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"usage\": $usage, \"gateways\": $d, \"flood\": $flood}"
   down garbage
@@ -550,7 +603,7 @@ phase_garbage() {
 phase_slow() {
   local n=${FLOODS_CLIENTS:-400000} rate=${FLOODS_RATE:-10000} hs=${FLOODS_SLOW_HANDSHAKE:-80000}
   local au=${FLOODS_SLOW_AUTH:-40000} srate=${FLOODS_SLOW_RATE:-10000} hold=${FLOODS_SLOW_HOLD:-60}
-  local s0 s1 d l0 l1 t0 lease_s flooding=true online usage inst held f
+  local s0 s1 d l0 l1 t0 lease_s flooding=true online on usage inst held f
   STACK_GATEWAYS=2 STACK_GATEWAY_ARGS=(-max-conns $(((n + hs + au) / 2 + (n + hs + au) / 10)) -heartbeat "${HB}s")
   up slow || { stack_down; return; }
   stack_snapshot before
@@ -566,7 +619,8 @@ phase_slow() {
   lg_start slow-light -mode light -clients "$n" -rate "$rate" -ping-every "${HB}s" -uid-prefix slow
   stack_usage_start loadgen="$LG_PID" flood="${LG_PIDS[flood]}" flood2="${LG_PIDS[flood2]}"
   online=false
-  lg_wait_online "$n" $((n / rate * 3 + 60)) && online=$(lg_get /stats 'd["online"] == '"$n")
+  lg_wait "$(settled "$n")" $((n / rate * 3 + 60)) && online=$(lg_get /stats "$(logged_in "$n")")
+  on=$(lg_get /stats 'd["online"]')
   sleep "$hold"
   usage=$(stack_usage_json)
   lg_in flood lg_stop
@@ -577,16 +631,18 @@ phase_slow() {
   stack_snapshot after
   lg_stop
   d=$(gws_delta "$s0" "$s1")
+  # Slow-auth's handshakes meet the limiter: a refused one ends pre-handshake,
+  # with no hold, and the bounds are on the holds the timeouts ended (O1).
   held=true
-  for inst in slowhs slowauth; do
-    [ "$(lg_true "$STACK_DIR/artifacts/loadgen-$inst.json" 'set(d["flood"]["outcomes"]) == {"closed"} and d["flood"]["held"]["p50_ms"] >= 5000 and d["flood"]["held"]["p99_ms"] <= 6500 and d["flood"]["held"]["max_ms"] <= 7500')" = true ] || held=false
+  for inst in slowhs:'{"closed"}' slowauth:'{"closed", "pre-handshake"}'; do
+    [ "$(lg_true "$STACK_DIR/artifacts/loadgen-${inst%%:*}.json" 'set(d["flood"]["outcomes"]) <= '"${inst#*:}"' and "closed" in d["flood"]["outcomes"] and d["flood"]["held"]["p50_ms"] >= 5000 and d["flood"]["held"]["p99_ms"] <= 6500 and d["flood"]["held"]["max_ms"] <= 7500')" = true ] || held=false
   done
   t2_check slow_held "$held" "\"slowhs\": $(lg_py "$STACK_DIR/artifacts/loadgen-slowhs.json" '{k: d["flood"][k] for k in ("attempts", "open", "outcomes", "held")}'), \"slowauth\": $(lg_py "$STACK_DIR/artifacts/loadgen-slowauth.json" '{k: d["flood"][k] for k in ("attempts", "open", "outcomes", "held")}')"
   t2_check slow_freed "$(echo "{\"g\": $d, \"h\": $(lg_py "$STACK_DIR/artifacts/loadgen-slowhs.json" 'd["flood"]["outcomes"].get("closed", 0)'), \"a\": $(lg_py "$STACK_DIR/artifacts/loadgen-slowauth.json" 'd["flood"]["outcomes"].get("closed", 0)')}" | lg_true - 'sum(v["rejects_handshake_timeout"] for v in d["g"].values()) >= d["h"] and sum(v["rejects_auth_timeout"] for v in d["g"].values()) >= d["a"]')" \
     "\"handshake_timeout\": $(echo "$d" | lg_py - 'sum(v["rejects_handshake_timeout"] for v in d.values())'), \"slowhs_closed\": $(lg_py "$STACK_DIR/artifacts/loadgen-slowhs.json" 'd["flood"]["outcomes"].get("closed", 0)'), \"auth_timeout\": $(echo "$d" | lg_py - 'sum(v["rejects_auth_timeout"] for v in d.values())'), \"slowauth_closed\": $(lg_py "$STACK_DIR/artifacts/loadgen-slowauth.json" 'd["flood"]["outcomes"].get("closed", 0)')"
   t2_check slow_legit "$(echo "{\"g\": $d, \"o\": ${online:-false}}" | lg_true - 'd["o"] is True and all(v[k] == 0 for v in d["g"].values() for k in ("logins_busy", "rejects_login_queue", "rejects_pending_mem", "rejects_at_capacity", "hs_no_token"))')" \
-    "\"want\": $n, \"online\": ${online:-false}, \"failed\": $(lg_json 'd["failed"]'), \"login_latency\": $(lg_json 'd["login_latency"]'), \"gateways\": $(echo "$d" | lg_py - '{g: {k: v[k] for k in ("logins_ok", "logins_busy", "rejects_login_queue", "rejects_pending_mem", "rejects_at_capacity", "hs_no_slot", "hs_no_token")} for g, v in d.items()}')"
-  heartbeats slow "$n" "$d"
+    "\"want\": $n, \"online\": $on, \"gave_up\": $(lg_json 'd["failed"].get("gave-up", 0)'), \"failed\": $(lg_json 'd["failed"]'), \"login_latency\": $(lg_json 'd["login_latency"]'), \"gateways\": $(echo "$d" | lg_py - '{g: {k: v[k] for k in ("logins_ok", "logins_busy", "rejects_login_queue", "rejects_pending_mem", "rejects_at_capacity", "hs_no_slot", "hs_no_token")} for g, v in d.items()}')"
+  heartbeats slow "$on" "$d"
   lease slow "$d" "$lease_s" "$(stack_counters_delta "$l0" "$l1")"
   t2_field slow "{\"clients\": $n, \"rate\": $rate, \"slow_handshake\": $hs, \"slow_auth\": $au, \"slow_rate\": $srate, \"hold_s\": $hold, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"usage\": $usage, \"gateways\": $d}"
   down slow
@@ -656,12 +712,12 @@ GOIM_TEST_TIER=2 T2_CPUS_GATEWAY=0-1 T2_CPUS_LOGIC=0-1 T2_CPUS_LOADGEN=0-1 \
 
 The `grep` must show three `. ` lines naming `scripts/`, a `:` line, `t2_mem_budget 0`, the redis path, `if ! true`, and `t2_need` without sudo.
 
-Expected (prototype, ~2 min): `exit 1`. `result.json` parses and has 27 checks. All pass except `storm_rate`, and possibly the `no_swap_in_*` checks from the dev machine's own swapping (the prototype saw 1–22 pages in some runs and 0 in others). Values from the prototype (`c99b8bc`):
-- `storm_rate` fails: `rate_per_s` 385 of 1,000. The dev gateway has 2 CPUs, so 1 handshake slot, and `storm_bucket` (which passes) shows why: `hs_no_token` 0, `hs_no_slot` 993, `no_slot_share` 0.33, loadgen `failed` `{"pre-handshake": 993}`. `storm_online` passes: all 2,000 logged in through the retries.
-- `garbage_delivered`: `attempts` 90,373 against `want` 85,500, `skipped` 0, `outcomes` `{"closed": 90373}`. Gateways: gw-0 `hs_failed` 25,057 and `hs_no_token` 34,737, gw-1 25,067 and 5,389 (the split of Review Focus 3). `timewait` `[2895, 8192]`. `tcp.TCPTimeWaitOverflow` ~65k, `ListenOverflows` 0.
-- `garbage_limited`: both gateways refused, `dh_per_s` 557 each against `bucket` 500 (the burst of 2,500 included).
-- `garbage_heartbeats` and `slow_heartbeats`: `pong_missing` 0, `pongs` 3,208 and 2,567, `pong_rtt.max_ms` 19 and 52, `lost` `{}`, no heartbeat closes. `garbage_lease` and `slow_lease`: `live` 3–4 per gateway, at the floor, no `missing` or `error`.
-- `slow_flood`: each flood `open` 500, `closed` 500. `slow_held`: 3,500 closed each, p50 ~5,510ms, p99 ~5,995ms, max ~6,007ms. `slow_freed`: `handshake_timeout` 3,500 = `slowhs_closed`, `auth_timeout` 3,500 = `slowauth_closed`. `slow_legit`: 2,000 online, `failed` `{}`, every gateway count 0.
+Expected (prototype, ~2 min): `exit 1`. `result.json` parses and has 27 checks. All pass except the `no_swap_in_*` checks, which may fail from the dev machine's own swapping: the prototype saw 2–22 pages in some runs and 0 in others, and `86b99bc` failed `no_swap_in_garbage` (15) and `no_swap_in_slow` (2). Values from the prototype (`86b99bc`):
+- `storm_rate` passes on the seen rate: `seen_per_s` 1,075 of 1,000, with the completed `rate_per_s` at 586 (`ramp_s` 3.1). The dev gateway has 2 CPUs, so 1 handshake slot, and `storm_bucket` (which passes) shows the semaphore's loss: `hs_no_token` 0, `hs_no_slot` 792, `no_slot_share` 0.28, loadgen `failed` `{"pre-handshake": 792}`. `storm_online` passes: all 2,000 logged in through the retries, `gave_up` 0.
+- `garbage_delivered`: `attempts` 90,390 against `want` 85,500, `skipped` 0, `outcomes` `{"closed": 90389}`. Gateways: gw-0 `hs_failed` 25,068 and `hs_no_token` 33,051, gw-1 25,077 and 7,095 (the split of Review Focus 3), `hs_no_slot` 0 on both. `timewait` `[2801, 8192]`. `tcp.TCPTimeWaitOverflow` ~65k, `ListenOverflows` 0.
+- `garbage_limited`: both buckets refused (`no_token` above), `dh_per_s` 557 each against `bucket` 500 (the burst of 2,500 included).
+- `garbage_heartbeats` and `slow_heartbeats`: `pong_missing` 0, `pongs` 3,208 and 2,571, `pong_rtt.max_ms` 16 and 66, `lost` `{}`, no heartbeat closes. `garbage_lease` and `slow_lease`: `live` 4 per gateway, at or above the floor (3 and 4), no `missing` or `error`.
+- `slow_flood`: slowhs `open` 500, `closed` 500, slowauth `open` 451, `closed` 500. `slow_held`: 3,500 closed each, all `closed`, p50 ~5,510ms, p99 ~5,997ms, max ~6,018ms. `slow_freed`: `handshake_timeout` 3,500 = `slowhs_closed`, `auth_timeout` 3,500 = `slowauth_closed`. `slow_legit`: 2,000 online, `gave_up` 0, `failed` `{}`, every gateway count 0.
 - `artifacts`: `missing` `""`. `garbage/artifacts/garbage/` holds `gw-0`, `gw-1`, `logic` and `loadgen-flood` `.cpu.pb.gz`.
 
 Then the pass path of `storm`, at a rate one slot carries:
@@ -672,9 +728,16 @@ GOIM_TEST_TIER=2 T2_CPUS_GATEWAY=0-1 T2_CPUS_LOGIC=0-1 T2_CPUS_LOADGEN=0-1 FLOOD
   FLOODS_STORM_CLIENTS=1000 FLOODS_STORM_RATE=200 bash "$D/floods.sh" >"$D/out2.txt" 2>&1; echo "exit $?"
 ```
 
-Expected: `exit 0`, 8 checks. `storm_rate` `rate_per_s` 184 of 200. `storm_bucket` `hs_no_slot` 67 (`no_slot_share` 0.06), `hs_no_token` 0.
+Expected: `exit 0`, 8 checks. `storm_rate` `seen_per_s` 197 of 200, `rate_per_s` 187. `storm_bucket` `hs_no_slot` 54 (`no_slot_share` 0.05), `hs_no_token` 0.
 
-And the refusals, each before anything starts (`exit 1`, with these messages): `FLOODS_PHASES=bogus` prints `floods: unknown phase 'bogus' (storm, garbage, slow)`. `FLOODS_GARBAGE_SECONDS=30` prints `floods: FLOODS_GARBAGE_SECONDS must be at least 45 (the flood's profile)`. `FLOODS_RATE=1.5` prints `floods: FLOODS_RATE must be a positive whole number`. Each is run as `GOIM_TEST_TIER=2 VAR=VALUE bash "$D/floods.sh"`. No process is left (`pgrep -af "tier2-results/floods" | grep -v pgrep || echo none`). Afterwards, remove `tier2-results/floods-*` and `$D`.
+And the refusals, each before anything starts (`exit 1`, with these messages): `FLOODS_PHASES=bogus` prints `floods: unknown phase 'bogus' (storm, garbage, slow)`. `FLOODS_GARBAGE_SECONDS=30` prints `floods: FLOODS_GARBAGE_SECONDS must be at least 45 (the flood's profile)`. `FLOODS_RATE=1.5` prints `floods: FLOODS_RATE must be a positive whole number`. Each is run as `GOIM_TEST_TIER=2 VAR=VALUE bash "$D/floods.sh"`. No process is left (`pgrep -af "tier2-results/floods" | grep -v pgrep || echo none`).
+
+Then the review's checks (O1–O3), each run like the pass path above (the same `GOIM_TEST_TIER` and CPU sets, `rm -rf tier2-results/floods-*` first). Each must fail, or pass, as named:
+- **A slow-auth handshake refused (O1, O2):** in a second copy, `D2=$(mktemp -d)`, made by the same `cp` and `sed` lines as `$D`, the slow phase's gateways get a tiny bucket: `sed -i 's|(n + hs + au) / 10)) -heartbeat "${HB}s")|(n + hs + au) / 10)) -heartbeat "${HB}s" -handshake-rate 70 -handshake-burst 1)|' "$D2/floods.sh"`. Then run `FLOODS_PHASES=slow FLOODS_CLIENTS=200 FLOODS_RATE=50 FLOODS_SLOW_HANDSHAKE=500 FLOODS_SLOW_AUTH=500 FLOODS_SLOW_RATE=500 FLOODS_SLOW_HOLD=35 bash "$D2/floods.sh"`. Expected (prototype): `slow_held` passes, with slowauth `outcomes` `{"closed": 4256, "pre-handshake": 3698}` and its holds p50 5,498ms, p99 5,990ms. `slow_legit` fails only on `hs_no_token` (2,122 and 1,856, from the tiny bucket). Its `online` 199 + `gave_up` 1 with `failed` `{"gave-up": 1, "pre-handshake": 280}` meets the logged-in rule. `slow_heartbeats` passes on 199 online. With `slow_held`'s old rule (`== {"closed"}`) the same result fails.
+- **The bucket never fires (O3):** `FLOODS_PHASES=garbage FLOODS_CLIENTS=2000 FLOODS_RATE=1000 FLOODS_GARBAGE_RATE=2000 FLOODS_GARBAGE_INFLIGHT=500 FLOODS_GARBAGE_SECONDS=45 FLOODS_GARBAGE_BUCKET=100000 bash "$D/floods.sh"`. Expected: `garbage_limited` fails (`no_token` 0 and `no_slot` 0 on both, `dh_per_s` 1,386 and 622), while `garbage_delivered` passes.
+- **A loadgen-bound storm (O2):** `FLOODS_PHASES=storm FLOODS_STORM_CLIENTS=20000 FLOODS_STORM_RATE=20000 bash "$D/floods.sh"`. Expected: `storm_rate` fails (`seen_per_s` 2,758 of 20,000, loadgen ~1 core of the dev machine's 2). `storm_online` fails too: besides 11 `gave-up` clients, loadgen counted `login` failures (16,986), and failures other than pre-handshake still fail.
+
+Afterwards, remove `tier2-results/floods-*`, `$D` and `$D2`.
 
 - [ ] **Step 4: Commit**
 
@@ -700,10 +763,10 @@ Expected: `lib_test`, `loadgen_test` and `stack_test` print `all passed`, and `m
 On the Tier 2 host, after `git fetch && git switch feat/plan6b3 && git pull`, with the desktop apps closed, the user runs `GOIM_TEST_TIER=2 make test-tier2 SCENARIO=floods` and sends back the `.report.txt`. Expected: 27/27 (`storm_stack`, `no_swap_in_storm`, `storm_online`, `storm_rate`, `storm_bucket`, `storm_idle`, `storm_processes`, `garbage_stack`, `garbage_online`, `no_swap_in_garbage`, `garbage_delivered`, `garbage_limited`, `garbage_heartbeats`, `garbage_lease`, `garbage_idle`, `garbage_processes`, `slow_stack`, `slow_flood`, `no_swap_in_slow`, `slow_held`, `slow_freed`, `slow_legit`, `slow_heartbeats`, `slow_lease`, `slow_idle`, `slow_processes`, `artifacts`).
 
 What to read, for the *Execution Notes*, the roadmap and the README:
-- **storm:** `storm_rate.handshakes` (`rate_per_s`, `peak_per_s`, `ramp_s`) and `loadgen_cores`, `storm_bucket` (`hs_no_token` 0, `hs_no_slot` and `no_slot_share`, Review Focus 1, against the ~1.2% estimate), `storm.login_latency`, `storm.usage` (gw-0's and Logic's cores at 20k/s).
-- **garbage:** `garbage_delivered` (`attempts`/`want`, the gateways' `hs_failed` and `hs_no_token`/`hs_no_slot` each, `outcomes`, `timewait`, `tcp.TCPTimeWaitOverflow`, `tcp.ListenOverflows`), `garbage_limited.dh_per_s` against 25,000/s, the gateways' cores (`garbage.usage`) and the flood's, the heartbeats' `pong_rtt` p50/p99/max, `garbage_lease`. The gateways' profiles (`garbage/artifacts/garbage/gw-*.cpu.pb.gz`) show how much of their CPU the failed DH took.
-- **slow:** `slow_flood` (`open` against 85%), `slow_held` quantiles, `slow_freed`, `slow_legit` (`login_latency`, loadgen `failed`, each gateway's `hs_no_slot`), the heartbeats, `slow_lease`.
-- If a check fails: `storm_rate` or `garbage_delivered` → Review Focus 2. `garbage_limited` on one gateway → Review Focus 3. `slow_legit` with `rejects_pending_mem` → the floods filled the pending cap (lower `FLOODS_SLOW_HANDSHAKE`), with `hs_no_token` → slow-auth's share is too high for the bucket (lower `FLOODS_SLOW_AUTH`). `slow_held` past 6.5s → the gateways' wheel was late under the floods, which is a finding. `<phase>_heartbeats` → the limiter did not protect established connections, the spec's claim: read `pong_rtt` and the gateways' profiles.
+- **storm:** `storm_rate.handshakes` (`seen_per_s` against the completed `rate_per_s`, `peak_per_s`, `ramp_s`) and `loadgen_cores`, `storm_bucket` (`hs_no_token` 0, `hs_no_slot` and `no_slot_share`, Review Focus 1, against the 20–45% range of a ~300–500µs hold), `storm_online.gave_up`, `storm.login_latency`, `storm.usage` (gw-0's and Logic's cores at 20k/s). `no_slot_share`, `gave_up` and the completed rate are #111's input.
+- **garbage:** `garbage_delivered` (`attempts`/`want`, the gateways' `hs_failed` and `hs_no_token`/`hs_no_slot` each, `outcomes`, `timewait`, `tcp.TCPTimeWaitOverflow`, `tcp.ListenOverflows`), `garbage_limited` (`no_token` and `no_slot` per gateway, `dh_per_s` against 25,000/s: which limit bound first, Review Focus 3), the gateways' cores (`garbage.usage`) and the flood's, the heartbeats' `pong_rtt` p50/p99/max, `garbage_lease`. The gateways' profiles (`garbage/artifacts/garbage/gw-*.cpu.pb.gz`) show how much of their CPU the failed DH took.
+- **slow:** `slow_flood` (`open` against 85%), `slow_held` quantiles and slowauth's `pre-handshake` count, `slow_freed`, `slow_legit` (`login_latency`, `gave_up`, loadgen `failed`, each gateway's `hs_no_slot`), the heartbeats, `slow_lease`.
+- If a check fails: `storm_rate` or `garbage_delivered` → Review Focus 2. `garbage_limited` → Review Focus 3: with `dh_per_s` under 25,000 and `no_slot` large the semaphore bound first (a finding, #111's input), with `no_slot` small the split was uneven (raise `FLOODS_GARBAGE_RATE`). `storm_online` or `slow_legit` with a failure other than `pre-handshake`/`gave-up` → read which (`login` timeouts, Busy) before any limiter. `slow_legit` with `rejects_pending_mem` → the floods filled the pending cap (lower `FLOODS_SLOW_HANDSHAKE`), with `hs_no_token` → slow-auth's share is too high for the bucket (lower `FLOODS_SLOW_AUTH`). `slow_held` past 6.5s → the gateways' wheel was late under the floods, which is a finding. `<phase>_heartbeats` → the limiter did not protect established connections, the spec's claim: read `pong_rtt` and the gateways' profiles.
 
 - [ ] **Step 2: Record**
 
@@ -723,7 +786,7 @@ Push the branch. Fast-forwarding `main` is the user's call.
 ## After this plan
 
 - **6b3c** (`POST /reset`, `POST /network-change`, scenario `reconnect`, run 31) reuses `floods`' pattern: instances named by role, `lg_stop_all`, per-gateway counters, `<phase>_heartbeats` from a light instance beside an SDK storm. The SDK's pre-handshake retries meet the same concurrency limit in a whole-population reconnect. Run 30's `no_slot_share` (Review Focus 1) is the measured input for that.
-- **Spec:** if run 30 shows a large `no_slot` share in a legitimate storm, *Admission control*'s "shapes load rather than rejecting it" holds for the bucket but not for the semaphore. Deciding that is the user's call, after the run.
+- **Spec and #111:** if run 30 shows a large `no_slot` share in a legitimate storm, *Admission control*'s "shapes load rather than rejecting it" holds for the bucket but not for the semaphore. That is parked #111 (a handshake that finds no free slot waits briefly), and run 30's `no_slot_share`, `gave_up`, slow-auth's `pre-handshake` and garbage's `dh_per_s` are its input. Unparking it is the user's call, after the run.
 
 ## Execution Notes
 
