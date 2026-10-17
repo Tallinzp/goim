@@ -1,6 +1,9 @@
 package wire
 
-import "testing"
+import (
+	"runtime"
+	"testing"
+)
 
 // The handshake's cost on each side (#130): BenchmarkRespond is the
 // gateway's work per legitimate handshake, BenchmarkInitiate and
@@ -53,6 +56,28 @@ func BenchmarkFinish(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// BenchmarkInitiatorHeap reports the live heap one pending handshake keeps
+// until Finish (#130 review O1): loadgen's precompute holds one Initiator
+// per SDK client, 600k in gwloss's b_stress.
+func BenchmarkInitiatorHeap(b *testing.B) {
+	k := benchKey(b)
+	ins := make([]*Initiator, b.N)
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	for i := range ins {
+		in, _, err := Initiate(1, k.Public, cmdHandshake)
+		if err != nil {
+			b.Fatal(err)
+		}
+		ins[i] = in
+	}
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	b.ReportMetric(float64(int64(after.HeapAlloc)-int64(before.HeapAlloc))/float64(b.N), "heap-B/op")
+	runtime.KeepAlive(ins)
 }
 
 func benchKey(b *testing.B) Key {

@@ -173,7 +173,8 @@
 #   <phase>_processes     nothing died, panicked or stopped uncleanly
 #   artifacts             metrics before and after each phase's window, the
 #                         slow phase's series (slow-series.jsonl), the
-#                         garbage flood's CPU profiles, loadgen's results
+#                         storm's and the garbage flood's CPU profiles,
+#                         loadgen's results
 # Each phase also records its CPU sets' shares and softnet drops over its
 # window (cpu_sets: run 30's garbage SYN loss had none snapshotted), and
 # conntrack's own drops (conntrack_stat: insert_failed, drop, early_drop,
@@ -658,12 +659,18 @@ phase_storm() {
   stack_usage_start loadgen="$LG_PID"
   hs_sampler gw-0 "$STACK_DIR/artifacts/handshakes-gw-0.tsv" "$LG_PID" &
   smp=$!
+  # The gateway's and loadgen's CPU over 8s of the ramp, from 1s in: X25519's
+  # share on both sides of the handshake (#130).
+  (sleep 1; stack_profile storm 8 & lg_profile storm 8 & wait) >/dev/null 2>&1 &
+  prof=$!
   online=$(t2_bool lg_wait "$(settled "$n")" $((n / rate * 3 + 60)))
   kill "$smp" 2>/dev/null; wait "$smp" 2>/dev/null; smp=""
   usage=$(stack_usage_json)
   t2_cpustat_snap "$STACK_DIR/cpustat-1"
   ct_stat_snap "$STACK_DIR/ctstat-1"
   s1=$(gws_counters)
+  wait "$prof"
+  prof=""
   t2_record_end storm
   stack_snapshot after
   d=$(gws_delta "$s0" "$s1")
@@ -683,6 +690,9 @@ phase_storm() {
     "\"gw-0\": $(echo "$d" | lg_py - '{k: d["gw-0"][k] for k in ("hs_ok", "hs_no_token", "hs_no_slot", "rejects_handshake_rate", "logins_busy", "rejects_pending_mem", "rejects_at_capacity")}'), \"no_slot_share\": $(echo "$d" | lg_py - 'round(d["gw-0"]["hs_no_slot"] / (d["gw-0"]["hs_ok"] + d["gw-0"]["hs_no_slot"]), 4)'), \"failed\": $(lg_get /stats 'd["failed"]')"
   t2_field storm "{\"clients\": $n, \"rate\": $rate, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"usage\": $usage, \"cpu_sets\": $(t2_cpusets_json "$STACK_DIR/cpustat-0" "$STACK_DIR/cpustat-1"), \"conntrack_stat\": $(ct_stat_json "$STACK_DIR/ctstat-0" "$STACK_DIR/ctstat-1"), \"handshakes\": $hs, \"gateways\": $d, \"login_latency\": $(lg_get /stats 'd["login_latency"]'), \"failed\": $(lg_get /stats 'd["failed"]')}"
   down storm "$n"
+  for f in gw-0 loadgen; do
+    gzip -t "$STACK_DIR/artifacts/storm/$f.cpu.pb.gz" 2>/dev/null || missing+=" storm:storm/$f.cpu.pb.gz"
+  done
 }
 
 # garbage: #121 (1), garbage handshakes beside a Pinging population.
