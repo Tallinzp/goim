@@ -938,6 +938,27 @@ Run by the user after run 30m. **Failed 10/12**: `slow_legit` (`rejects_pending_
 - **First attempt** (commit `16f93e7`, `capacity-20261017-100656`): invalid, the `LG_CPUS` bug (`6a709ae`): loadgen under `taskset -c 8`, `pinning` `wrong` `loadgen`, `online` null after the 420s ramp wait; stopped by Ctrl-C (`stopped` exit 130). The teardown ran (gateway draining, Logic and Redis shut down) but printed nothing for over a minute while further Ctrl-Cs were ignored, so it looked hung: `d252368` prints a `stopping:` line when a signal's teardown starts.
 - **Rerun** (commit `d252368`, `dirty` 0, 311s; `capacity-20261017-103512`): **passed 12/12**. 600,000 light clients online in 122s on one gateway (12 CPUs, default GC), none lost; 601,200 Pongs in the 150s window, none missing, `ping_gap_max_ms` 150,033 (limit 165,000); Login p99 21ms, Pong p99 2ms. Gateway: RSS 1,179MB in the window (peak 1,358MB), **live heap 735MB = 1,286 B per connection** (run 19: 1,208 B; +78 B against P6b3b4I-1's expected +96 B per Session), 0.178 cores over the window, 44.5µs per Pong, 1 GC cycle in the window. Loadgen 1.09 of 8 cores in the ramp. No swap, no loopback drops.
 
+### Handshake-concurrency-4 trial at the new cost (2026-10-17, the user, Tier 2 host; commit `6bbcdf9`, `dirty` 0, 262s; `gwloss-20261017-104939`; `GWLOSS_PHASES=b_stress GWLOSS_STRESS_HANDSHAKE_CONCURRENCY=4 GWLOSS_SS_EVERY=10`)
+
+The user's call after the 30j rerun (repeat `d218483`'s trial, 594s at 4 against 188s at 2, now at the halved handshake cost). **14/15**: only `b_stress_storm_real` failed (attempt_lag p99 1,760ms, `send_lag` p99 3,466ms, and not `loadgen_bound`: loadgen 10.0 of 14 cores in the first 30s). No swap in (3,731 pages out).
+
+| b_stress | 2 slots (30j rerun) | 4 slots |
+|---|---|---|
+| all back (`back_s`) | 127s | **107s** |
+| from the kill p50 / p90 / p99 | 23.2 / 40.8 / 54.6s | **41.4 / 71.0 / 74.8s** |
+| survivors' `no_slot` | 2,570,379 | 0 |
+| survivors' `pending_mem` (gw-1 / gw-2) | 0 / 0 | **100,602 / 2,251,091** |
+| survivors' `login_queue` | 17,713 / 16,898 | **226,068 / 379,925** |
+| loadgen failures `busy` / `no-reply` | 34,611 / 58 | **605,993 / 284,097** |
+| handshakes done by the survivors | 634,669 | **1,490,303** (606,008 + 884,295) |
+| connections opened in the storm | 3,206,518 | **3,843,286** |
+| Logic: logins replaced / live Kicks ok | 599,481 / 0 | 625,933 / **30,848** |
+| Logic's set (2 CPUs), storm first 30s | 1.43 cores | 1.35 cores (storm 59% busy) |
+| gateway set busy over the storm | 25.7% | 45.3% |
+
+- **Reading:** with 4 slots no handshake is refused for a slot, but the refusals move later and get dearer. The survivors complete 2.3× as many handshakes, then refuse the excess at the pending-socket cap (`pending_mem`, mostly gw-2: 2.25M) or, after the handshake, at Logic's login queue (606k `Busy`), each a finished DH thrown away, and the clients redial (3.84M connections against 3.21M). Some relogins time out (`no-reply` 284k) after their Login succeeded, so a later attempt Kicks the live session (30,848 live Kicks). The last client is back 20s sooner, but the median and p99 client 18–20s later. Not the collapse of `d218483` (594s), which #130's halved cost removed. Unexplained here: the split between the two survivors (`pending_mem` 100,602 frozen on gw-1 from t=29s while gw-2 kept refusing; 884k against 606k handshakes) with the balancer's connections even (~300k each).
+- **For the default (#111, #116):** on this host 2 slots per 4 loops still gives the better median and p99; 4 trades them for a shorter tail. A refusal before the DH (`no_slot`) is the cheapest place to refuse; #111 (a handshake waits briefly for a slot) remains the alternative to more slots.
+
 ### Task 3 summary
 
 Runs 30i and 30k (floods) passed, 30l–30n probed the slow phase's edge, the 30j rerun (gwloss) passed with b_stress back in 127s (179–188s before), `race` and `capacity` `a_default` passed. Open, the user's calls: whether the README's floods, 600k SIGKILL and *Gateway memory at 600k* rows take these numbers (both languages), and whether to repeat the handshake-concurrency-4 trial at the new cost (#111, #116). Next: Plan 6b3c (fresh session), with run 30m's verdict gap and run 30n's `slow_freed` note.
