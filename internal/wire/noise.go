@@ -17,11 +17,6 @@ import (
 	"github.com/flynn/noise"
 )
 
-// Suite is Noise_NK_25519_ChaChaPoly_SHA256 (spec: Client encryption).
-// SHA-256 rather than BLAKE2s because the apps' platform crypto (iOS
-// CryptoKit, Android) has it natively.
-var Suite = noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashSHA256)
-
 // Handshake sizes. NK message 1 is e, es and an empty payload's tag; message
 // 2 is e, ee and an empty payload's tag. Handshake messages carry no
 // application payload (R4G-O6), so both sizes are exact.
@@ -43,11 +38,26 @@ var (
 	ErrClosedBeforeReply = errors.New("wire: closed before the handshake reply")
 )
 
-// Key is a server static key: X25519, 32 bytes each.
-type Key = noise.DHKey
+// Key is a server static key: X25519, 32 bytes each. It keeps the parsed
+// private key, so a handshake doesn't parse it again (#130); a Key built
+// from its bytes alone still works, parsed on each use.
+type Key struct {
+	Private, Public []byte
+	priv            *ecdh.PrivateKey
+}
+
+func newKey(priv *ecdh.PrivateKey) Key {
+	return Key{Private: priv.Bytes(), Public: priv.PublicKey().Bytes(), priv: priv}
+}
 
 // GenerateKey returns a new server static key.
-func GenerateKey() (Key, error) { return Suite.GenerateKeypair(rand.Reader) }
+func GenerateKey() (Key, error) {
+	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		return Key{}, err
+	}
+	return newKey(priv), nil
+}
 
 // ParsePrivate builds a Key from a base64 (standard encoding) private key.
 func ParsePrivate(s string) (Key, error) {
@@ -59,7 +69,7 @@ func ParsePrivate(s string) (Key, error) {
 	if err != nil {
 		return Key{}, fmt.Errorf("wire: private key: %w", err)
 	}
-	return Key{Private: priv.Bytes(), Public: priv.PublicKey().Bytes()}, nil
+	return newKey(priv), nil
 }
 
 // EncodeKey returns k's private (for the Secret) and public (pinned in the
@@ -127,11 +137,17 @@ type Session struct {
 // frame, with the static key its key_id selected. It returns the session and
 // the server's handshake frame (Cmd = cmd, payload = the raw Noise message).
 func Respond(key Key, frame []byte, cmd uint16) (*Session, []byte, error) {
+	return respond(newSuite(key.priv), key, frame, cmd, nil)
+}
+
+// respond is Respond with cipher suite cs and the ephemeral key read from rng
+// (nil: crypto/rand).
+func respond(cs noise.CipherSuite, key Key, frame []byte, cmd uint16, rng io.Reader) (*Session, []byte, error) {
 	if len(frame) != HeaderLen+HandshakeLen {
 		return nil, nil, ErrHandshake
 	}
-	hs, err := noise.NewHandshakeState(noise.Config{CipherSuite: Suite, Pattern: noise.HandshakeNK,
-		Prologue: prologue(frame), StaticKeypair: key})
+	hs, err := noise.NewHandshakeState(noise.Config{CipherSuite: cs, Pattern: noise.HandshakeNK,
+		Random: rng, Prologue: prologue(frame), StaticKeypair: noise.DHKey{Private: key.Private, Public: key.Public}})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -160,11 +176,17 @@ type Initiator struct {
 // Initiate starts the client side: it returns the handshake frame to send,
 // for the server key pinned under keyID.
 func Initiate(keyID uint16, serverPub []byte, cmd uint16) (*Initiator, []byte, error) {
+	return initiate(newSuite(nil), keyID, serverPub, cmd, nil)
+}
+
+// initiate is Initiate with cipher suite cs and the ephemeral key read from
+// rng (nil: crypto/rand).
+func initiate(cs noise.CipherSuite, keyID uint16, serverPub []byte, cmd uint16, rng io.Reader) (*Initiator, []byte, error) {
 	frame := make([]byte, HeaderLen+KeyIDLen, HeaderLen+HandshakeLen)
 	Header{Version: Version, Cmd: cmd, Length: HandshakeLen}.Put(frame)
 	binary.BigEndian.PutUint16(frame[HeaderLen:], keyID)
-	hs, err := noise.NewHandshakeState(noise.Config{CipherSuite: Suite, Pattern: noise.HandshakeNK,
-		Initiator: true, Prologue: prologue(frame), PeerStatic: serverPub})
+	hs, err := noise.NewHandshakeState(noise.Config{CipherSuite: cs, Pattern: noise.HandshakeNK,
+		Initiator: true, Random: rng, Prologue: prologue(frame), PeerStatic: serverPub})
 	if err != nil {
 		return nil, nil, err
 	}
