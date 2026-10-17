@@ -72,6 +72,21 @@ func TestLogoutQueueFollowsTheCap(t *testing.T) {
 	}
 }
 
+// The refusal hold's flags (#131).
+func TestRefuseHoldFlags(t *testing.T) {
+	cfg, _, _, _, err := parseFlags([]string{"-id", "gw-0"})
+	if err != nil || cfg.RefuseHold != 500*time.Millisecond || cfg.HeldCap != 10_000 {
+		t.Fatalf("defaults: hold %v, cap %d, err %v; want 500ms, 10000", cfg.RefuseHold, cfg.HeldCap, err)
+	}
+	cfg, _, _, _, err = parseFlags([]string{"-id", "gw-0", "-refuse-hold", "0", "-held-cap", "0"})
+	if err != nil || cfg.RefuseHold != 0 || cfg.HeldCap != 0 {
+		t.Fatalf("hold %v, cap %d, err %v; want 0, 0", cfg.RefuseHold, cfg.HeldCap, err)
+	}
+	if _, _, _, _, err := parseFlags([]string{"-id", "gw-0", "-refuse-hold", "5s"}); err == nil {
+		t.Fatal("-refuse-hold 5s accepted: it must stay below -handshake-timeout (5s)")
+	}
+}
+
 // The race suite's flags (Plan 5b).
 func TestRaceSuiteFlags(t *testing.T) {
 	cfg, _, _, o, err := parseFlags([]string{"-id", "gw-0", "-faults", "-clock-offset", "-5s",

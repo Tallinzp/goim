@@ -142,6 +142,8 @@ func parseFlags(args []string) (gateway.Config, gateway.ServerConfig, tcp.Config
 	fs.IntVar(&cfg.NumLoops, "loops", cfg.NumLoops, "gnet event loops (default GOMAXPROCS)")
 	fs.IntVar(&cfg.MaxConns, "max-conns", cfg.MaxConns, "connection cap: open sockets in any state")
 	fs.IntVar(&cfg.PendingCap, "pending-cap", cfg.PendingCap, "HANDSHAKE + AUTH_PENDING sockets")
+	fs.DurationVar(&cfg.RefuseHold, "refuse-hold", cfg.RefuseHold, "a pending_mem or draining refusal stays open until the first tick this long after it (0: close at once)")
+	fs.IntVar(&cfg.HeldCap, "held-cap", cfg.HeldCap, "refusals held open at once; over it they close at once (0: no hold)")
 	fs.IntVar(&cfg.LoginQueueCap, "login-queue-cap", cfg.LoginQueueCap, "Logins waiting for or inside a Login RPC")
 	fs.IntVar(&cfg.LoginRPCs, "login-rpcs", cfg.LoginRPCs, "concurrent Login RPCs to Logic")
 	fs.IntVar(&cfg.LoginBatch, "login-batch", cfg.LoginBatch, "entries per Login RPC")

@@ -342,6 +342,8 @@ GW_COUNTERS=(
   rejects_draining='goim_gateway_admission_rejects_total:reason="draining"'
   rejects_bad_version='goim_gateway_admission_rejects_total:reason="bad_version"'
   rejects_noise_unknown_key='goim_gateway_admission_rejects_total:reason="noise_unknown_key"'
+  refusals_held='goim_gateway_refusals_held_total:result="held"'
+  refusals_held_full='goim_gateway_refusals_held_total:result="full"'
   handshakes_ok='goim_gateway_handshakes_total:result="ok"'
   handshakes_failed='goim_gateway_handshakes_total:result="failed"'
   handshakes_no_slot='goim_gateway_handshakes_total:result="no_slot"'
@@ -395,6 +397,7 @@ ss_sample() {
     gw+="${gw:+, }\"$g\": $(stack_counters "$g" handshake_conns='goim_gateway_connections:state="handshake"' \
       handshake_timeout='goim_gateway_admission_rejects_total:reason="handshake_timeout"' \
       pending_mem='goim_gateway_admission_rejects_total:reason="pending_mem"' \
+      refusals_held=goim_gateway_refusals_held \
       handshakes_ok='goim_gateway_handshakes_total:result="ok"' handshakes_no_slot='goim_gateway_handshakes_total:result="no_slot"')"
   done
   echo "{\"t\": $t, \"ss_ms\": $ms, \"sockets\": {$est}, \"listeners\": {$lst}, \"gateways\": {$gw}, \"loadgen\": $(lg_get /runtime d)}"
