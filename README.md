@@ -85,6 +85,10 @@ GOIM_TEST_TIER=2 make test-tier2 SCENARIO=smoke
 
 This is sub-project 1 (connection and session core) of a larger IM system. Done: gateway, Logic, session store, TCP transport, client SDK, race suite, load generator, the Tier 2 benchmark foundation, the single-gateway capacity and heartbeat-cost benchmarks (600k connections), gateway loss with SDK clients at 200k and 600k, silent loss of a 200k gateway, and a slowed Logic (a CPU quota). Next: floods, Redis Cluster failover, and Kubernetes rolling restarts. Messaging, push and the WebSocket transport are later sub-projects.
 
+## License
+
+Licensed under the GNU Affero General Public License v3.0 (AGPL-3.0-only); see [LICENSE](LICENSE). If you run a modified version as a network service, you must offer its source to the service's users.
+
 ---
 
 ## 中文
@@ -173,5 +177,9 @@ GOIM_TEST_TIER=2 make test-tier2 SCENARIO=smoke
 ### 当前状态
 
 这是一个更大 IM 系统中的子项目 1（连接与会话核心）。已完成：网关、Logic、会话存储、TCP 传输、客户端 SDK、竞态测试集、压测工具、Tier 2 压测基础设施，单网关容量和心跳开销压测（60 万连接），使用 SDK 客户端的 20 万和 60 万连接网关故障，静默丢失一个 20 万连接的网关，以及变慢的 Logic（CPU 配额）。下一步：洪泛、Redis Cluster 故障转移，以及 Kubernetes 滚动重启。消息、推送和 WebSocket 传输属于后续子项目。
+
+### 许可证
+
+本项目采用 GNU Affero 通用公共许可证 v3.0（AGPL-3.0-only），见 [LICENSE](LICENSE)。如果你以网络服务的形式运行修改后的版本，必须向该服务的用户提供其源代码。
 
 [回到 English](#goim)
