@@ -8,18 +8,30 @@
 #   sudo -n /usr/local/sbin/goim-netdrop del PORT   remove that port's rules
 #   sudo -n /usr/local/sbin/goim-netdrop flush      remove every goim-netdrop rule
 #   sudo -n /usr/local/sbin/goim-netdrop list       show them
-#   goim-netdrop --print add|del PORT               print the iptables commands, run nothing
+#   sudo -n /usr/local/sbin/goim-netdrop notrack        untrack the stack's ports on lo (#123)
+#   sudo -n /usr/local/sbin/goim-netdrop notrack-check  exit 0 only if every NOTRACK rule is in place
+#   goim-netdrop --print add|del PORT | notrack     print the iptables commands, run nothing
 #
 # It runs only iptables, from a fixed path, with a fixed rule shape: DROP in
 # INPUT on lo, by destination port (client to gateway) and by source port
 # (gateway to client), tagged with the comment goim-netdrop. PORT must be
 # 1024-65535. It reads no environment variable.
+#
+# NOTRACK (#123): flood churn filled the host's conntrack table with
+# TIME_WAIT entries in run 30 and SYNs were dropped, so the stack's ports,
+# 17000-17199 (STACK_PORT_BASE's default, up to 4 gateways), skip conntrack
+# on lo, as the spec allows a gateway (conntrack: notrack). The raw table's
+# CT --notrack in PREROUTING and OUTPUT, both directions, tagged goim-notrack;
+# flush leaves them. iptables rules do not survive a reboot: host-setup.sh
+# adds them, and lib.sh's guard refuses a run until they are back.
 set -eu
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 IPT=/usr/sbin/iptables
 TAG=goim-netdrop
+NOTRACK_TAG=goim-notrack
+NOTRACK_PORTS=17000:17199 # lib.sh's T2_NOTRACK_LO:T2_NOTRACK_HI
 
-usage() { echo "usage: goim-netdrop [--print] add|del PORT | flush | list" >&2; exit 2; }
+usage() { echo "usage: goim-netdrop [--print] add|del PORT | notrack | flush | list | notrack-check" >&2; exit 2; }
 
 print=0
 if [ "${1:-}" = --print ]; then print=1; shift; fi
@@ -33,6 +45,15 @@ fi
 
 # rule DIR: the match for one direction.
 rule() { echo "-i lo -p tcp --$1 $port -m comment --comment $TAG -j DROP"; }
+# notrack_rules: "CHAIN MATCH" per NOTRACK rule, one per line.
+notrack_rules() {
+  local chain dir
+  for chain in "PREROUTING -i lo" "OUTPUT -o lo"; do
+    for dir in dport sport; do
+      echo "$chain -p tcp --$dir $NOTRACK_PORTS -m comment --comment $NOTRACK_TAG -j CT --notrack"
+    done
+  done
+}
 
 case $cmd in
   add|del)
@@ -61,6 +82,28 @@ case $cmd in
     rules=$($IPT -w -S INPUT)
     printf '%s\n' "$rules" | grep -- "--comment $TAG -j DROP\$" |
       while read -r -a r; do r[0]=-D; $IPT -w "${r[@]}"; done
+    ;;
+  notrack)
+    [ $# -eq 1 ] || usage
+    notrack_rules | while read -r chain spec; do
+      # shellcheck disable=SC2086
+      if [ $print = 1 ]; then
+        echo "iptables -w -t raw -I $chain $spec"
+      else
+        $IPT -w -t raw -C $chain $spec 2>/dev/null || $IPT -w -t raw -I $chain $spec
+      fi
+    done
+    ;;
+  notrack-check)
+    [ $# -eq 1 ] && [ $print = 0 ] || usage
+    notrack_rules | {
+      ok=0
+      while read -r chain spec; do
+        # shellcheck disable=SC2086
+        $IPT -w -t raw -C $chain $spec 2>/dev/null || { echo "missing: -t raw $chain $spec"; ok=1; }
+      done
+      exit $ok
+    }
     ;;
   list)
     [ $# -eq 1 ] && [ $print = 0 ] || usage

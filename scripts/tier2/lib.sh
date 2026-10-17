@@ -544,17 +544,36 @@ t2_netdrop_leftover() {
   fi
 }
 
+# The ports goim-netdrop's NOTRACK rules cover on lo (#123), as its
+# NOTRACK_PORTS: STACK_PORT_BASE's default and up to 4 gateways.
+T2_NOTRACK_LO=17000 T2_NOTRACK_HI=17199
+
+# t2_notrack_covers BASE: refuses (returns 1) a STACK_PORT_BASE whose ports
+# (base … base + 132, the 4th gateway's last, stack.sh's stack_ports) leave
+# the NOTRACK range: they would be tracked again, unseen.
+t2_notrack_covers() {
+  if [ "$1" -lt $T2_NOTRACK_LO ] || [ $(($1 + 132)) -gt $T2_NOTRACK_HI ]; then
+    echo "refused: STACK_PORT_BASE $1 puts the stack's ports outside $T2_NOTRACK_LO-$T2_NOTRACK_HI, the ports host-setup.sh untracks (use $T2_NOTRACK_LO-$((T2_NOTRACK_HI - 132)))"
+    return 1
+  fi
+}
+
 # t2_require_host_setup: load scenarios call it after t2_init; refuses
-# (exit 2) until host-setup.sh has run with this checkout's files, and while
-# an earlier run's DROP rules are left.
+# (exit 2) until host-setup.sh has run with this checkout's files and its
+# NOTRACK rules are in place (they do not survive a reboot), while an
+# earlier run's DROP rules are left, and for a STACK_PORT_BASE outside them.
 t2_require_host_setup() {
   local missing rules why
   missing=$(t2_host_setup_missing scripts/tier2 /proc/sys /sys/module /usr/local/sbin/goim-netdrop)
   if [ -z "$missing" ] && ! rules=$(sudo -n /usr/local/sbin/goim-netdrop list 2>/dev/null); then
     missing="sudo -n /usr/local/sbin/goim-netdrop fails (no sudoers line?)"
   fi
+  if [ -z "$missing" ] && ! sudo -n /usr/local/sbin/goim-netdrop notrack-check >/dev/null 2>&1; then
+    missing="the NOTRACK rules for ports $T2_NOTRACK_LO-$T2_NOTRACK_HI on lo are missing (not kept across a reboot)"
+  fi
   if [ -n "$missing" ]; then
     t2_refuse "$(printf 'refused: the host is not set up for load tests:\n%s\nrun once: sudo scripts/tier2/host-setup.sh' "$missing")"
   fi
   why=$(t2_netdrop_leftover "$rules") || t2_refuse "$why"
+  why=$(t2_notrack_covers "${STACK_PORT_BASE:-17000}") || t2_refuse "$why"
 }
