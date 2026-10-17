@@ -958,6 +958,7 @@ The user's call after the 30j rerun (repeat `d218483`'s trial, 594s at 4 against
 
 - **Reading:** with 4 slots no handshake is refused for a slot, but the refusals move later and get dearer. The survivors complete 2.3× as many handshakes, then refuse the excess at the pending-socket cap (`pending_mem`, mostly gw-2: 2.25M) or, after the handshake, at Logic's login queue (606k `Busy`), each a finished DH thrown away, and the clients redial (3.84M connections against 3.21M). Some relogins time out (`no-reply` 284k) after their Login succeeded, so a later attempt Kicks the live session (30,848 live Kicks). The last client is back 20s sooner, but the median and p99 client 18–20s later. Not the collapse of `d218483` (594s), which #130's halved cost removed. Unexplained here: the split between the two survivors (`pending_mem` 100,602 frozen on gw-1 from t=29s while gw-2 kept refusing; 884k against 606k handshakes) with the balancer's connections even (~300k each).
 - **For the default (#111, #116):** on this host 2 slots per 4 loops still gives the better median and p99; 4 trades them for a shorter tail. A refusal before the DH (`no_slot`) is the cheapest place to refuse; #111 (a handshake waits briefly for a slot) remains the alternative to more slots.
+- **Decided by the user (2026-10-17):** the default stays (half the loops, 2 at 4 loops).
 
 ### Task 3 summary
 
