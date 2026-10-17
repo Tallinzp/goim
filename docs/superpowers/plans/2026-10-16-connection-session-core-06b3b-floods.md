@@ -790,4 +790,10 @@ Push the branch. Fast-forwarding `main` is the user's call.
 
 ## Execution Notes
 
-(Filled in during execution.)
+**Executed 2026-10-16** (inline, superpowers:executing-plans) on `feat/plan6b3` from `609f15a`:
+- Task 1: `05e2e00` (`t2_lease_floor`). RED as expected (four `command not found`, `lib_test: 1 failed`), then green, with no call to the old name left.
+- Task 2: `d56e719` (`floods.sh`, 462 lines, identical to `proto-6b3b`'s; the `Makefile` comment). `make test-scripts` (`lib_test`, `loadgen_test`, `stack_test` all passed), `make test` ok, `bash -n` ok.
+- Dry run (Task 2, Step 3; the throwaway copies were in the session scratchpad rather than `mktemp`'s `/tmp`): **exit 0, 27/27** in 112s. The `no_swap_in_*` checks passed this time (0 pages), which Step 3 allows. As the prototype: `storm_rate` `seen_per_s` 1,080 of 1,000, completed `rate_per_s` 579; `storm_bucket` `hs_no_token` 0, `hs_no_slot` 860 (`no_slot_share` 0.30); `storm_online` 2,000, `gave_up` 0. `garbage_delivered` 90,401 attempts against 85,500, all `closed`. gw-0 `hs_no_token` 34,422 and gw-1 5,720 (the uneven split again), `no_slot` 0, `dh_per_s` 557 each. `timewait` `[3003, 8192]`, `TCPTimeWaitOverflow` 84,998, `ListenOverflows` 0. Heartbeats: `pong_missing` 0, max 16ms and 21ms. `slow_held` p50 ~5.5s, max 6,017ms. `slow_freed` 3,500 = 3,500 for both timeouts. `slow_legit` 2,000 online, every gateway count 0. Leases: 4 per gateway (floor 3).
+- Storm pass path (1 slot, 200/s): exit 0, 8 checks, `seen_per_s` 199, `rate_per_s` 190, `no_slot` 46 (share 0.044), `no_token` 0. The three refusals print the plan's messages, exit 1, and leave no process.
+- Review checks: O1 (tiny bucket in `slow`): `slow_held` passes with slowauth `{"closed": 4256, "pre-handshake": 3629}`; `slow_legit` fails only on `hs_no_token` (2,107 / 1,836), 199 online + 1 gave up; `slow_heartbeats` passes. O3 (bucket 100,000): `garbage_limited` fails (`no_token`/`no_slot` 0, `dh_per_s` 1,362 / 650), `garbage_delivered` passes. O2 (loadgen-bound storm, 20,000/s): `storm_rate` fails (`seen_per_s` 2,140), `storm_online` fails (`login` 5,390 besides 1 `gave-up`).
+- Task 3 (run 30) waits for the user on the Tier 2 host.
