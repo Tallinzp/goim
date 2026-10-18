@@ -212,8 +212,10 @@ expect "setup: test mode exits 0" "$?" 0
 expect "setup: sudoers line" "$(cat "$tmp/hs/root/etc/sudoers.d/goim-netdrop")" "alice ALL=(root) NOPASSWD: /usr/local/sbin/goim-netdrop"
 expect "setup: sudoers mode" "$(stat -c %a "$tmp/hs/root/etc/sudoers.d/goim-netdrop")" 440
 expect "setup: helper mode" "$(stat -c %a "$tmp/hs/root/usr/local/sbin/goim-netdrop")" 755
+expect "setup: nofile hard limit" "$(cat "$tmp/hs/root/etc/security/limits.d/90-goim-tier2.conf")" "alice hard nofile 2097152"
+expect "setup: user manager's nofile" "$(grep LimitNOFILE "$tmp/hs/root/etc/systemd/system/user@.service.d/90-goim-tier2.conf")" "LimitNOFILE=1048576:2097152"
 again=$(scripts/tier2/host-setup.sh --root "$tmp/hs/root" --user alice | grep -c '^unchanged')
-expect "setup: idempotent" "$again" 4
+expect "setup: idempotent" "$again" 6
 scripts/tier2/host-setup.sh --root "$tmp/hs/root" --user 'a b' >/dev/null 2>&1; expect "setup: odd user refused" "$?" 2
 scripts/tier2/host-setup.sh --root "$tmp/hs/root" >/dev/null 2>&1 </dev/null; rc=$?
 [ -n "${SUDO_USER:-}" ] || expect "setup: no user refused" "$rc" 2
