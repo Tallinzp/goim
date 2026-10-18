@@ -161,6 +161,30 @@ func TestSlowFloodHeldUntilTheGatewaysTimeout(t *testing.T) {
 	}
 }
 
+// A slow client the gateway closes before slowHeld, here at its pending
+// cap (pending_mem), is counted refused with no hold, not closed: only the
+// gateway's timeouts are closed, so floods' slow_freed compares like with
+// like (#135, run 30n).
+func TestSlowFloodClosedEarlyIsRefused(t *testing.T) {
+	env, _ := startStack(t, 1, func(c *gateway.Config, _ *tcp.Config) {
+		c.HandshakeTimeout, c.PendingCap = 3*time.Second, 2
+	})
+	r, err := New(Config{Mode: ModeSlowHandshake, Clients: 5, Rate: 100, UIDPrefix: "p", Timeout: 10 * time.Second}, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := run(r)
+	defer stop()
+	waitFor(t, "2 closed by the timeout", 10*time.Second, func() bool { return r.Stats().Flood.Outcomes[FloodClosed] >= 2 })
+	f := r.Stats().Flood
+	if f.Outcomes[FloodRefused] < 3 || f.Held.P50 < 3000 || f.Held.N != f.Outcomes[FloodClosed] {
+		t.Fatalf("flood %+v, want ≥ 3 refused, and one hold per closed, a timeout's (p50 ≥ 3s)", f)
+	}
+	if got := metric(t, env.GatewayIDs[0], "goim_gateway_admission_rejects_total", "reason", gateway.RejectPendingMem); got < 3 {
+		t.Fatalf("gateway pending_mem %v, want ≥ 3", got)
+	}
+}
+
 // A slow client the gateway's timeout closed redials within one wheel tick,
 // spread over it, so a cohort closed in one tick does not redial together;
 // one closed sooner waits 0.5–1.5s, as the SDK does (O1).

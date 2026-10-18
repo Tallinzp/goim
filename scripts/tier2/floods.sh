@@ -135,9 +135,19 @@
 #                         p50 >= 5s, p99 <= 6.5s, max <= 7.5s (5s + one tick of
 #                         the wheel, plus scheduling slack, 6b3a O7); a
 #                         slow-auth handshake the limiter refused ends
-#                         pre-handshake, with no hold, and is counted (O1)
+#                         pre-handshake, with no hold, and is counted (O1);
+#                         a connection the gateway closed before 3s (at
+#                         capacity, a limit, pending_mem) is refused, with
+#                         no hold, and is counted (#135); the two floods'
+#                         refused are at most the gateways' refusals over
+#                         the phase (pending_mem + at_capacity + no_slot +
+#                         no_token, the light clients' included: a loose
+#                         bound, but a close no counter explains fails it,
+#                         review O7)
 #   slow_freed            the gateways counted at least as many
-#                         handshake_timeout and auth_timeout closes
+#                         handshake_timeout and auth_timeout closes as the
+#                         floods' closed outcomes, the closes held >= 3s
+#                         (refused ones are not timeouts, #135, run 30n)
 #   slow_legit            every light client logs in beside the floods (or
 #                         gave up as in storm_online): no
 #                         Busy, no reject (login_queue, pending_mem: the
@@ -147,7 +157,10 @@
 #                         recorded. Only a valid run passes: verdict
 #                         "valid" when none of loadgen's, the gateways' and
 #                         Logic's CPU sets was >= 85% busy over the light
-#                         clients' ramp or over the hold, else
+#                         clients' ramp or over the hold, and none was >= 95%
+#                         busy for 5s in a row in slow.series before every
+#                         light client was online (the ramp's average hid
+#                         run 30m's 16s at 98-100%, Plan 6b3c), else
 #                         "loadgen-saturated", "gateway-set-saturated" or
 #                         "logic-set-saturated" (the floods share the last
 #                         two), which fails with a not_covered line (#126:
@@ -493,7 +506,7 @@ slow_sampler() {
   done
 }
 
-# slow_series FILE: slow_sampler's lines as {"columns", "rows" (one per
+# slow_series FILE N: slow_sampler's lines as {"columns", "rows" (one per
 # interval between samples, t_s since the first; a column null where a
 # reading is missing), "first_s" (when each sign of trouble first showed,
 # null if never: a CPU set at >= 85% busy, /stats unanswered, a gateway
@@ -507,7 +520,10 @@ slow_sampler() {
 # alone (M5). gw_runq_ms_per_s is the larger gateway's run-queue wait per
 # second, summed over its threads, null for a gateway whose total went
 # down (a thread gone, M6), kept through a failed scrape (P6b3b3I-2):
-# recorded, not gated (6b3b3 review O2).
+# recorded, not gated (6b3b3 review O2). "sat_run_s": per CPU set, the
+# longest run of rows at >= 95% busy while fewer than N light clients were
+# online (or /stats went unanswered), in seconds: what slow_verdict reads
+# beside the windows' averages (Plan 6b3c, run 30m).
 slow_series() {
   python3 -c 'import json, os, sys
 rows = []
@@ -563,25 +579,39 @@ def first(f):
     return next((r[0] for r in out if f(r)), None)
 pos = lambda k: lambda r: (r[c[k]] or 0) > 0
 sat = lambda k: lambda r: (r[c[k]] or 0) >= 85
-print(json.dumps({"columns": cols, "rows": out, "samples": len(rows), "first_s": {
+def sat_run(k):
+    best = run = 0.0
+    prev = 0.0
+    for r in out:
+        dt, prev = r[0] - prev, r[0]
+        if (r[c["lg_online"]] is None or r[c["lg_online"]] < int(sys.argv[2])) and (r[c[k + "_set_busy_pct"]] or 0) >= 95:
+            run += dt
+            best = max(best, run)
+        else:
+            run = 0.0
+    return round(best, 1)
+print(json.dumps({"columns": cols, "rows": out, "samples": len(rows),
+    "sat_run_s": {k: sat_run(k) for k in ("loadgen", "gateway", "logic")}, "first_s": {
     "loadgen_saturated": first(sat("loadgen_set_busy_pct")), "gateway_set_saturated": first(sat("gateway_set_busy_pct")),
     "logic_set_saturated": first(sat("logic_set_busy_pct")),
     "stats_unanswered": first(lambda r: r[c["lg_online"]] is None),
     "scrape_late": first(lambda r: r[c["scrape_ms"]] is None or r[c["scrape_ms"]] > 1500),
     "pending_mem": first(pos("pending_mem_per_s")), "no_slot": first(pos("no_slot_per_s")),
     "light_refused": first(pos("lg_refused_per_s")),
-    "gave_up": first(pos("lg_gave_up")), "closes_heartbeat": first(pos("closes_heartbeat_per_s"))}}))' "$1" 2>/dev/null || echo null
+    "gave_up": first(pos("lg_gave_up")), "closes_heartbeat": first(pos("closes_heartbeat_per_s"))}}))' "$1" "$2" 2>/dev/null || echo null
 }
 
 # slow_verdict: the lg_py expression for the slow phase's verdict, on
 # {"ramp", "hold": t2_cpusets_json of the light clients' ramp and of the
-# hold}: the first of loadgen's, the gateways' (with slow-auth) and Logic's
-# (with slow-handshake) sets >= 85% busy in either window, as
-# loadgen-saturated, gateway-set-saturated or logic-set-saturated; else
-# valid; unread if a snapshot is missing. Only valid lets slow_legit and
+# hold, "sat": slow_series' sat_run_s}: the first of loadgen's, the
+# gateways' (with slow-auth) and Logic's (with slow-handshake) sets >= 85%
+# busy in either window, or >= 95% for 5s in a row before the light
+# clients were online, as loadgen-saturated, gateway-set-saturated or
+# logic-set-saturated; else valid; unread if a snapshot or the series is
+# missing. Only valid lets slow_legit and
 # slow_heartbeats pass (#126). The order names a set, not a cause: which
 # came first is read in slow.series.first_s (6b3b3 review O3).
-slow_verdict='"unread" if not (d["ramp"] and d["hold"]) else next((k + "-saturated" if k == "loadgen" else k + "-set-saturated" for k in ("loadgen", "gateway", "logic") if any(100 - w[k]["idle_pct"] >= 85 for w in (d["ramp"], d["hold"]))), "valid")'
+slow_verdict='"unread" if not (d["ramp"] and d["hold"] and d["sat"]) else next((k + "-saturated" if k == "loadgen" else k + "-set-saturated" for k in ("loadgen", "gateway", "logic") if any(100 - w[k]["idle_pct"] >= 85 for w in (d["ramp"], d["hold"])) or d["sat"][k] >= 5), "valid")'
 
 t=$SECONDS
 if ! make redis-server >"$T2_OUT/redis-build.log" 2>&1; then
@@ -713,7 +743,7 @@ phase_garbage() {
 phase_slow() {
   local n=${FLOODS_CLIENTS:-400000} rate=${FLOODS_RATE:-10000} hs=${FLOODS_SLOW_HANDSHAKE:-80000}
   local au=${FLOODS_SLOW_AUTH:-40000} srate=${FLOODS_SLOW_RATE:-10000} hold=${FLOODS_SLOW_HOLD:-60}
-  local s0 s1 d l0 l1 t0 lease_s flooding=true online on usage inst held f win verdict
+  local s0 s1 d l0 l1 t0 lease_s flooding=true online on usage inst held f win series verdict
   STACK_GATEWAYS=2 STACK_GATEWAY_ARGS=(-max-conns $(((n + hs + au) / 2 + (n + hs + au) / 10)) -heartbeat "${HB}s")
   up slow || { stack_down; return; }
   stack_snapshot before
@@ -761,23 +791,29 @@ phase_slow() {
   lg_stop
   d=$(t2_gws_delta "$s0" "$s1")
   win="{\"ramp\": $(t2_cpusets_json "$STACK_DIR/cpustat-light0" "$STACK_DIR/cpustat-light1"), \"hold\": $(t2_cpusets_json "$STACK_DIR/cpustat-light1" "$STACK_DIR/cpustat-light2")}"
-  verdict=$(echo "$win" | lg_py - "$slow_verdict")
+  series=$(slow_series "$STACK_DIR/artifacts/slow-series.jsonl" "$n")
+  verdict=$(echo "{\"w\": $win, \"s\": $series}" | lg_py - '{"ramp": d["w"]["ramp"], "hold": d["w"]["hold"], "sat": (d["s"] or {}).get("sat_run_s")}' | lg_py - "$slow_verdict")
   [ "$verdict" = '"valid"' ] ||
     t2_not_covered "slow: legitimate logins and heartbeats beside the floods; verdict $verdict, ruled by the order in slow.series.first_s (slow.window, slow.series)"
   # Slow-auth's handshakes meet the limiter: a refused one ends pre-handshake,
-  # with no hold, and the bounds are on the holds the timeouts ended (O1).
+  # with no hold, and the bounds are on the holds the timeouts ended (O1). A
+  # close before 3s is refused, with no hold, in both floods (#135).
   held=true
-  for inst in slowhs:'{"closed"}' slowauth:'{"closed", "pre-handshake"}'; do
+  for inst in slowhs:'{"closed", "refused"}' slowauth:'{"closed", "pre-handshake", "refused"}'; do
     [ "$(lg_true "$STACK_DIR/artifacts/loadgen-${inst%%:*}.json" 'set(d["flood"]["outcomes"]) <= '"${inst#*:}"' and "closed" in d["flood"]["outcomes"] and d["flood"]["held"]["p50_ms"] >= 5000 and d["flood"]["held"]["p99_ms"] <= 6500 and d["flood"]["held"]["max_ms"] <= 7500')" = true ] || held=false
   done
-  t2_check slow_held "$held" "\"slowhs\": $(lg_py "$STACK_DIR/artifacts/loadgen-slowhs.json" '{k: d["flood"][k] for k in ("attempts", "open", "outcomes", "held")}'), \"slowauth\": $(lg_py "$STACK_DIR/artifacts/loadgen-slowauth.json" '{k: d["flood"][k] for k in ("attempts", "open", "outcomes", "held")}')"
+  # Each refused close needs a gateway refusal to explain it (review O7).
+  refused=$(echo "{\"h\": $(lg_py "$STACK_DIR/artifacts/loadgen-slowhs.json" 'd["flood"]["outcomes"].get("refused", 0)'), \"a\": $(lg_py "$STACK_DIR/artifacts/loadgen-slowauth.json" 'd["flood"]["outcomes"].get("refused", 0)')}" | lg_py - 'd["h"] + d["a"]')
+  refusals=$(echo "$d" | lg_py - 'sum(v[k] for v in d.values() for k in ("rejects_pending_mem", "rejects_at_capacity", "hs_no_slot", "hs_no_token"))')
+  [ "$(echo "{\"r\": ${refused:-null}, \"g\": ${refusals:-null}}" | lg_true - 'd["r"] <= d["g"]')" = true ] || held=false
+  t2_check slow_held "$held" "\"slowhs\": $(lg_py "$STACK_DIR/artifacts/loadgen-slowhs.json" '{k: d["flood"][k] for k in ("attempts", "open", "outcomes", "held")}'), \"slowauth\": $(lg_py "$STACK_DIR/artifacts/loadgen-slowauth.json" '{k: d["flood"][k] for k in ("attempts", "open", "outcomes", "held")}'), \"refused\": ${refused:-null}, \"gateway_refusals\": ${refusals:-null}"
   t2_check slow_freed "$(echo "{\"g\": $d, \"h\": $(lg_py "$STACK_DIR/artifacts/loadgen-slowhs.json" 'd["flood"]["outcomes"].get("closed", 0)'), \"a\": $(lg_py "$STACK_DIR/artifacts/loadgen-slowauth.json" 'd["flood"]["outcomes"].get("closed", 0)')}" | lg_true - 'sum(v["rejects_handshake_timeout"] for v in d["g"].values()) >= d["h"] and sum(v["rejects_auth_timeout"] for v in d["g"].values()) >= d["a"]')" \
     "\"handshake_timeout\": $(echo "$d" | lg_py - 'sum(v["rejects_handshake_timeout"] for v in d.values())'), \"slowhs_closed\": $(lg_py "$STACK_DIR/artifacts/loadgen-slowhs.json" 'd["flood"]["outcomes"].get("closed", 0)'), \"auth_timeout\": $(echo "$d" | lg_py - 'sum(v["rejects_auth_timeout"] for v in d.values())'), \"slowauth_closed\": $(lg_py "$STACK_DIR/artifacts/loadgen-slowauth.json" 'd["flood"]["outcomes"].get("closed", 0)')"
   t2_check slow_legit "$(echo "{\"g\": $d, \"o\": ${online:-false}, \"v\": $verdict}" | lg_true - 'd["v"] == "valid" and d["o"] is True and all(v[k] == 0 for v in d["g"].values() for k in ("logins_busy", "rejects_login_queue", "rejects_pending_mem", "rejects_at_capacity", "hs_no_token"))')" \
     "\"verdict\": $verdict, \"want\": $n, \"online\": $on, \"gave_up\": $(lg_json 'd["failed"].get("gave-up", 0)'), \"failed\": $(lg_json 'd["failed"]'), \"login_latency\": $(lg_json 'd["login_latency"]'), \"gateways\": $(echo "$d" | lg_py - '{g: {k: v[k] for k in ("logins_ok", "logins_busy", "rejects_login_queue", "rejects_pending_mem", "rejects_at_capacity", "hs_no_slot", "hs_no_token")} for g, v in d.items()}')"
   heartbeats slow "$on" "$d" "$verdict"
   t2_lease slow "$d" "$lease_s" "$(stack_counters_delta "$l0" "$l1")"
-  t2_field slow "{\"clients\": $n, \"rate\": $rate, \"slow_handshake\": $hs, \"slow_auth\": $au, \"slow_rate\": $srate, \"hold_s\": $hold, \"flood_cpus\": {\"slowhs\": $(t2_json_str "$HS_CPUS"), \"slowauth\": $(t2_json_str "$AUTH_CPUS")}, \"flood_procs\": {\"slowhs\": ${FLOODS_SLOW_HS_PROCS:-2}, \"slowauth\": ${FLOODS_SLOW_AUTH_PROCS:-4}}, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"usage\": $usage, \"verdict\": $verdict, \"window\": $win, \"series\": $(slow_series "$STACK_DIR/artifacts/slow-series.jsonl"), \"cpu_sets\": $(t2_cpusets_json "$STACK_DIR/cpustat-0" "$STACK_DIR/cpustat-1"), \"conntrack_stat\": $(ct_stat_json "$STACK_DIR/ctstat-0" "$STACK_DIR/ctstat-1"), \"gateways\": $d}"
+  t2_field slow "{\"clients\": $n, \"rate\": $rate, \"slow_handshake\": $hs, \"slow_auth\": $au, \"slow_rate\": $srate, \"hold_s\": $hold, \"flood_cpus\": {\"slowhs\": $(t2_json_str "$HS_CPUS"), \"slowauth\": $(t2_json_str "$AUTH_CPUS")}, \"flood_procs\": {\"slowhs\": ${FLOODS_SLOW_HS_PROCS:-2}, \"slowauth\": ${FLOODS_SLOW_AUTH_PROCS:-4}}, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"usage\": $usage, \"verdict\": $verdict, \"window\": $win, \"series\": $series, \"cpu_sets\": $(t2_cpusets_json "$STACK_DIR/cpustat-0" "$STACK_DIR/cpustat-1"), \"conntrack_stat\": $(ct_stat_json "$STACK_DIR/ctstat-0" "$STACK_DIR/ctstat-1"), \"gateways\": $d}"
   down slow $((n + hs + au))
   for f in before/gw-0 after/gw-0; do
     grep -q '^# TYPE' "$STACK_DIR/artifacts/$f.metrics" 2>/dev/null || missing+=" slow:$f.metrics"
