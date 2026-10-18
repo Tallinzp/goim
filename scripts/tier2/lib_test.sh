@@ -299,6 +299,38 @@ expect "tcpstat: a missing snapshot is null" "$(t2_tcpstat_json "$tmp/none" "$tm
 # up to 5s after its tick, and a short window still needs its one renewal.
 expect "lease floor: 16s, 53s, 66s, 5s" "$(t2_lease_floor 16) $(t2_lease_floor 53) $(t2_lease_floor 66) $(t2_lease_floor 5)" "1 4 6 0"
 
+# The helpers moved here from floods.sh (Plan 6b3c). t2_kill_tree: no
+# process of a subshell tree is left (6b3b4 final review M4).
+(sleep 30 & (sleep 30 & wait) & wait) >/dev/null 2>&1 & tree=$!
+sleep 0.2
+kids=$(pgrep -P "$tree"); kids="$kids $(for p in $kids; do pgrep -P "$p"; done)"
+t2_kill_tree "$tree"; sleep 0.2
+left=0; for p in $tree $kids; do kill -0 "$p" 2>/dev/null && left=$((left + 1)); done
+[ "$(echo $kids | wc -w)" -eq 3 ] && expect "kill_tree: no process of the tree is left" "$left" 0 || bad "kill_tree: the test tree isn't 4 processes"
+kill $tree $kids 2>/dev/null
+# t2_gws_delta: per gateway; a key null in A counts as 0, one null in B
+# stays null, a gateway missing in A is null.
+expect "gws_delta: per gateway" "$(t2_gws_delta '{"gw-0": {"a": 1, "b": null, "c": 5}}' '{"gw-0": {"a": 4, "b": 2, "c": null}, "gw-1": {"a": 1}}')" \
+  '{"gw-0": {"a": 3, "b": 2, "c": null}, "gw-1": null}'
+expect "gws_delta: unreadable" "$(t2_gws_delta '{' '{}')" null
+# t2_set_ticks: busy and total of the listed CPUs only.
+printf '%s\n' 'cpu  9 9 9 9 9 9 9 9' 'cpu0 1 2 3 4 5 6 7 8' 'cpu1 10 20 30 40 50 60 70 80' 'cpu2 100 0 0 100 0 0 0 0' >"$tmp/stat"
+expect "set_ticks: the listed CPUs" "$(t2_set_ticks 0,2 "$tmp/stat")" "127 236"
+expect "set_ticks: no CPU" "$(t2_set_ticks 5 "$tmp/stat")" "0 0"
+expect "runq_ns: this shell waits a whole number of ns" "$(t2_runq_ns $$ | grep -cE '^[0-9]+$')" 1
+expect "runq_ns: a pid that is gone" "$(t2_runq_ns 999999999)" ""
+# t2_lease: the floor of a 66s window is 6 renewals; Logic's errors fail it.
+f0=$fails
+(
+  . scripts/loadgen.sh
+  t2_check() { echo "$1 $2"; }
+  g='{"gw-0": {"lease_live": 6, "lease_missing": 0, "lease_error": 0}}'
+  expect "lease: 6 renewals in 66s" "$(t2_lease p "$g" 66 '{"lease_error": 0}')" "p_lease true"
+  expect "lease: 5 renewals in 66s" "$(t2_lease p "${g/6/5}" 66 '{"lease_error": 0}')" "p_lease false"
+  expect "lease: Logic's error" "$(t2_lease p "$g" 66 '{"lease_error": 1}')" "p_lease false"
+  [ "$fails" -eq "$f0" ]
+) || fails=$((fails + 1))
+
 # make test-tier2 shows the script's own exit code (make itself exits 2 on any failure).
 out=$(GOIM_TEST_TIER= make -s test-tier2 SCENARIO=race 2>&1)
 contains "make: shows the scenario's exit code" "$out" "test-tier2: race exited 2"

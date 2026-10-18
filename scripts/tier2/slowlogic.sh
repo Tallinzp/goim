@@ -243,20 +243,6 @@ t2_report_extra() {
   done
 }
 
-# up NAME: a fresh stack in $T2_OUT/NAME; checks NAME_stack.
-up() {
-  export STACK_DIR=$T2_OUT/$1
-  mkdir -p "$STACK_DIR"
-  ln -sfn ../bin "$STACK_DIR/bin"
-  local busy
-  busy=$(stack_busy_ports)
-  [ -z "$busy" ] || t2_refuse "$(printf 'refused: the stack ports are in use (a leftover stack?):\n%s\nstop whatever holds them first' "$busy")"
-  stack_up 2>"$STACK_DIR/stack-up.err"
-  local rc=$?
-  t2_check "${1}_stack" "$(t2_bool [ $rc -eq 0 ])" "\"gateways\": $STACK_GATEWAYS, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"error\": $(t2_json_str "$(cat "$STACK_DIR/stack-up.err")")"
-  return $rc
-}
-
 # down NAME: loadgen stopped, the gateways idle (dropped Logouts settled and
 # recorded), the stack stopped; checks NAME_idle and NAME_processes.
 down() {
@@ -292,7 +278,7 @@ cal_clients=${SLOWLOGIC_CAL_CLIENTS:-120000} cal_rate=${SLOWLOGIC_CAL_RATE:-8000
 cal_cap=${SLOWLOGIC_CAL_QUEUE_CAP:-1000}
 skip=${SLOWLOGIC_CAL_SKIP:-5} win=${SLOWLOGIC_CAL_WINDOW:-10}
 STACK_GATEWAY_ARGS=(-max-conns $((cal_clients + 10000)) -login-queue-cap "$cal_cap")
-up calibrate || t2_finish
+t2_up calibrate || t2_finish
 cpu_max=$(stack_cpu_max logic)
 want_max="$(python3 -c 'import sys; print(round(float(sys.argv[1]) * 100000))' "$quota_cores") 100000"
 gomaxprocs=$(stack_metric logic go_sched_gomaxprocs_threads)
@@ -384,7 +370,7 @@ back_wait=${SLOWLOGIC_BACK_WAIT:-600}
 busy_win=${SLOWLOGIC_BUSY_WINDOW:-20}
 STACK_GATEWAY_ARGS=(-max-conns $((clients + clients / 10)) -login-queue-cap "$qcap"
   ${SLOWLOGIC_LOGIN_RPCS:+-login-rpcs "$SLOWLOGIC_LOGIN_RPCS"} ${SLOWLOGIC_LOGIN_BATCH:+-login-batch "$SLOWLOGIC_LOGIN_BATCH"})
-up storm || t2_finish
+t2_up storm || t2_finish
 lg_start storm -mode sdk -clients "$clients" -rate "$rate" -uid-prefix slow
 online=false
 lg_wait_online "$clients" $((clients / rate * 3 + 60)) &&

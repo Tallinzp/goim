@@ -443,6 +443,76 @@ t2_lease_floor() {
   echo $((s / 10 - 1 > (s - 6) / 10 ? s / 10 - 1 : (s - 6) / 10))
 }
 
+# The helpers below were each written for one scenario and moved here with
+# their second user (Plan 6b3c, P6b3bI-3, P6b3b3I-4, P6b3b4I-2). They need
+# stack.sh and loadgen.sh sourced, as every scenario that calls them does.
+
+# t2_kill_tree PID: PID and its descendants, so an exit trap stops a
+# background helper's curls too, not only its subshell (6b3b4 final review
+# M4).
+t2_kill_tree() { local c; for c in $(pgrep -P "$1"); do t2_kill_tree "$c"; done; kill "$1" 2>/dev/null; }
+
+# t2_up NAME: a fresh stack in $T2_OUT/NAME, STACK_DIR exported; checks
+# NAME_stack. Refuses the run if the stack's ports are in use.
+t2_up() {
+  export STACK_DIR=$T2_OUT/$1
+  mkdir -p "$STACK_DIR"
+  ln -sfn ../bin "$STACK_DIR/bin"
+  local busy
+  busy=$(stack_busy_ports)
+  [ -z "$busy" ] || t2_refuse "$(printf 'refused: the stack ports are in use (a leftover stack?):\n%s\nstop whatever holds them first' "$busy")"
+  stack_up 2>"$STACK_DIR/stack-up.err"
+  local rc=$?
+  t2_check "${1}_stack" "$(t2_bool [ $rc -eq 0 ])" "\"gateways\": $STACK_GATEWAYS, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"error\": $(t2_json_str "$(cat "$STACK_DIR/stack-up.err")")"
+  return $rc
+}
+
+# t2_gws_counters SPEC...: {"gw-0": stack_counters SPEC..., ...} of every
+# gateway; t2_gws_delta A B the same of two readings (stack_counters_delta
+# per gateway: a key null in A counts as 0).
+t2_gws_counters() {
+  local g out=""
+  for g in $(stack_admins | awk '$1 ~ /^gw-/ { print $1 }'); do
+    out+="${out:+, }\"$g\": $(stack_counters "$g" "$@")"
+  done
+  echo "{$out}"
+}
+t2_gws_delta() {
+  python3 -c 'import json, sys
+a, b = (json.loads(x) for x in sys.argv[1:3])
+def delta(x, y):
+    if x is None or y is None:
+        return None
+    return {k: None if v is None else round(v - (x.get(k) or 0), 6) for k, v in y.items()}
+print(json.dumps({g: delta(a.get(g), y) for g, y in b.items()}))' "$1" "$2" 2>/dev/null || echo null
+}
+
+# t2_lease PHASE DELTA SECONDS LOGIC_DELTA: checks PHASE_lease over the
+# gateways' counter delta (t2_gws_delta, with lease_live, lease_missing and
+# lease_error) of a window of SECONDS, and Logic's (lease_error).
+t2_lease() {
+  local floor
+  floor=$(t2_lease_floor "$3")
+  t2_check "${1}_lease" "$(echo "{\"g\": $2, \"l\": $4}" | lg_true - 'all(v["lease_error"] == 0 and v["lease_missing"] == 0 and v["lease_live"] >= '"$floor"' for v in d["g"].values()) and d["l"]["lease_error"] == 0')" \
+    "\"window_s\": $3, \"live_floor\": $floor, \"gateways\": $(echo "$2" | lg_py - '{g: {"live": v["lease_live"], "missing": v["lease_missing"], "error": v["lease_error"]} for g, v in d.items()}'), \"logic_lease_error\": $(echo "$4" | lg_py - 'd["lease_error"]')"
+}
+
+# t2_set_ticks LIST [STAT]: "busy total" clock ticks of LIST's CPUs since
+# boot (STAT, default /proc/stat; busy: user, nice, system, irq, softirq,
+# steal; total adds idle and iowait), as t2_cpusets_json counts them.
+t2_set_ticks() {
+  awk -v cpus=" $(t2_cpulist_expand "$1") " '$1 ~ /^cpu[0-9]+$/ && index(cpus, " " substr($1, 4) " ") {
+    b += $2 + $3 + $4 + $7 + $8 + $9; t += $2 + $3 + $4 + $5 + $6 + $7 + $8 + $9 } END { print b + 0, t + 0 }' "${2:-/proc/stat}"
+}
+
+# t2_runq_ns PID: nanoseconds PID's threads have waited on a run queue
+# (/proc/PID/task/*/schedstat, field 2; the process's own schedstat is its
+# main thread only); empty if PID is gone.
+t2_runq_ns() {
+  [ -d "/proc/$1/task" ] || return 0
+  cat /proc/"$1"/task/*/schedstat 2>/dev/null | awk '{ s += $2 } END { if (NR) printf "%.0f\n", s }'
+}
+
 t2_swap_pages() { awk '/^pswpin / { i = $2 } /^pswpout / { o = $2 } END { print i + 0, o + 0 }' /proc/vmstat; }
 
 # t2_clock_sampler FILE: appends "unix_s cpu khz" for every CPU every 5s.

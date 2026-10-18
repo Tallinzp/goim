@@ -286,8 +286,7 @@ t2_on_exit 'lg_stop' # newest first: loadgen stops before the stack
 # started from a non-interactive shell they ignore Ctrl-C's SIGINT, and the
 # goroutine count never ends on its own (6b2b-b2 review I-2).
 storm_helpers=()
-kill_tree() { local c; for c in $(pgrep -P "$1"); do kill_tree "$c"; done; kill "$1" 2>/dev/null; }
-t2_on_exit 'for p in "${storm_helpers[@]}"; do kill_tree "$p"; done'
+t2_on_exit 'for p in "${storm_helpers[@]}"; do t2_kill_tree "$p"; done'
 
 # The storm's counters (Plan 6b2a): Logic's Kicks, lease renewals, sweeps
 # and relogins onto a dead epoch; each survivor's own lease calls and rejects.
