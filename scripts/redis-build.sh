@@ -20,7 +20,12 @@ fi
 src=$(mktemp -d)
 trap 'rm -rf "$src"' EXIT
 curl -fsSL -o "$src/redis.tar.gz" "https://download.redis.io/releases/redis-$version.tar.gz"
-echo "$sha256  $src/redis.tar.gz" | sha256sum -c --quiet
+# sha256sum on Linux; macOS has shasum.
+if command -v sha256sum >/dev/null 2>&1; then
+  echo "$sha256  $src/redis.tar.gz" | sha256sum -c --quiet
+else
+  echo "$sha256  $src/redis.tar.gz" | shasum -a 256 -c --quiet
+fi
 tar -xzf "$src/redis.tar.gz" -C "$src"
 # libc malloc: no jemalloc build, and the suite does not measure memory.
 if ! make -C "$src/redis-$version" -j"$(getconf _NPROCESSORS_ONLN)" BUILD_TLS=no MALLOC=libc >"$src/build.log" 2>&1 ||
