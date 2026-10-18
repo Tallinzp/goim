@@ -122,6 +122,11 @@ s=$(slow_series "$tmp/sat.jsonl" 20)
 expect "series: sat_run_s" "$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["sat_run_s"])' "$s")" "{'loadgen': 3.0, 'gateway': 0.0, 'logic': 0.0}"
 s=$(slow_series "$tmp/sat.jsonl" 10)
 expect "series: all online, only the unanswered second counts" "$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["sat_run_s"]["loadgen"])' "$s")" 1.0
+# Clients that gave up end the ramp too, as in settled: 18 online and 2
+# gave up of 20 is no ramp, so the hold's busy seconds do not count.
+gu='{"online": 18, "gave_up": 2, "failed": 2, "refused": 0}'
+{ sl 0 0 "$gu"; sl 1000 96 "$gu"; sl 2000 192 "$gu"; sl 3000 288 "$gu"; sl 4000 384 "$gu"; sl 5000 480 "$gu"; sl 6000 576 "$gu"; } >"$tmp/gu.jsonl"
+expect "series: gave-up clients end the ramp" "$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["sat_run_s"]["loadgen"])' "$(slow_series "$tmp/gu.jsonl" 20)")" 0.0
 expect "series: columns" "$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])["columns"]))' "$s")" 19
 
 # The exit trap stops the profile subshell with its curls (M4).

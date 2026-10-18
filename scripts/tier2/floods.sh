@@ -522,7 +522,7 @@ slow_sampler() {
 # down (a thread gone, M6), kept through a failed scrape (P6b3b3I-2):
 # recorded, not gated (6b3b3 review O2). "sat_run_s": per CPU set, the
 # longest run of rows at >= 95% busy while fewer than N light clients were
-# online (or /stats went unanswered), in seconds: what slow_verdict reads
+# online or gave up, as in settled (or /stats went unanswered), in seconds: what slow_verdict reads
 # beside the windows' averages (Plan 6b3c, run 30m).
 slow_series() {
   python3 -c 'import json, os, sys
@@ -584,7 +584,7 @@ def sat_run(k):
     prev = 0.0
     for r in out:
         dt, prev = r[0] - prev, r[0]
-        if (r[c["lg_online"]] is None or r[c["lg_online"]] < int(sys.argv[2])) and (r[c[k + "_set_busy_pct"]] or 0) >= 95:
+        if (r[c["lg_online"]] is None or r[c["lg_online"]] + (r[c["lg_gave_up"]] or 0) < int(sys.argv[2])) and (r[c[k + "_set_busy_pct"]] or 0) >= 95:
             run += dt
             best = max(best, run)
         else:
