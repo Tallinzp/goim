@@ -1,5 +1,7 @@
 # Plan 6b3b5: Hold a Refused Socket Implementation Plan
 
+> **PARKED (the user, 2026-10-17, after the review):** not to be executed now. #131 amended (no gateway fix now), #132 added; see `docs/superpowers/objections/connection-session-core-06b3b5-refusal-hold-dispositions.md`. Kept for #111: if #111 is unparked, apply the dispositions first (no `draining` hold, the narrowed claim, O4–O6) and re-verify in `proto-6b3b5`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Stop a least-connections LB from pouring every new dial onto a gateway that refuses at once (#131). On a `pending_mem` or `draining` refusal, the gateway keeps the socket open for a short hold before it closes it, so the LB's count includes the refusals. Then repeat the handshake-concurrency-4 `b_stress` trial that found the problem.
