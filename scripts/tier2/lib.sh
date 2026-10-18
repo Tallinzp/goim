@@ -289,12 +289,13 @@ t2_mem_budget() {
 }
 
 # t2_nofile N: raises the soft nofile limit to N for this run and its
-# children (the hard limit is 1,048,576 on the host, #68), or refuses.
+# children (the hard limit is 2,097,152 on the host after host-setup.sh and
+# a new login, #68, #136.5), or refuses.
 t2_nofile() {
   local hard
   hard=$(ulimit -Hn)
   if [ "$hard" != unlimited ] && [ "$hard" -lt "$1" ]; then
-    t2_refuse "refused: nofile hard limit $hard < $1"
+    t2_refuse "refused: nofile hard limit $hard < $1 (run sudo scripts/tier2/host-setup.sh, then log in again, or: sudo prlimit --pid $$ --nofile=1048576:$1)"
   fi
   ulimit -Sn "$1"
 }

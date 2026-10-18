@@ -27,6 +27,7 @@ test-race-suite:
 test-scripts:
 	scripts/tier2/lib_test.sh
 	scripts/tier2/floods_test.sh
+	scripts/tier2/reconnect_test.sh
 	scripts/loadgen_test.sh
 	STACK_REDIS_SERVER=$(REDIS_SERVER) scripts/stack_test.sh
 
@@ -72,7 +73,7 @@ test-redis:
 
 # Tier 2 scenario entry point (spec: automation contract). The caller sets
 # GOIM_TEST_TIER (P5bI-5), e.g. GOIM_TEST_TIER=2 make test-tier2 SCENARIO=race;
-# scenarios: store, race, foundation, smoke, capacity, gwloss, slowlogic, floods, probe (read-only, no guard).
+# scenarios: store, race, foundation, smoke, capacity, gwloss, slowlogic, floods, reconnect, probe (read-only, no guard).
 # The script's exit code is 0 (pass), 1 (a check failed or the run stopped
 # early) or 2 (host refused); make exits 2 on any failure, so the recipe
 # prints the script's code. Automation that needs it runs the script directly.

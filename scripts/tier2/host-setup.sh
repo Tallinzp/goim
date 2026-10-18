@@ -11,6 +11,11 @@
 #   /usr/local/sbin/goim-netdrop           root-owned, 0755 (the b2 DROP rule only)
 #   /etc/sudoers.d/goim-netdrop            $SUDO_USER may run goim-netdrop, and only
 #                                          it, without a password (checked with visudo)
+#   /etc/security/limits.d/90-goim-tier2.conf  and
+#   /etc/systemd/system/user@.service.d/90-goim-tier2.conf
+#                                          $SUDO_USER's nofile hard limit 2,097,152
+#                                          (reconnect's ghost phase, #136.5): new
+#                                          sessions only, so log in again
 #   NOTRACK rules for ports 17000-17199 on lo (goim-netdrop notrack, #123): not
 #                                          kept across a reboot, so run it again
 #                                          after one (the Tier 2 guard says so)
@@ -62,6 +67,10 @@ if [ -z "$root" ]; then
   visudo -cqf "$tmp/sudoers" || { echo "host-setup: visudo rejected the sudoers line" >&2; exit 1; }
 fi
 put "$tmp/sudoers" /etc/sudoers.d/goim-netdrop 0440
+echo "$user hard nofile 2097152" >"$tmp/limits"
+put "$tmp/limits" /etc/security/limits.d/90-goim-tier2.conf 0644
+printf '[Service]\nLimitNOFILE=1048576:2097152\n' >"$tmp/user-service"
+put "$tmp/user-service" /etc/systemd/system/user@.service.d/90-goim-tier2.conf 0644
 
 if [ -n "$root" ]; then
   echo "test mode: nothing applied"
@@ -69,6 +78,7 @@ if [ -n "$root" ]; then
 fi
 grep -vE '^[[:space:]]*(#|$)' "$here/modules.conf" | while read -r m; do modprobe "$m"; done
 sysctl -q -p /etc/sysctl.d/90-goim-tier2.conf
+systemctl daemon-reload
 if [ -x /usr/sbin/iptables ]; then
   /usr/local/sbin/goim-netdrop notrack
   echo "applied: NOTRACK for ports 17000-17199 on lo"
@@ -77,4 +87,5 @@ else
   exit 1
 fi
 echo "host-setup: done. Check: sudo -n /usr/local/sbin/goim-netdrop list; sudo -n /usr/local/sbin/goim-netdrop notrack-check"
+echo "host-setup: the nofile hard limit 2,097,152 applies to new sessions: log out and in again (ulimit -Hn shows it), or raise one shell's: sudo prlimit --pid \$\$ --nofile=1048576:2097152"
 echo "host-setup: NOTRACKed packets are UNTRACKED, not ESTABLISHED: check that iptables -S INPUT, iptables -S OUTPUT and nft list ruleset accept lo before any conntrack-state rule"
