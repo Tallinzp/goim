@@ -87,7 +87,7 @@ GOIM_TEST_TIER=2 make test-tier2 SCENARIO=smoke
 
 `make deploy` starts a whole stack on one machine: Redis, devtoken, Logic and one gateway. A client app on another machine in your LAN can connect to it. It works on Ubuntu and macOS, without Docker.
 
-Needs Go 1.27, a C compiler (`apt install build-essential`, or `xcode-select --install` on macOS), `curl`, and Redis (`apt install redis-server`, `brew install redis`, or `make redis-server`).
+Needs Go 1.27, `curl`, and Redis (`apt install redis-server`, `brew install redis`, or `make redis-server`; the last one also needs a C compiler).
 
 ```sh
 make deploy                       # build, make keys (first run only), start, print the connection values
@@ -99,7 +99,7 @@ make deploy-down                  # stop: gateway drains first, then Logic, devt
 
 `make deploy` prints the gateway address, the Noise key ID and the Noise public key. Put them in the app once. The keys stay the same after a restart. After a reboot, run `make deploy` again. A second `make deploy` while the node runs changes nothing.
 
-Only the gateway port (default 18100) listens on the LAN. Everything else listens on 127.0.0.1. Allow the port in the firewall: `sudo ufw allow 18100/tcp` on Ubuntu. macOS asks once to accept incoming connections.
+Only the gateway port (default 18100) listens on the LAN. Everything else listens on 127.0.0.1. Allow the port in the firewall: `sudo ufw allow 18100/tcp` on Ubuntu. On macOS the firewall is off by default. If you turn it on, macOS asks to accept incoming connections, and it may ask again after a rebuild.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -107,10 +107,11 @@ Only the gateway port (default 18100) listens on the LAN. Everything else listen
 | `GOIM_PORT_BASE` | `18000` | Redis +0 … Logic admin +4; gateway +100 (client), +101, +102 |
 | `GOIM_LISTEN_HOST` | `0.0.0.0` | Gateway client listen address |
 | `GOIM_ADVERTISE_HOST` | the LAN address | Address printed for the app |
+| `GOIM_REDIS_SERVER` | `redis-server` on PATH | Redis binary |
 | `GOIM_MAX_CONNS` | `5000` | Gateway connection cap |
 | `GOIM_DRAIN_WINDOW` | `5s` | Gateway drain spread at stop |
 | `GOIM_DOWN_WAIT` | `60` | Seconds the gateway may drain at stop |
-| `GOIM_TOKEN_TTL`, `GOIM_APPID` | `24h`, `im` | Token lifetime and appid |
+| `GOIM_TOKEN_TTL`, `GOIM_APPID`, `GOIM_PLATFORM` | `24h`, `im`, `mobile` | Token lifetime, appid and platform |
 
 `make deploy-down` does not kill a process that is slow to stop. It reports it. `make deploy-down FORCE=1` sends SIGKILL.
 
@@ -215,7 +216,7 @@ GOIM_TEST_TIER=2 make test-tier2 SCENARIO=smoke
 
 `make deploy` 在一台机器上启动完整的一套服务：Redis、devtoken、Logic 和一个网关。局域网内另一台机器上的客户端 App 可以连接它。支持 Ubuntu 和 macOS，无需 Docker。
 
-需要 Go 1.27、C 编译器（Ubuntu：`apt install build-essential`；macOS：`xcode-select --install`）、`curl` 和 Redis（`apt install redis-server`、`brew install redis`，或 `make redis-server`）。
+需要 Go 1.27、`curl` 和 Redis（`apt install redis-server`、`brew install redis`，或 `make redis-server`；后者还需要 C 编译器）。
 
 ```sh
 make deploy                       # 编译、生成密钥（仅首次）、启动，并打印连接参数
@@ -227,9 +228,9 @@ make deploy-down                  # 停止：先让网关排空，再停 Logic�
 
 `make deploy` 会打印网关地址、Noise 密钥 ID 和 Noise 公钥。把它们一次性配置到 App 中。重启后密钥不变。重启机器后，再运行一次 `make deploy`。节点已在运行时再次执行 `make deploy` 不会改变任何东西。
 
-只有网关端口（默认 18100）监听局域网，其余都只监听 127.0.0.1。请在防火墙放行该端口：Ubuntu 上 `sudo ufw allow 18100/tcp`；macOS 会在首次启动时询问是否允许接收传入连接。
+只有网关端口（默认 18100）监听局域网，其余都只监听 127.0.0.1。请在防火墙放行该端口：Ubuntu 上 `sudo ufw allow 18100/tcp`；macOS 防火墙默认关闭；若已开启，系统会询问是否允许接收传入连接，重新编译后可能再次询问。
 
-环境变量与上表相同：`GOIM_HOME`（默认 `~/.goim`）、`GOIM_PORT_BASE`（18000）、`GOIM_LISTEN_HOST`（0.0.0.0）、`GOIM_ADVERTISE_HOST`、`GOIM_MAX_CONNS`（5000）、`GOIM_DRAIN_WINDOW`（5s）、`GOIM_DOWN_WAIT`（60）、`GOIM_TOKEN_TTL`（24h）、`GOIM_APPID`（im）。
+环境变量与上表相同：`GOIM_HOME`（默认 `~/.goim`）、`GOIM_PORT_BASE`（18000）、`GOIM_LISTEN_HOST`（0.0.0.0）、`GOIM_ADVERTISE_HOST`、`GOIM_MAX_CONNS`（5000）、`GOIM_DRAIN_WINDOW`（5s）、`GOIM_DOWN_WAIT`（60）、`GOIM_TOKEN_TTL`（24h）、`GOIM_APPID`（im）、`GOIM_PLATFORM`（mobile）、`GOIM_REDIS_SERVER`。
 
 停得慢的进程不会被强杀，只会报告。`make deploy-down FORCE=1` 会发送 SIGKILL。
 

@@ -55,14 +55,14 @@ expect "stop: sleep dies from SIGTERM, not clean" "$rc" 1
 case $msg in *"exited with status 143"*) ok "stop: reports 143" ;; *) bad "stop: reports 143: [$msg]" ;; esac
 [ ! -f "$D_HOME/run/sleeper.pid" ] && ok "stop: pid file gone" || bad "stop: pid file gone"
 
-deploy_spawn trapper "$TMP/bin/trapper"
+deploy_spawn trapper bash "$TMP/bin/trapper"
 msg=$(deploy_stop trapper 5); rc=$?
 expect "stop: a TERM-trapping service stops clean" "$rc" 0
 
 msg=$(deploy_stop nothing 5); rc=$?
 expect "stop: not running is a no-op" "$rc:$msg" "0:"
 
-deploy_spawn stubborn "$TMP/bin/stubborn"
+deploy_spawn stubborn bash "$TMP/bin/stubborn"
 msg=$(deploy_stop stubborn 1); rc=$?
 case $msg in *"still running after 1s"*) ok "stop: timeout is reported" ;; *) bad "stop: timeout is reported: [$msg]" ;; esac
 expect "stop: timeout returns 1" "$rc" 1
@@ -76,6 +76,12 @@ msg=$(deploy_alive ghost 2>&1); rc=$?
 expect "alive: pid of an unrelated process is stale" "$rc" 1
 [ ! -f "$D_HOME/run/ghost.pid" ] && ok "alive: stale pid file removed" || bad "alive: stale pid file removed"
 kill -0 $$ && ok "alive: the unrelated process is untouched" || bad "alive: the unrelated process is untouched"
+
+# macOS ps shows argv[0], and Redis rewrites it to "path/redis-server 127.0.0.1:PORT".
+( ps() { echo "/opt/homebrew/bin/redis-server 127.0.0.1:18000"; }
+  echo "$$ redis-server" >"$D_HOME/run/mac.pid"
+  deploy_alive mac ) && ok "alive: a process title with arguments (macOS)" || bad "alive: a process title with arguments (macOS)"
+rm -f "$D_HOME/run/mac.pid"
 
 PORT=$((18900 + RANDOM % 50))
 deploy_port_free "$PORT" && ok "port: free" || bad "port: free"
@@ -171,6 +177,22 @@ c=json.loads(base64.urlsafe_b64decode(p)); print(c["sub"], c["appid"], int(c["ex
   msg=$(deploy_down 2>&1); rc=$?
   expect "down: nothing running" "$rc" 0
   case $msg in *"no node is running"*) ok "down: says so" ;; *) bad "down: says so: [$msg]" ;; esac
+
+  # Keys: each one on its own; the pinned Noise key is never replaced.
+  k=$GOIM_HOME/keys
+  noise_before=$(cksum <"$k/noise/1")
+  rm -f "$k/jwt.jwk" "$k/jwks.json"
+  deploy_keys "$GOIM_HOME/bin" "$k" >/dev/null 2>&1; rc=$?
+  expect "keys: a missing JWT key is made again" "$rc:$(cksum <"$k/noise/1"):$([ -f "$k/jwt.jwk" ] && [ -f "$k/jwks.json" ] && echo both)" "0:$noise_before:both"
+  rm -f "$k/noise-public" "$k/noise/1"
+  deploy_keys "$GOIM_HOME/bin" "$k" >/dev/null 2>&1; rc=$?
+  expect "keys: an interrupted Noise key is made again" "$rc:$([ -f "$k/noise/1" ] && [ -f "$k/noise-public" ] && echo both)" "0:both"
+  rm -f "$k/noise-public"
+  msg=$(deploy_keys "$GOIM_HOME/bin" "$k" 2>&1); rc=$?
+  expect "keys: a Noise key without its public half is not replaced" "$rc" 1
+  case $msg in *noise-public*) ok "keys: says which file" ;; *) bad "keys: says which file: [$msg]" ;; esac
+  rm -f "$k/noise/1" "$k/noise-public"
+  deploy_keys "$GOIM_HOME/bin" "$k" >/dev/null 2>&1
 
   printf '%s\n' '#!/bin/bash' 'exit 1' >"$TMP/bin/badredis"
   chmod +x "$TMP/bin/badredis"

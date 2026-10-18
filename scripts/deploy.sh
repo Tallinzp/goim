@@ -63,7 +63,6 @@ deploy_lan_ip() {
 deploy_preflight() {
   local bad=0
   command -v go >/dev/null 2>&1 || { echo "goim: go is missing (install Go 1.27: go.dev/dl)" >&2; bad=1; }
-  command -v cc >/dev/null 2>&1 || { echo "goim: no C compiler (Ubuntu: apt install build-essential; macOS: xcode-select --install)" >&2; bad=1; }
   command -v curl >/dev/null 2>&1 || { echo "goim: curl is missing" >&2; bad=1; }
   [ -x "$D_REDIS" ] || { echo "goim: redis-server not found (Ubuntu: apt install redis-server; macOS: brew install redis; or make redis-server)" >&2; bad=1; }
   return $bad
@@ -109,6 +108,7 @@ deploy_alive() {
   if kill -0 "$pid" 2>/dev/null; then
     cur=$(ps -p "$pid" -o comm= 2>/dev/null)
     cur=${cur##*/}
+    cur=${cur%% *} # macOS shows argv[0]; Redis adds "127.0.0.1:PORT" to it
     [ "${cur:0:15}" = "${comm:0:15}" ] && return 0
   fi
   rm -f "$f"
@@ -211,6 +211,32 @@ deploy_summary() {
   echo "  logs          $D_HOME/logs"
 }
 
+# deploy_keys BIN KEYS: makes each missing key on its own. The Noise key is
+# written to a side directory first, so a stop in the middle leaves either all
+# of it or none; a Noise key whose public half is missing is never replaced
+# (the app has pinned it).
+deploy_keys() {
+  local bin=$1 keys=$2 pub
+  mkdir -p "$keys/noise"
+  if [ ! -f "$keys/noise/1" ]; then
+    rm -rf "$keys/noise.new"
+    mkdir -p "$keys/noise.new"
+    pub=$("$bin/gateway" noise-keygen -key-id 1 -out "$keys/noise.new/1") || return 1
+    echo "${pub##* public }" >"$keys/noise-public"
+    mv "$keys/noise.new/1" "$keys/noise/1" && rmdir "$keys/noise.new"
+  elif [ ! -f "$keys/noise-public" ]; then
+    echo "goim: $keys/noise-public is missing. Restore it, or remove $keys/noise/1 to make a new Noise key (the app must pin the new one)." >&2
+    return 1
+  fi
+  if [ ! -f "$keys/jwt.jwk" ]; then
+    rm -f "$keys/jwks.json"
+    "$bin/devtoken" keygen -kid k1 -out "$keys/jwt.jwk" || return 1
+  fi
+  if [ ! -f "$keys/jwks.json" ]; then
+    "$bin/devtoken" jwks -out "$keys/jwks.json" "$keys/jwt.jwk" || return 1
+  fi
+}
+
 # deploy_up: starts the node; a second run prints the summary and changes
 # nothing. A failure after the first start stops what was started, in order.
 deploy_up() {
@@ -242,15 +268,9 @@ _deploy_up() {
   [ -z "$busy" ] || return 1
   (deploy_raise_nofile) || return 1
   mkdir -p "$bin" "$keys/noise" "$D_HOME/logs" "$D_HOME/run" "$D_HOME/redis"
-  (cd "$D_ROOT" && go build -o "$bin/" ./cmd/gateway ./cmd/logic ./cmd/devtoken) || return 1
+  (cd "$D_ROOT" && CGO_ENABLED=0 go build -o "$bin/" ./cmd/gateway ./cmd/logic ./cmd/devtoken) || return 1
 
-  # Keys are made once: the app pins the Noise key.
-  if [ ! -f "$keys/noise/1" ] || [ ! -f "$keys/noise-public" ] || [ ! -f "$keys/jwt.jwk" ]; then
-    pub=$("$bin/gateway" noise-keygen -key-id 1 -out "$keys/noise/1") || return 1
-    echo "${pub##* public }" >"$keys/noise-public"
-    "$bin/devtoken" keygen -kid k1 -out "$keys/jwt.jwk" || return 1
-    "$bin/devtoken" jwks -out "$keys/jwks.json" "$keys/jwt.jwk" || return 1
-  fi
+  deploy_keys "$bin" "$keys" || return 1
   echo "{\"gw-0\": \"127.0.0.1:$((base + 101))\"}" >"$D_HOME/kick.json"
 
   D_STARTED=1
