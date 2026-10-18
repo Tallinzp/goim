@@ -167,3 +167,208 @@ deploy_ready() {
   tail -n 20 "$D_HOME/logs/$name.log" >&2
   return 1
 }
+
+# deploy_raise_nofile: the gateway stays NotReady unless RLIMIT_NOFILE is at
+# least 1.10 times its connection cap (internal/gateway/limits.go). Raises the
+# soft limit of this shell to min(hard, 10240) when it is lower; 1 if still too low.
+deploy_raise_nofile() {
+  local need=$((D_MAXCONNS * 11 / 10 + 1)) cur hard target=10240
+  cur=$(ulimit -Sn)
+  hard=$(ulimit -Hn)
+  [ "$cur" = unlimited ] && return 0
+  if [ "$cur" -lt "$need" ]; then
+    if [ "$hard" != unlimited ] && [ "$hard" -lt "$target" ]; then target=$hard; fi
+    ulimit -Sn "$target" 2>/dev/null
+    cur=$(ulimit -Sn)
+  fi
+  if [ "$cur" != unlimited ] && [ "$cur" -lt "$need" ]; then
+    echo "goim: the open-file limit is $cur; the gateway needs $need for $D_MAXCONNS connections. Raise it (ulimit -n) or set a lower GOIM_MAX_CONNS." >&2
+    return 1
+  fi
+}
+
+# deploy_redis_ready: Redis answers on its port (PING when redis-cli is there).
+deploy_redis_ready() {
+  local cli
+  cli=$(dirname "$D_REDIS")/redis-cli
+  [ -x "$cli" ] || cli=$(command -v redis-cli 2>/dev/null)
+  if [ -n "$cli" ]; then
+    [ "$("$cli" -p "$D_BASE" ping 2>/dev/null)" = PONG ]
+  else
+    ! deploy_port_free "$D_BASE"
+  fi
+}
+
+# deploy_summary: what the app needs.
+deploy_summary() {
+  local pubf=$D_HOME/keys/noise-public
+  [ -f "$pubf" ] || { echo "goim: nothing deployed yet (make deploy)"; return 0; }
+  echo "goim node:"
+  echo "  gateway       $D_ADV:$((D_BASE + 100))"
+  echo "  noise key id  1"
+  echo "  noise public  $(cat "$pubf")"
+  echo "  token         make deploy-token USER_ID=<uid>"
+  echo "  logs          $D_HOME/logs"
+}
+
+# deploy_up: starts the node; a second run prints the summary and changes
+# nothing. A failure after the first start stops what was started, in order.
+deploy_up() {
+  local rc
+  deploy_config
+  D_STARTED=
+  _deploy_up
+  rc=$?
+  if [ "$rc" -ne 0 ] && [ -n "$D_STARTED" ]; then deploy_down >&2; fi
+  [ "$rc" -eq 0 ]
+}
+
+_deploy_up() {
+  local name n=0 p busy="" pub bin=$D_HOME/bin keys=$D_HOME/keys base=$D_BASE
+  deploy_preflight || return 1
+  for name in redis devtoken logic gateway; do deploy_alive "$name" && n=$((n + 1)); done
+  if [ "$n" -eq 4 ]; then
+    echo "goim: the node is already running"
+    deploy_summary
+    return 0
+  fi
+  if [ "$n" -gt 0 ]; then
+    echo "goim: only some processes run; run make deploy-down first" >&2
+    return 1
+  fi
+  for p in $(seq "$base" $((base + 4))) $((base + 100)) $((base + 101)) $((base + 102)); do
+    deploy_port_free "$p" || { echo "goim: port $p is in use" >&2; busy=1; }
+  done
+  [ -z "$busy" ] || return 1
+  (deploy_raise_nofile) || return 1
+  mkdir -p "$bin" "$keys/noise" "$D_HOME/logs" "$D_HOME/run" "$D_HOME/redis"
+  (cd "$D_ROOT" && go build -o "$bin/" ./cmd/gateway ./cmd/logic ./cmd/devtoken) || return 1
+
+  # Keys are made once: the app pins the Noise key.
+  if [ ! -f "$keys/noise/1" ] || [ ! -f "$keys/noise-public" ] || [ ! -f "$keys/jwt.jwk" ]; then
+    pub=$("$bin/gateway" noise-keygen -key-id 1 -out "$keys/noise/1") || return 1
+    echo "${pub##* public }" >"$keys/noise-public"
+    "$bin/devtoken" keygen -kid k1 -out "$keys/jwt.jwk" || return 1
+    "$bin/devtoken" jwks -out "$keys/jwks.json" "$keys/jwt.jwk" || return 1
+  fi
+  echo "{\"gw-0\": \"127.0.0.1:$((base + 101))\"}" >"$D_HOME/kick.json"
+
+  D_STARTED=1
+  deploy_spawn redis "$D_REDIS" --port "$base" --bind 127.0.0.1 --dir "$D_HOME/redis" \
+    --appendonly yes --save "" --maxmemory-policy noeviction || { echo "goim: redis did not start" >&2; tail -n 20 "$D_HOME/logs/redis.log" >&2; return 1; }
+  for p in $(seq 100); do
+    deploy_redis_ready && break
+    deploy_alive redis || { echo "goim: redis exited; last log lines:" >&2; tail -n 20 "$D_HOME/logs/redis.log" >&2; return 1; }
+    sleep 0.1
+  done
+  deploy_redis_ready || { echo "goim: redis not answering on port $base" >&2; return 1; }
+  deploy_spawn devtoken "$bin/devtoken" serve -addr "127.0.0.1:$((base + 1))" -jwks "$keys/jwks.json" || return 1
+  deploy_ready devtoken "http://127.0.0.1:$((base + 1))/" 30 || return 1
+  deploy_spawn logic "$bin/logic" -redis "127.0.0.1:$base" -redis-cluster=false \
+    -grpc-addr "127.0.0.1:$((base + 2))" -lease-addr "127.0.0.1:$((base + 3))" -admin-addr "127.0.0.1:$((base + 4))" \
+    -jwks-url "http://127.0.0.1:$((base + 1))/" -jwks-fallback "$keys/jwks.json" \
+    -kick-addr-file "$D_HOME/kick.json" || return 1
+  deploy_ready logic "http://127.0.0.1:$((base + 4))/readyz" 30 || return 1
+  (
+    deploy_raise_nofile
+    deploy_spawn gateway "$bin/gateway" -id gw-0 -listen "tcp://$D_HOST:$((base + 100))" \
+      -noise-keys "$keys/noise" -logic "127.0.0.1:$((base + 2))" -lease "127.0.0.1:$((base + 3))" \
+      -kick-addr "127.0.0.1:$((base + 101))" -admin-addr "127.0.0.1:$((base + 102))" \
+      -drain-window "$D_DRAIN" -max-conns "$D_MAXCONNS" -pending-cap $((D_MAXCONNS / 2)) -logout-queue "$D_MAXCONNS"
+  ) || return 1
+  deploy_ready gateway "http://127.0.0.1:$((base + 102))/readyz" 30 || return 1
+  deploy_summary
+}
+
+# deploy_down: gateway first (it drains), then Logic, devtoken, Redis. Tries
+# all four; 1 if any did not stop clean.
+deploy_down() {
+  local name rc=0 n=0
+  deploy_config
+  for name in gateway logic devtoken redis; do deploy_alive "$name" && n=$((n + 1)); done
+  if [ "$n" -eq 0 ]; then
+    echo "goim: no node is running"
+    return 0
+  fi
+  deploy_stop gateway "$D_WAIT" || rc=1
+  for name in logic devtoken redis; do deploy_stop "$name" 10 || rc=1; done
+  return $rc
+}
+
+# deploy_status: the summary, one line per process; 0 when all run and are ready.
+deploy_status() {
+  local name rc=0 pid state
+  deploy_config
+  deploy_summary
+  for name in redis devtoken logic gateway; do
+    if deploy_alive "$name"; then
+      read -r pid _ <"$D_HOME/run/$name.pid"
+      state=
+      case $name in
+        logic) curl -sf -o /dev/null "http://127.0.0.1:$((D_BASE + 4))/readyz" && state=", ready" || { state=", not ready"; rc=1; } ;;
+        gateway) curl -sf -o /dev/null "http://127.0.0.1:$((D_BASE + 102))/readyz" && state=", ready" || { state=", not ready"; rc=1; } ;;
+      esac
+      echo "$name running, pid $pid$state"
+    else
+      echo "$name stopped"
+      rc=1
+    fi
+  done
+  return $rc
+}
+
+# deploy_logs [NAME]: follows one log or all four.
+deploy_logs() {
+  local name=${1:-} f files=()
+  deploy_config
+  for f in redis devtoken logic gateway; do
+    [ -z "$name" ] || [ "$name" = "$f" ] || continue
+    files+=("$D_HOME/logs/$f.log")
+  done
+  if [ ${#files[@]} -eq 0 ]; then
+    echo "logs: NAME is one of redis, devtoken, logic, gateway" >&2
+    return 2
+  fi
+  tail -n 50 -F "${files[@]}"
+}
+
+# deploy_token UID: a login token for UID (devtoken signs it).
+deploy_token() {
+  deploy_config
+  if [ -z "${1:-}" ]; then
+    echo "token: UID is required" >&2
+    return 2
+  fi
+  if [ ! -f "$D_HOME/keys/jwt.jwk" ] || [ ! -x "$D_HOME/bin/devtoken" ]; then
+    echo "token: run make deploy first" >&2
+    return 2
+  fi
+  "$D_HOME/bin/devtoken" issue -key "$D_HOME/keys/jwt.jwk" -sub "$1" -appid "$D_APPID" \
+    -platform "${GOIM_PLATFORM:-mobile}" -ttl "$D_TTL"
+}
+
+deploy_main() {
+  local cmd=${1:-}
+  [ $# -gt 0 ] && shift
+  set -uo pipefail
+  case $cmd in
+    up)
+      # Ctrl-C or SIGTERM after the first start stops what runs.
+      trap '[ -n "${D_STARTED:-}" ] && deploy_down >&2; exit 130' INT TERM
+      deploy_up
+      ;;
+    down) deploy_down ;;
+    status) deploy_status ;;
+    logs) deploy_logs "$@" ;;
+    token) deploy_token "$@" ;;
+    *)
+      echo "usage: deploy.sh up | down | status | logs [NAME] | token UID" >&2
+      return 2
+      ;;
+  esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  deploy_main "$@"
+  exit $?
+fi

@@ -101,5 +101,96 @@ else
   echo "skip lint: shellcheck (not installed)"
 fi
 
+# --- Task 2: a real node -------------------------------------------------------
+export GOIM_PORT_BASE=18700 GOIM_LISTEN_HOST=127.0.0.1 GOIM_DOWN_WAIT=40
+export GOIM_HOME="$TMP/node home"
+deploy_config 2>/dev/null
+B=$GOIM_PORT_BASE
+no_pid_files() { ! ls "$GOIM_HOME"/run/*.pid >/dev/null 2>&1; }
+all_ports_free() {
+  local p
+  for p in $B $((B + 1)) $((B + 2)) $((B + 3)) $((B + 4)) $((B + 100)) $((B + 101)) $((B + 102)); do
+    deploy_port_free "$p" || { echo "port $p busy"; return 1; }
+  done
+}
+pubkey() { sed -n 's/^ *noise public  *//p' "$1"; }
+
+if [ ! -x "$D_REDIS" ]; then
+  echo "skip node tests: no redis-server (make redis-server, or set GOIM_REDIS_SERVER)"
+else
+  python3 -c 'import socket,sys,time
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(); time.sleep(60)' $((B + 100)) &
+  HOLD_PID=$!
+  sleep 0.5
+  deploy_up >"$TMP/up.out" 2>&1; rc=$?
+  expect "up: busy port refuses" "$rc" 1
+  grep -q "$((B + 100))" "$TMP/up.out" && ok "up: names the busy port" || bad "up: names the busy port"
+  no_pid_files && deploy_port_free "$B" && ok "up: busy port starts nothing" || bad "up: busy port starts nothing"
+  kill "$HOLD_PID"; HOLD_PID=; sleep 0.3
+
+  ( ulimit -S -n 256; deploy_up ) >"$TMP/up.out" 2>&1; rc=$?
+  expect "up: low file limit" "$rc" 0
+  curl -sf -o /dev/null "http://127.0.0.1:$((B + 102))/readyz" && ok "up: low file limit, gateway ready" || { bad "up: low file limit, gateway ready"; tail -n 5 "$TMP/up.out"; }
+  first_pub=$(pubkey "$TMP/up.out")
+  deploy_down >/dev/null 2>&1
+
+  deploy_up >"$TMP/up.out" 2>&1; rc=$?
+  expect "up: node comes up" "$rc" 0
+  deploy_status >"$TMP/st.out" 2>&1; rc=$?
+  expect "status: all running and ready" "$rc" 0
+  grep -Eq 'noise public  +[A-Za-z0-9+/]{43}=$' "$TMP/up.out" && ok "up: prints the noise public key" || bad "up: prints the noise public key"
+  expect "up: same noise key as before the stop" "$(pubkey "$TMP/up.out")" "$first_pub"
+  (exec 3<>"/dev/tcp/127.0.0.1/$((B + 100))") 2>/dev/null && ok "up: gateway accepts TCP" || bad "up: gateway accepts TCP"
+  curl -sf -o /dev/null "http://127.0.0.1:$((B + 4))/readyz" && ok "up: logic ready" || bad "up: logic ready"
+
+  before=$(cat "$GOIM_HOME"/run/*.pid | cksum; cat "$GOIM_HOME"/keys/noise/1 "$GOIM_HOME"/keys/jwt.jwk | cksum)
+  deploy_up >"$TMP/up2.out" 2>&1; rc=$?
+  after=$(cat "$GOIM_HOME"/run/*.pid | cksum; cat "$GOIM_HOME"/keys/noise/1 "$GOIM_HOME"/keys/jwt.jwk | cksum)
+  expect "up: second run is a no-op" "$rc:$before" "0:$after"
+
+  tok=$(deploy_token alice)
+  claims=$(python3 -c 'import sys,json,base64
+p=sys.argv[1].split(".")[1]; p+="="*(-len(p)%4)
+c=json.loads(base64.urlsafe_b64decode(p)); print(c["sub"], c["appid"], int(c["exp"]-c["iat"]))' "$tok" 2>&1)
+  expect "token: claims" "$claims" "alice im 86400"
+  msg=$(deploy_token 2>&1); rc=$?
+  expect "token: no uid" "$rc" 2
+  msg=$(GOIM_HOME="$TMP/empty home" deploy_token alice 2>&1); rc=$?
+  expect "token: before deploy" "$rc" 2
+  case $msg in *"run make deploy first"*) ok "token: says what to do" ;; *) bad "token: says what to do: [$msg]" ;; esac
+
+  deploy_down >"$TMP/down.out" 2>&1; rc=$?
+  expect "down: graceful" "$rc" 0
+  expect "down: gateway status" "$(cat "$GOIM_HOME/run/gateway.status")" 0
+  expect "down: logic status" "$(cat "$GOIM_HOME/run/logic.status")" 0
+  expect "down: redis status" "$(cat "$GOIM_HOME/run/redis.status")" 0
+  case $(cat "$GOIM_HOME/run/devtoken.status") in 0 | 143) ok "down: devtoken status" ;; *) bad "down: devtoken status" ;; esac
+  no_pid_files && ok "down: no pid file" || bad "down: no pid file"
+  all_ports_free >/dev/null && ok "down: no listener" || bad "down: no listener: $(all_ports_free)"
+  msg=$(deploy_down 2>&1); rc=$?
+  expect "down: nothing running" "$rc" 0
+  case $msg in *"no node is running"*) ok "down: says so" ;; *) bad "down: says so: [$msg]" ;; esac
+
+  printf '%s\n' '#!/bin/bash' 'exit 1' >"$TMP/bin/badredis"
+  chmod +x "$TMP/bin/badredis"
+  (GOIM_REDIS_SERVER="$TMP/bin/badredis"; deploy_up) >"$TMP/up.out" 2>&1; rc=$?
+  expect "up: failure rolls back" "$rc" 1
+  no_pid_files && all_ports_free >/dev/null && ok "up: failure leaves nothing" || bad "up: failure leaves nothing"
+
+  for sig in INT TERM; do
+    rm -f "$GOIM_HOME"/run/*.status
+    set -m
+    scripts/deploy.sh up >"$TMP/sig.out" 2>&1 &
+    UP=$!
+    set +m
+    for _ in $(seq 100); do [ -f "$GOIM_HOME/run/redis.pid" ] && break; sleep 0.1; done
+    kill -$sig "$UP"
+    wait "$UP" 2>/dev/null
+    sleep 1
+    no_pid_files && all_ports_free >/dev/null && ok "up: SIG$sig rolls back" || bad "up: SIG$sig rolls back: $(ls "$GOIM_HOME"/run 2>&1 | tr '\n' ' ')"
+  done
+fi
+
 echo
 if [ "$fails" -eq 0 ]; then echo "deploy_test: all passed"; else echo "deploy_test: $fails failure(s)"; exit 1; fi
