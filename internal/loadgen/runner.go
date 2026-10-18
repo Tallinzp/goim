@@ -52,6 +52,14 @@ type Stats struct {
 	ElapsedS   float64          `json:"elapsed_s"`
 	Precompute *PrecomputeStats `json:"precompute,omitempty"`
 	Flood      *FloodStats      `json:"flood,omitempty"` // flood modes only
+	// BalancerOpen is the balancer's open connections per gateway, the
+	// count least connections picks by (#133: the funnel).
+	BalancerOpen map[string]int `json:"balancer_open"`
+	// GhostsOpen is the sockets POST /ghost keeps that no gateway closed
+	// yet; GhostsClosed the ones closed, per gateway, by a Kick or silently
+	// (the heartbeat sweep).
+	GhostsOpen   int64                  `json:"ghosts_open"`
+	GhostsClosed map[string]GhostCloses `json:"ghosts_closed"`
 	Counts
 }
 
@@ -70,7 +78,10 @@ type Runner struct {
 	ramped   chan struct{} // closed when every client has started
 
 	mu    sync.Mutex
-	stops []func() // one per started client
+	stops []func()     // one per started client
+	sdks  []*sdkClient // sdk mode: every started client (Reset, NetworkChange, Ghost)
+
+	ghosts *ghosts // the sockets Ghost keeps
 }
 
 // New checks cfg and prepares a run against env's gateways.
@@ -121,7 +132,8 @@ func New(cfg Config, env Env) (*Runner, error) {
 	for _, gw := range down {
 		bal.SetDown(gw)
 	}
-	r := &Runner{cfg: cfg, env: env, rec: NewRecorder(cfg.Clients, env.GatewayIDs), bal: bal, ramped: make(chan struct{})}
+	r := &Runner{cfg: cfg, env: env, rec: NewRecorder(cfg.Clients, env.GatewayIDs), bal: bal, ramped: make(chan struct{}),
+		ghosts: newGhosts(len(env.GatewayIDs))}
 	if cfg.Mode == "light" {
 		r.pinger = newPingers(runtime.GOMAXPROCS(0), cfg.PingEvery, r.rec)
 	}
@@ -204,6 +216,7 @@ func (r *Runner) Run(ctx context.Context) {
 	close(work)
 	sw.Wait()
 	wg.Wait()
+	r.ghosts.stop()
 }
 
 func (r *Runner) start(ctx context.Context, wg *sync.WaitGroup, i int) {
@@ -217,13 +230,16 @@ func (r *Runner) start(ctx context.Context, wg *sync.WaitGroup, i int) {
 		stop = lc.stop
 		wg.Go(func() { r.light(ctx, lc) })
 	default:
-		c, err := r.newSDK(i)
+		sc, err := r.newSDK(i)
 		if err != nil {
 			r.rec.Failed("sdk")
 			return
 		}
-		stop = c.Close
-		c.Connect()
+		stop = sc.c.Close
+		sc.c.Connect()
+		r.mu.Lock()
+		r.sdks = append(r.sdks, sc)
+		r.mu.Unlock()
 	}
 	r.mu.Lock()
 	r.stops = append(r.stops, stop)
@@ -283,6 +299,73 @@ func (r *Runner) Mark(gw int, name string, down bool) (int, error) {
 	return n, err
 }
 
+// ErrNotSDK refuses /reset and /network-change outside sdk mode: only SDK
+// clients follow the spec's reconnect rules (#134). Nothing changes.
+var ErrNotSDK = errors.New("loadgen: /reset and /network-change need sdk mode")
+
+// Reset is POST /reset (P6a2bI-2, #134): mark name on every gateway, its
+// population every client logged in now, then close every SDK client's
+// newest connection with SO_LINGER 0, so each gateway gets an RST and each
+// client loses its connection at once, as when an LB resets every flow
+// (the spec's whole-population reconnect, "RST from loadgen in one
+// instant"). took is how long the closes took after the mark. A taken mark
+// name closes nothing.
+func (r *Runner) Reset(name string) (n int, took time.Duration, err error) {
+	if r.cfg.Mode != "sdk" {
+		return 0, 0, ErrNotSDK
+	}
+	if n, err = r.Mark(-1, name, false); err != nil {
+		return 0, 0, err
+	}
+	begin := time.Now()
+	r.eachSDK(func(sc *sdkClient) {
+		if c := sc.conn.Load(); c != nil {
+			c.abort()
+		}
+	})
+	return n, time.Since(begin), nil
+}
+
+// NetworkChange is POST /network-change (P6a2bI-2): every SDK client gets
+// sdk.Client.NetworkChanged, as when a city's network recovers. A client
+// in its 0–20s storm wait then attempts within the 0–1s local window; one
+// online, or in a wait the server set, keeps it (spec: Precedence). n is
+// the clients told, took how long that took.
+func (r *Runner) NetworkChange() (n int, took time.Duration, err error) {
+	if r.cfg.Mode != "sdk" {
+		return 0, 0, ErrNotSDK
+	}
+	begin := time.Now()
+	var told atomic.Int64
+	r.eachSDK(func(sc *sdkClient) {
+		sc.c.NetworkChanged()
+		told.Add(1)
+	})
+	return int(told.Load()), time.Since(begin), nil
+}
+
+// eachSDK runs f on every started SDK client, 64 at a time: a call into a
+// client waits for its run loop.
+func (r *Runner) eachSDK(f func(*sdkClient)) {
+	r.mu.Lock()
+	scs := r.sdks
+	r.mu.Unlock()
+	work := make(chan *sdkClient)
+	var wg sync.WaitGroup
+	for range 64 {
+		wg.Go(func() {
+			for sc := range work {
+				f(sc)
+			}
+		})
+	}
+	for _, sc := range scs {
+		work <- sc
+	}
+	close(work)
+	wg.Wait()
+}
+
 // Up is POST /up: gateway gw is back in the balancer. It is not refused for
 // a gateway that /kill or /mark&down=1 took out (#99): a scenario that
 // restarts one needs it. The caller sends it only once gw listens again:
@@ -292,7 +375,12 @@ func (r *Runner) Up(gw int) { r.bal.SetUp(gw) }
 // Stats is the run's state now.
 func (r *Runner) Stats() Stats {
 	s := Stats{Mode: r.cfg.Mode, Clients: r.cfg.Clients, Sources: r.cfg.Sources, Started: r.started.Load(),
-		RampDone: r.rampDone.Load(), Counts: r.rec.Counts()}
+		RampDone: r.rampDone.Load(), BalancerOpen: map[string]int{}, GhostsOpen: r.ghosts.open.Load(),
+		GhostsClosed: map[string]GhostCloses{}, Counts: r.rec.Counts()}
+	for i, n := range r.bal.Open() {
+		s.BalancerOpen[r.env.GatewayIDs[i]] = n
+		s.GhostsClosed[r.env.GatewayIDs[i]] = GhostCloses{Kick: r.ghosts.kick[i].Load(), Silent: r.ghosts.silent[i].Load()}
+	}
 	if b := r.begin.Load(); b != 0 {
 		s.ElapsedS = time.Since(time.Unix(0, b)).Seconds()
 	}

@@ -76,7 +76,8 @@ func TestNewFloodModes(t *testing.T) {
 	}
 }
 
-// metric is the value of name{label=value} in gateway id's registry.
+// metric is the value of name{label=value} in gateway id's registry, a
+// counter or a gauge.
 func metric(t *testing.T, id, name, label, value string) float64 {
 	t.Helper()
 	reg, _ := gatewayRegs.Load(id)
@@ -91,7 +92,7 @@ func metric(t *testing.T, id, name, label, value string) float64 {
 		for _, m := range mf.GetMetric() {
 			for _, l := range m.GetLabel() {
 				if l.GetName() == label && l.GetValue() == value {
-					return m.GetCounter().GetValue()
+					return m.GetCounter().GetValue() + m.GetGauge().GetValue()
 				}
 			}
 		}

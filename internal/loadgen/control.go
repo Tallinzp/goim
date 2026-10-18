@@ -34,6 +34,13 @@ func (r *Runner) Result(within time.Duration) Result {
 //	POST /mark?gateway=gw-1|all&mark=drop     a mark; &down=1 also takes the gateway out of the balancer
 //	POST /up?gateway=gw-1                     the gateway is back in the balancer  {"gateway"}
 //	                                          also after /kill: send it once the gateway listens again
+//	POST /reset?mark=reset                    sdk: mark every gateway, then RST every connection  {"mark", "population", "close_ms"}
+//	                                          409: not sdk mode or the mark taken, nothing changed
+//	POST /network-change                      sdk: NetworkChanged on every client  {"clients", "ms"}; 409: not sdk mode
+//	POST /ghost?mark=ghost                    sdk: mark every gateway, then every connection lost to its client
+//	                                          and kept open, unread, until its gateway closes it  {"mark", "population", "ms"}
+//	                                          409: not sdk mode or the mark taken, nothing changed
+//	GET  /clients                             {"uid_prefix", "gateways", "gw": [client i's gateway index, -1: offline]}
 //	GET  /slo?mark=death&within=30s           SLO
 //	GET  /runtime                             Runtime: loadgen's GC, memory and scheduling counters
 //	/debug/pprof/                             loadgen's own profiles
@@ -82,6 +89,41 @@ func (r *Runner) Handler() http.Handler {
 		}
 		r.Up(gw)
 		writeJSON(w, map[string]any{"gateway": q.FormValue("gateway")})
+	})
+	mux.HandleFunc("POST /reset", func(w http.ResponseWriter, q *http.Request) {
+		if q.FormValue("mark") == "" {
+			http.Error(w, "want mark=<name>", http.StatusBadRequest)
+			return
+		}
+		n, took, err := r.Reset(q.FormValue("mark"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		writeJSON(w, map[string]any{"mark": q.FormValue("mark"), "population": n, "close_ms": took.Milliseconds()})
+	})
+	mux.HandleFunc("POST /ghost", func(w http.ResponseWriter, q *http.Request) {
+		if q.FormValue("mark") == "" {
+			http.Error(w, "want mark=<name>", http.StatusBadRequest)
+			return
+		}
+		n, took, err := r.Ghost(q.FormValue("mark"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		writeJSON(w, map[string]any{"mark": q.FormValue("mark"), "population": n, "ms": took.Milliseconds()})
+	})
+	mux.HandleFunc("GET /clients", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, map[string]any{"uid_prefix": r.cfg.UIDPrefix, "gateways": r.env.GatewayIDs, "gw": r.rec.Gateways()})
+	})
+	mux.HandleFunc("POST /network-change", func(w http.ResponseWriter, _ *http.Request) {
+		n, took, err := r.NetworkChange()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		writeJSON(w, map[string]any{"clients": n, "ms": took.Milliseconds()})
 	})
 	mux.HandleFunc("GET /slo", func(w http.ResponseWriter, q *http.Request) {
 		within, err := time.ParseDuration(q.FormValue("within"))
