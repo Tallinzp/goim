@@ -2,7 +2,8 @@
 # Tests for scripts/tier2/reconnect.sh's rc_series over synthetic
 # rc_sampler lines (make test-scripts): the per-gateway rates, a late
 # scrape, loadgen's run-queue wait, and the funnel reading and its bar
-# (#133, review O3, O6); and rc_sessions_cmp (review O4). The scenario
+# (#133, review O3, O6); rc_sessions_cmp (review O4); and rc_heartbeats_ok
+# (the final review's I-1: the ghost allowance). The scenario
 # itself runs on the Tier 2 host.
 set -uo pipefail
 cd "$(git rev-parse --show-toplevel)"
@@ -14,7 +15,7 @@ fails=0
 ok() { echo "ok   $1"; }
 bad() { echo "FAIL $1"; fails=$((fails + 1)); }
 expect() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1: got [$2], want [$3]"; fi; }
-eval "$(sed -n '/^rc_series() {/,/^}/p; /^rc_sessions_cmp() {/,/^}/p' scripts/tier2/reconnect.sh)"
+eval "$(sed -n '/^rc_series() {/,/^}/p; /^rc_sessions_cmp() {/,/^}/p; /^rc_heartbeats_ok() {/,/^}/p' scripts/tier2/reconnect.sh)"
 
 # gw HANDSHAKE ONLINE PENDING_MEM: one gateway's reading (its Kick closes
 # = ONLINE); line MS SKEW GW0 GW1 [RQ] one sample (loadgen 10 online, the
@@ -59,5 +60,17 @@ expect "sessions: counts" "$(get "$c" '[d[k] for k in ("clients", "found", "miss
 expect "sessions: examples" "$(get "$c" 'd["examples"]')" "[['u-2', 'missing'], ['u-3', 'extra'], ['u-4', 'wrong_gateway'], ['u-5', 'stale'], ['u-6', 'offline']]"
 head -n 3 "$tmp/sessions.txt" >"$tmp/short.txt"
 expect "sessions: too few lines" "$(rc_sessions_cmp "$tmp/clients.json" "$tmp/short.txt" 1000)" null
+
+# rc_heartbeats_ok: gw-0 kept 5 ghosts and Kicked 3 of them, so 2
+# heartbeat closes are its ghosts. A Pong left unread at the ghost instant
+# made loadgen count one swept ghost as a kick (4 kick, 1 silent): the
+# allowance comes from the gateway's Kicks, not loadgen's labels.
+g='{"gw-0": {"closes_kick": 3, "closes_heartbeat": 2}}'
+gh='{"open": 0, "closed": {"gw-0": {"kick": 4, "silent": 1}}}'
+expect "heartbeats: ghosts the Kicks missed" "$(rc_heartbeats_ok '{"lost": 5}' "$g" 5 "$gh" ghost)" true
+expect "heartbeats: one more is a timeout" "$(rc_heartbeats_ok '{"lost": 5}' '{"gw-0": {"closes_kick": 3, "closes_heartbeat": 3}}' 5 "$gh" ghost)" false
+expect "heartbeats: none allowed after a reset" "$(rc_heartbeats_ok '{"lost": 5}' "$g" 5 null reset)" false
+expect "heartbeats: a Pong timeout" "$(rc_heartbeats_ok '{"lost": 5, "pong-timeout": 1}' "$g" 5 "$gh" ghost)" false
+expect "heartbeats: a failed reading" "$(rc_heartbeats_ok null "$g" 5 "$gh" ghost)" false
 
 [ "$fails" -eq 0 ] && echo "reconnect_test: all passed" || { echo "reconnect_test: $fails failed"; exit 1; }

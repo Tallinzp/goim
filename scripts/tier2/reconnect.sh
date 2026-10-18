@@ -351,6 +351,19 @@ print(json.dumps({"columns": cols, "gw_columns": gcols, "gateways": ids, "rows":
                "bar_s": bar, "over_bar": round(longest, 1) >= bar, "rows": hits[:20]}}))' "$1" "$2" "$3" "$4" 2>/dev/null || echo null
 }
 
+# rc_heartbeats_ok LOST G POP GH PHASE: true if every connection that ended
+# after the mark was the drop's (LOST = {"lost": POP}) and no gateway
+# closed more by heartbeat than it may. In ghost a gateway's heartbeat
+# closes may be its old connections that no Kick reached: its ghosts (GH's
+# kick + silent) minus its own Kick closes. Loadgen's kick/silent label is
+# not used: a Pong unread at the ghost instant labels a swept ghost kick.
+rc_heartbeats_ok() {
+  local allowed='0'
+  [ "$5" = ghost ] && allowed='sum(((d["gh"] or {}).get("closed") or {}).get(g, {}).values()) - v["closes_kick"]'
+  echo "{\"l\": ${1:-null}, \"g\": ${2:-null}, \"p\": ${3:-null}, \"gh\": ${4:-null}}" |
+    lg_true - 'd["l"] == {"lost": d["p"]} and all(v["closes_heartbeat"] <= '"$allowed"' for g, v in d["g"].items())'
+}
+
 # rc_sessions_cmp CLIENTS SESSIONS MARK_MS: P_sessions' reading (review
 # O4). CLIENTS is loadgen's GET /clients; SESSIONS one line per client, in
 # order: "N|VALUE", N the sess hash's fields, VALUE the first ("gw|epoch|
@@ -538,11 +551,7 @@ for name in $PHASES; do
   t2_check "${name}_back" "$([ "$back" = true ] && lg_true "$slo" 'd["back"] == d["population"] == '"$N" || echo false)" \
     "\"back_s\": $back_s, \"wait_s\": $BACK_WAIT, \"from_mark\": $(lg_py "$slo" 'd["from_mark"]'), \"backoff\": $(echo "$st" | lg_py - 'd["backoff"]'), \"backoff_share\": $(echo "$st" | lg_py - 'round(d["backoff"]["clients"] / '"${pop:-0}"', 4) if '"${pop:-0}"' else None'), \"waits\": $(echo "$st" | lg_py - 'd["storm"]["waits"]'), \"loadgen_bound\": $loadgen_bound, \"rejects\": $(echo "$d" | lg_py - '{g: {k: v[k] for k in ("hs_no_slot", "hs_no_token", "rejects_at_capacity", "rejects_pending_mem", "rejects_handshake_timeout", "rejects_auth_timeout", "rejects_login_queue", "logins_busy")} for g, v in d.items()}'), \"kicks\": $(echo "$ld" | lg_py - '{k: d[k] for k in ("kick_attempts", "kicks_ok", "kick_giveups", "kick_dropped")}'), \"funnel\": $(echo "$series" | lg_py - 'd["funnel"]')"
   lost=$(echo "{\"a\": ${lost0:-null}, \"b\": ${lost1:-null}}" | lg_py - '{k: v - d["a"].get(k, 0) for k, v in d["b"].items() if v - d["a"].get(k, 0)}')
-  # ghost: a gateway's heartbeat closes may be its old connections that no
-  # Kick reached (loadgen saw them close silently), and no more.
-  allowed='0'
-  [ "$name" = ghost ] && allowed='((d["gh"] or {}).get("closed") or {}).get(g, {}).get("silent", 0)'
-  hb_ok=$(echo "{\"l\": ${lost:-null}, \"g\": $d, \"p\": ${pop:-null}, \"gh\": ${gh:-null}}" | lg_true - 'd["l"] == {"lost": d["p"]} and all(v["closes_heartbeat"] <= '"$allowed"' for g, v in d["g"].items())')
+  hb_ok=$(rc_heartbeats_ok "${lost:-null}" "$d" "${pop:-null}" "${gh:-null}" "$name")
   runq_max=$(echo "$series" | lg_py - 'max([r[4] for r in d["rows"] if r[4] is not None], default=None)')
   t2_check "${name}_heartbeats" "$hb_ok" \
     "\"lost_since_mark\": ${lost:-null}, \"population\": ${pop:-null}, \"closes_heartbeat\": $(echo "$d" | lg_py - '{g: v["closes_heartbeat"] for g, v in d.items()}'), \"ghosts_silent\": $(echo "${gh:-null}" | lg_py - '{g: v["silent"] for g, v in d["closed"].items()}'), \"heartbeat_s\": $HB, \"hold_s\": $HOLD, \"loadgen_bound\": $loadgen_bound, \"lg_runq_ms_per_s_max\": $runq_max"
