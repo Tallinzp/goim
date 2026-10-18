@@ -2052,7 +2052,7 @@ Readings (31 for `reset`/`netchange`, 31b for `ghost`; 31's `ghost` in brackets)
 | sessions found | 600,000 | 600,000 | 600,000 |
 
 - Every phase was loadgen-bound (`storm_first30` loadgen 11.7–13.4 cores of 14; `lg_runq_ms_per_s` up to 1.5–1.7s/s): the times are upper bounds, as b_stress's (#110). `*_heartbeats` passed in all phases, so no labelled `not_covered` line.
-- Which bound came first (Review Focus 4): the gateway set reached 98–99% busy from ~10s (`reset`) and ~4s (`netchange`, `ghost`), with Logic's set at 99–100% at the same time; `pending_mem` never fired. In `ghost` the cap bound from ~6–9s (`open` 250,000 on each gateway) until the sweep at `DeadAfter` (~41–73s) freed it.
+- Which bound came first (Review Focus 4): the gateway set reached 98–99% busy from ~14s (`reset`), ~4s (`netchange`) and ~6s (`ghost`), with Logic's set at 99–100% at the same time; `pending_mem` never fired. In `ghost` the cap bound from ~6–9s (`open` 250,000 on each gateway) until the sweep at `DeadAfter` (~41–73s) freed it.
 - `netchange` ≈ `reset`: `/network-change` reached all 600k clients only 27–36s after the mark (`eachSDK` over 600k `NetworkChanged` on a saturated loadgen), after most 0–20s storm waits had ended; it cut 126–160k waits. The spec's "0–1s instead of 0–20s" shape is not what Tier 2 measured; the bound is loadgen's own fan-out.
 - `ghost`: ~62% of old connections were Kicked by a relogin (incl. `not_owner`), ~38% waited for the heartbeat sweep; `at_capacity` (~2.8M refusals in all) and backoff (29.5%) shaped the recovery, which took ~1.9× `reset`'s p99.
 - Redis (single instance, Plan 6c's baseline): `evalsha` p99 75–94µs, p99.9 2.6–3.1ms; `sadd` p99 150–309µs; `hget`/`hset`/`hmget` p99 2–5µs.
