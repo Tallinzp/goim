@@ -2011,4 +2011,20 @@ Push the branch. Fast-forwarding `main` is the user's call.
 
 ## Execution Notes
 
-(none yet)
+**Tasks 1–2 executed 2026-10-18** (inline, superpowers:executing-plans) on `feat/plan6b3` from `c221ab4`: `c32f14c` (Task 1), `e2e4102` (Task 2). Both patches applied cleanly on top of 6b3c1 (including its `e5f401d` fix).
+- Task 1: the 7 new tests pass; `gofmt`, `go vet ./...` and `make test` (race) green; mutations 11/11 caught (each a test failure, not a build error).
+- Task 2: `make test-scripts` all five passed (`lib_test` with the three `setup:` cases). Dry run (3,000 clients): exit 1, 34 checks, failing only `no_swap_in_reset` and `no_swap_in_ghost` (the dev swap). `reset` p99 19,894ms, `waits` `{"storm": 3000}`; `netchange` p99 1,452ms, `local` 2,961, network change at 277ms; `ghost` p99 1,761ms, `local` 2,965, network change at 198ms, ghosts `open` 0, `kick` 1,000 per gateway, `silent` 0. Sessions found 3,000 in each phase; funnel `over_bar` false.
+
+**Final review (fresh Opus reviewer, 2026-10-18):** 0 Critical, 1 Important, 9 Minor.
+- **I-1, fixed `e5c070d`:** the gateway answers each Ping with a Pong. A Pong that reaches a socket after `/ghost` stays unread, so the keeper reads `n > 0` and labels a ghost that the heartbeat sweep closed as `kick`. At 600k clients and a 30s heartbeat (~20k Pings/s), tens to hundreds of ghosts can hold such a Pong, and `ghost_heartbeats` then fails falsely (`closes_heartbeat > silent`). Now each gateway may close by heartbeat its ghosts (`kick` + `silent`) minus its own `closes_kick`, in the new `rc_heartbeats_ok` (5 cases in `reconnect_test.sh`; the first failed before the fix). Loadgen's `kick`/`silent` stays a reading only. This amends Global Constraints' "gateway heartbeat closes up to the silent ghosts". A `ghost`-only dry run after the fix: 12 checks, only `no_swap_in_ghost` failing.
+- Minors, not fixed (the user's call):
+  - M1: when `keep()`'s `EPOLL_CTL_ADD` fails (e.g. `fs.epoll.max_user_watches`), its fallback blocks the SDK's `Close` for 1s, closes the socket from loadgen's side and counts it `silent`.
+  - M2: `abort()` closes the socket outside the `replyConn` state; a `/reset` after a `/ghost` on one runner would close a kept socket (the scenario never does this).
+  - M3: a narrow race between `Close` and `ghost()` can close a socket instead of keeping it (then `P_drop` fails).
+  - M4: the drop wait polls `/slo` every 0.2s, and each poll walks 600k members under `Recorder.mu` early in the storm (0.5s suggested).
+  - M5: the `user@.service` drop-in applies to every user and raises the soft limit to 1,048,576 (`LimitNOFILE=1024:2097152` suggested).
+  - M6: `fs.nr_open = 2097152` can lower a host value that systemd raised at boot (1073741816); check `sysctl fs.nr_open` on the host first.
+  - M7: `daemon-reload` does not restart a running user manager, so a new login may not apply the drop-in; the `prlimit` fallback covers it.
+  - M8: `rc_sessions_cmp` checks only that there are enough lines, not exactly one per client (a fail, not a false pass).
+  - M9: `ErrNotSDK`'s text omits `/ghost`; an epoll failure in `Ghost` also gives 409.
+- Not judged by the reviewer (host data, read in run 31): the 23GiB budget with ~1.2M loadgen sockets, the host's `epoll max_user_watches` and `file-max`, and whether a Kick frame always reaches the socket before the close under load.
