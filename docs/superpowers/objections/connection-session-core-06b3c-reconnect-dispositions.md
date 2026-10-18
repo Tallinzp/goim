@@ -96,3 +96,7 @@ Size note: O1 adds a loadgen mode and a third phase to a plan that is already ~1
 **Plan changes to apply:**
 - `reconnect.sh`: `taskset -apc "$T2_CPUS_LOADGEN" "$smp"`, with a comment saying why.
 - Review Focus 4: one sentence.
+
+## Applied (2026-10-18)
+
+All eight are applied and re-verified in `proto-6b3c` (`f2546aa`, `4658e13`, `d1d4c06`, `fd1dc04`; replayed byte for byte). O1's fd peak: up to 1.2M loadgen sockets, so the user chose a nofile hard limit of 2,097,152 (`host-setup.sh`) over a smaller `ghost`. The plan then measured ~170KB, and the user split it after its Task 2: O7 is in `2026-10-17-connection-session-core-06b3c1-helpers-floods.md`; O1–O6 and O8 are in `2026-10-17-connection-session-core-06b3c2-reconnect.md` (the plan file this review names, renamed).
