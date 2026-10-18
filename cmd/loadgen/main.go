@@ -2,7 +2,9 @@
 // scripts/stack.sh's stack.env, starts -clients at -rate through a
 // least-connections balancer from 127.0.0.2… (choices #69, #81), holds them,
 // and serves the control API on -control (GET /stats, POST /kill, POST /mark,
-// POST /up, GET /slo, GET /runtime; choice #84) until SIGTERM, Ctrl-C or -duration.
+// POST /up, GET /slo, GET /runtime, GET /clients; choice #84; sdk mode also
+// POST /reset, POST /network-change and POST /ghost, Plan 6b3c) until
+// SIGTERM, Ctrl-C or -duration.
 // -down keeps gateways out of the balancer until POST /up (#93). The flood
 // modes (garbage, slow-handshake, slow-auth; Plan 6b3a) log nothing in: they
 // put a handshake flood or a slow-client flood beside another instance's

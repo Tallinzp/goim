@@ -114,6 +114,18 @@ func (r *Recorder) Lost(i int, why string, now time.Time) {
 	}
 }
 
+// Gateways is the gateway index each client is logged in on now, -1 for
+// none (GET /clients, Plan 6b3c review O4).
+func (r *Recorder) Gateways() []int32 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	gw := make([]int32, len(r.clients))
+	for i, c := range r.clients {
+		gw[i] = c.gw
+	}
+	return gw
+}
+
 // Failed: an attempt ended before logging in, for why.
 func (r *Recorder) Failed(why string) {
 	r.mu.Lock()
@@ -192,6 +204,18 @@ func (r *Recorder) Handshake(how string) {
 	default:
 		r.storm.HandshakesInline++
 	}
+	r.mu.Unlock()
+}
+
+// Wait: an SDK client's next attempt waits, of kind (an sdk.WaitKind
+// name), counted since the latest mark: after /network-change the storm
+// waits it cut show as local ones (Plan 6b3c).
+func (r *Recorder) Wait(kind string) {
+	r.mu.Lock()
+	if r.storm.Waits == nil {
+		r.storm.Waits = map[string]int64{}
+	}
+	r.storm.Waits[kind]++
 	r.mu.Unlock()
 }
 
@@ -355,16 +379,17 @@ type BackoffCount struct {
 // (SendLag, ms), how long each handshake took from the
 // server's reply to the Login frame (ReplyLag, ms), and where its first
 // message came from: made ahead of time, when it dialed, or the last attempt's
-// again (#106, #107, #109).
+// again (#106, #107, #109); and every SDK wait by kind (Plan 6b3c).
 type StormCount struct {
-	Mark                  string `json:"mark"`
-	AttemptLag            Dist   `json:"attempt_lag"`
-	ConnectLag            Dist   `json:"connect_lag"`
-	SendLag               Dist   `json:"send_lag"`
-	ReplyLag              Dist   `json:"reply_lag"`
-	HandshakesPrecomputed int64  `json:"handshakes_precomputed"`
-	HandshakesInline      int64  `json:"handshakes_inline"`
-	HandshakesReused      int64  `json:"handshakes_reused"`
+	Mark                  string           `json:"mark"`
+	AttemptLag            Dist             `json:"attempt_lag"`
+	ConnectLag            Dist             `json:"connect_lag"`
+	SendLag               Dist             `json:"send_lag"`
+	ReplyLag              Dist             `json:"reply_lag"`
+	HandshakesPrecomputed int64            `json:"handshakes_precomputed"`
+	HandshakesInline      int64            `json:"handshakes_inline"`
+	HandshakesReused      int64            `json:"handshakes_reused"`
+	Waits                 map[string]int64 `json:"waits"`
 }
 
 // Counts returns a snapshot of the counters.
@@ -398,5 +423,9 @@ func (r *Recorder) Counts() Counts {
 	c.StormSinceMark.ReplyLag = r.reply.dist(r.reply.n)
 	c.StormSinceMark.ConnectLag = r.connect.dist(r.connect.n)
 	c.StormSinceMark.SendLag = r.send.dist(r.send.n)
+	c.StormSinceMark.Waits = map[string]int64{}
+	for k, v := range r.storm.Waits {
+		c.StormSinceMark.Waits[k] = v
+	}
 	return c
 }

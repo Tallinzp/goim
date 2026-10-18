@@ -18,6 +18,8 @@ import (
 type sdkClient struct {
 	r      *Runner
 	i      int
+	c      *sdk.Client
+	conn   atomic.Pointer[replyConn] // the newest connection dialed, for Reset
 	gw     atomic.Int32              // gateway of the last dial
 	tok    atomic.Pointer[string]    // the last token, reused until a refresh (spec: Client SDK rules)
 	pre    atomic.Pointer[prepared]  // the next attempt's first message (#106)
@@ -29,9 +31,9 @@ type sdkClient struct {
 	online bool                      // run loop only
 }
 
-func (r *Runner) newSDK(i int) (*sdk.Client, error) {
+func (r *Runner) newSDK(i int) (*sdkClient, error) {
 	sc := &sdkClient{r: r, i: i}
-	return sdk.New(sdk.Config{Addrs: []string{"balancer"}, KeyID: r.env.NoiseKeyID, ServerKey: r.env.NoisePublic,
+	c, err := sdk.New(sdk.Config{Addrs: []string{"balancer"}, KeyID: r.env.NoiseKeyID, ServerKey: r.env.NoisePublic,
 		AppID: AppID, Platform: clientpb.Platform_PLATFORM_MOBILE,
 		Token: func(_ context.Context, refresh bool) (string, error) {
 			if t := sc.tok.Load(); t != nil && !refresh {
@@ -57,16 +59,31 @@ func (r *Runner) newSDK(i int) (*sdk.Client, error) {
 				sc.gw.Store(int32(gw))
 			}
 			rc := sc.track(nc, seq)
+			rc.gw = gw
+			if seq == sc.dials.Load() {
+				sc.conn.Store(rc)
+			}
 			r.rec.ConnectLag(rc.dialed.Sub(nc.(*conn).connecting))
 			return rc, nil
 		},
 		Initiate: sc.initiate})
+	sc.c = c
+	return sc, err
+}
+
+// abort closes c with an RST, not a FIN (SO_LINGER 0): an LB resetting
+// the flow (Reset, #134).
+func (c *replyConn) abort() {
+	if tc := c.tcp(); tc != nil {
+		tc.SetLinger(0)
+	}
+	c.Conn.Close()
 }
 
 // track wraps a connection the client just dialed; seq is its dial number,
 // taken when its dial started (#107, #109).
 func (sc *sdkClient) track(nc net.Conn, seq uint64) *replyConn {
-	return &replyConn{Conn: nc, sc: sc, seq: seq, dialed: time.Now()}
+	return &replyConn{Conn: nc, sc: sc, gw: -1, seq: seq, dialed: time.Now()}
 }
 
 // initiate is the client's Config.Initiate. It sends the last attempt's
@@ -106,8 +123,11 @@ func (sc *sdkClient) initiate(keyID uint16, pub []byte) (*wire.Initiator, []byte
 // event runs on the client's run loop: it must not block.
 func (sc *sdkClient) event(e sdk.Event) {
 	now := time.Now()
-	if e.Kind == sdk.EventWaiting && (e.Wait.Kind == sdk.WaitBackoff || e.Wait.Kind == sdk.WaitFailure) {
-		sc.r.rec.Backoff(sc.i, e.Wait.Kind.String())
+	if e.Kind == sdk.EventWaiting {
+		sc.r.rec.Wait(e.Wait.Kind.String())
+		if e.Wait.Kind == sdk.WaitBackoff || e.Wait.Kind == sdk.WaitFailure {
+			sc.r.rec.Backoff(sc.i, e.Wait.Kind.String())
+		}
 	}
 	switch e.Kind {
 	case sdk.EventConnecting:
@@ -195,7 +215,9 @@ var errHandshakeTaken = errors.New("loadgen: handshake used by a later attempt")
 type replyConn struct {
 	net.Conn
 	sc     *sdkClient
-	seq    uint64 // its dial number (#109)
+	gw     int          // the gateway dialed
+	seq    uint64       // its dial number (#109)
+	state  atomic.Int32 // connOpen, connGhost, connClosed (Ghost)
 	dialed time.Time
 	read   atomic.Int64 // unix ns the latest Read returned
 	writes atomic.Int32
@@ -203,7 +225,13 @@ type replyConn struct {
 }
 
 func (c *replyConn) Read(b []byte) (int, error) {
+	if c.state.Load() == connGhost {
+		return 0, errGhost
+	}
 	n, err := c.Conn.Read(b)
+	if c.state.Load() == connGhost {
+		return 0, errGhost
+	}
 	c.read.Store(time.Now().UnixNano())
 	if h := c.hs.Load(); h != nil && n > 0 {
 		if !h.reply(c) {
@@ -221,6 +249,9 @@ func (c *replyConn) Read(b []byte) (int, error) {
 // is a cancelled attempt's: its first message, held or one answered since,
 // is not sent (review M1).
 func (c *replyConn) Write(b []byte) (int, error) {
+	if c.state.Load() == connGhost {
+		return 0, errGhost
+	}
 	switch c.writes.Add(1) {
 	case 1:
 		c.sc.r.rec.SendLag(time.Since(c.dialed))
