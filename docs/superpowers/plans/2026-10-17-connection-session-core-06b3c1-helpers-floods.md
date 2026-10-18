@@ -937,4 +937,13 @@ Push the branch. Fast-forwarding `main` is the user's call.
 
 ## Execution Notes
 
-(none yet)
+**Executed 2026-10-18** (inline, superpowers:executing-plans), on `feat/plan6b3` from `69dfa80`:
+- Task 1: `5fc44fa` (helpers to `lib.sh`). The new `lib_test` lines failed first (7 fails), then `make test-scripts` passed. The `grep` printed only floods' `up storm` and `lib_test`'s `kill_tree` line, as expected.
+- Task 2: `c367041` (`refused`, the O7 bound, the series verdict). The new `floods_test` lines failed first (5 fails). The mutation failed `TestSlowFloodClosedEarlyIsRefused` with `Outcomes:map[closed:3]` (the plan expected `closed:2`; the same shape, no `refused`). Dry run (slow phase, 2,000 at 500/s): `exit 1`, 12 checks, only `no_swap_in_slow` failing; verdict `valid`, `sat_run_s` 0.0 on every set; `slow_held` outcomes `closed` 3,500 each, `refused` 0 against `gateway_refusals` 0; `slow_freed` 3,500 timeouts against 3,500 `closed`. `make test` (race), `go vet ./...` and `make test-scripts` green.
+- Task 3: run 30o (optional) not run; the user's call.
+
+**Final review** (fresh Opus reviewer, whole branch `69dfa80..c367041`): 0 Critical, 0 Important, 3 Minor. Both Review Focus items hold: the 5s/4.9s edges are tested; every key the O7 bound reads is in `GW_COUNTERS`, and a null fails safe. Task 1's "no behaviour change" holds; Plan 6b3c2's calls match the moved helpers.
+- **M1, re-graded Important and fixed** (`e5f401d`): `sat_run_s` counted rows while fewer than N light clients were online. A client that gave up never comes online, so a few gave-ups (run 30g had 8) stretched the window over the whole hold. A short burst at ≥ 95% there would give a false `*-saturated` verdict. The window now ends at online + gave-up ≥ N, as `settled` does. Test `series: gave-up clients end the ramp` failed first (6.0 against 0.0), then passed.
+- M2 (deferred, the user's call): `refused` and `refusals` are not in `phase_slow`'s `local` line, so they are globals. No clash now.
+- M3 (deferred, the user's call): `slowHeld` (3s) equals the smallest allowed auth timeout. With `-auth-timeout 3s`, a slow-auth timeout close can read 2.99s (loadgen starts its clock after the handshake reply) and count `refused`. Not at floods' 5s defaults.
+
