@@ -71,6 +71,11 @@ expect "heartbeats: ghosts the Kicks missed" "$(rc_heartbeats_ok '{"lost": 5}' "
 expect "heartbeats: one more is a timeout" "$(rc_heartbeats_ok '{"lost": 5}' '{"gw-0": {"closes_kick": 3, "closes_heartbeat": 3}}' 5 "$gh" ghost)" false
 expect "heartbeats: none allowed after a reset" "$(rc_heartbeats_ok '{"lost": 5}' "$g" 5 null reset)" false
 expect "heartbeats: a Pong timeout" "$(rc_heartbeats_ok '{"lost": 5, "pong-timeout": 1}' "$g" 5 "$gh" ghost)" false
+# Run 31: gw-0's Reconcile closed 4,119 ghosts as not_owner (with a Kick
+# frame). Those are not heartbeat closes: 5 ghosts, 3 Kicked, 1 not_owner,
+# so only 1 heartbeat close is allowed.
+expect "heartbeats: not_owner closes are no heartbeat allowance" "$(rc_heartbeats_ok '{"lost": 5}' '{"gw-0": {"closes_kick": 3, "closes_not_owner": 1, "closes_heartbeat": 2}}' 5 "$gh" ghost)" false
+expect "heartbeats: kick, not_owner and heartbeat closes" "$(rc_heartbeats_ok '{"lost": 5}' '{"gw-0": {"closes_kick": 3, "closes_not_owner": 1, "closes_heartbeat": 1}}' 5 "$gh" ghost)" true
 expect "heartbeats: a failed reading" "$(rc_heartbeats_ok null "$g" 5 "$gh" ghost)" false
 
 [ "$fails" -eq 0 ] && echo "reconnect_test: all passed" || { echo "reconnect_test: $fails failed"; exit 1; }

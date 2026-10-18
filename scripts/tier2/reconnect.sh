@@ -182,6 +182,7 @@ GW_COUNTERS=(
   closes_client='goim_gateway_closes_total:reason="client"'
   closes_heartbeat='goim_gateway_closes_total:reason="heartbeat"'
   closes_kick='goim_gateway_closes_total:reason="kick"'
+  closes_not_owner='goim_gateway_closes_total:reason="not_owner"'
   hs_ok='goim_gateway_handshakes_total:result="ok"'
   hs_no_slot='goim_gateway_handshakes_total:result="no_slot"'
   hs_no_token='goim_gateway_handshakes_total:result="no_token"'
@@ -355,11 +356,13 @@ print(json.dumps({"columns": cols, "gw_columns": gcols, "gateways": ids, "rows":
 # after the mark was the drop's (LOST = {"lost": POP}) and no gateway
 # closed more by heartbeat than it may. In ghost a gateway's heartbeat
 # closes may be its old connections that no Kick reached: its ghosts (GH's
-# kick + silent) minus its own Kick closes. Loadgen's kick/silent label is
-# not used: a Pong unread at the ghost instant labels a swept ghost kick.
+# kick + silent) minus its own Kick and not_owner closes (Reconcile Kicks
+# an old connection whose session moved, run 31). Loadgen's kick/silent
+# label is not used: a Pong unread at the ghost instant labels a swept
+# ghost kick.
 rc_heartbeats_ok() {
   local allowed='0'
-  [ "$5" = ghost ] && allowed='sum(((d["gh"] or {}).get("closed") or {}).get(g, {}).values()) - v["closes_kick"]'
+  [ "$5" = ghost ] && allowed='sum(((d["gh"] or {}).get("closed") or {}).get(g, {}).values()) - v["closes_kick"] - (v.get("closes_not_owner") or 0)'
   echo "{\"l\": ${1:-null}, \"g\": ${2:-null}, \"p\": ${3:-null}, \"gh\": ${4:-null}}" |
     lg_true - 'd["l"] == {"lost": d["p"]} and all(v["closes_heartbeat"] <= '"$allowed"' for g, v in d["g"].items())'
 }
@@ -540,14 +543,15 @@ for name in $PHASES; do
   rule='d["r"]["population"] == '"$N"' and d["s"]["lost"] == d["s"]["population"] and 0 <= d["s"]["detection"]["max_ms"] <= '"$DROP_MAX"' * 1000'
   if [ "$name" = ghost ]; then
     # The gateways closed every old connection: loadgen saw each close,
-    # none is left open, and the gateways counted them (Kick or heartbeat).
-    rule+=' and d["gh"]["open"] == 0 and sum(v["kick"] + v["silent"] for v in d["gh"]["closed"].values()) == d["s"]["population"] and sum(v["closes_kick"] + v["closes_heartbeat"] for v in d["g"].values()) >= d["s"]["population"]'
+    # none is left open, and the gateways counted them (Kick, Reconcile's
+  # not_owner Kick, or heartbeat).
+    rule+=' and d["gh"]["open"] == 0 and sum(v["kick"] + v["silent"] for v in d["gh"]["closed"].values()) == d["s"]["population"] and sum(v["closes_kick"] + (v.get("closes_not_owner") or 0) + v["closes_heartbeat"] for v in d["g"].values()) >= d["s"]["population"]'
   else
     rule+=' and sum(v["closes_client"] for v in d["g"].values()) >= d["s"]["population"]'
   fi
   [ "$name" != reset ] && rule+=' and d["nc"] is not None and d["nc"]["clients"] == '"$N"
   t2_check "${name}_drop" "$([ "$dropped" = true ] && echo "{\"r\": ${reply:-null}, \"s\": $(cat "$slo"), \"g\": $d, \"nc\": $nc, \"gh\": ${gh:-null}}" | lg_true - "$rule" || echo false)" \
-    "\"$mark\": ${reply:-null}, \"lost\": $(lg_py "$slo" 'd["lost"]'), \"detection\": $(lg_py "$slo" 'd["detection"]'), \"max_s\": $DROP_MAX, \"closes\": $(echo "$d" | lg_py - '{g: {k: v[k] for k in ("closes_client", "closes_kick", "closes_heartbeat")} for g, v in d.items()}'), \"ghosts\": ${gh:-null}, \"network_change\": $nc, \"network_change_after_ms\": $nc_after_ms"
+    "\"$mark\": ${reply:-null}, \"lost\": $(lg_py "$slo" 'd["lost"]'), \"detection\": $(lg_py "$slo" 'd["detection"]'), \"max_s\": $DROP_MAX, \"closes\": $(echo "$d" | lg_py - '{g: {k: v[k] for k in ("closes_client", "closes_kick", "closes_not_owner", "closes_heartbeat")} for g, v in d.items()}'), \"ghosts\": ${gh:-null}, \"network_change\": $nc, \"network_change_after_ms\": $nc_after_ms"
   t2_check "${name}_back" "$([ "$back" = true ] && lg_true "$slo" 'd["back"] == d["population"] == '"$N" || echo false)" \
     "\"back_s\": $back_s, \"wait_s\": $BACK_WAIT, \"from_mark\": $(lg_py "$slo" 'd["from_mark"]'), \"backoff\": $(echo "$st" | lg_py - 'd["backoff"]'), \"backoff_share\": $(echo "$st" | lg_py - 'round(d["backoff"]["clients"] / '"${pop:-0}"', 4) if '"${pop:-0}"' else None'), \"waits\": $(echo "$st" | lg_py - 'd["storm"]["waits"]'), \"loadgen_bound\": $loadgen_bound, \"rejects\": $(echo "$d" | lg_py - '{g: {k: v[k] for k in ("hs_no_slot", "hs_no_token", "rejects_at_capacity", "rejects_pending_mem", "rejects_handshake_timeout", "rejects_auth_timeout", "rejects_login_queue", "logins_busy")} for g, v in d.items()}'), \"kicks\": $(echo "$ld" | lg_py - '{k: d[k] for k in ("kick_attempts", "kicks_ok", "kick_giveups", "kick_dropped")}'), \"funnel\": $(echo "$series" | lg_py - 'd["funnel"]')"
   lost=$(echo "{\"a\": ${lost0:-null}, \"b\": ${lost1:-null}}" | lg_py - '{k: v - d["a"].get(k, 0) for k, v in d["b"].items() if v - d["a"].get(k, 0)}')
