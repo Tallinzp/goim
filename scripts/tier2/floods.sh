@@ -234,10 +234,8 @@ t2_on_exit 'stack_down'
 t2_on_exit 'lg_stop_all' # newest first: every loadgen instance stops before the stack
 smp="" prof=""
 t2_on_exit '[ -n "$smp" ] && kill "$smp" 2>/dev/null'
-# kill_tree PID: PID and its descendants, so the exit trap stops a profile
-# subshell's curls too (6b3b4 final review M4).
-kill_tree() { local c; for c in $(pgrep -P "$1"); do kill_tree "$c"; done; kill "$1" 2>/dev/null; }
-t2_on_exit '[ -n "$prof" ] && kill_tree "$prof"'
+# The profile subshell with its curls (6b3b4 final review M4).
+t2_on_exit '[ -n "$prof" ] && t2_kill_tree "$prof"'
 cts=""
 t2_on_exit '[ -n "$cts" ] && kill "$cts" 2>/dev/null'
 
@@ -271,19 +269,10 @@ t2_report_extra() {
   done
 }
 
-# up NAME: a fresh stack in $T2_OUT/NAME; checks NAME_stack.
+# up NAME: t2_up, then the conntrack sampler.
 up() {
-  export STACK_DIR=$T2_OUT/$1
-  mkdir -p "$STACK_DIR"
-  ln -sfn ../bin "$STACK_DIR/bin"
-  local busy
-  busy=$(stack_busy_ports)
-  [ -z "$busy" ] || t2_refuse "$(printf 'refused: the stack ports are in use (a leftover stack?):\n%s\nstop whatever holds them first' "$busy")"
-  stack_up 2>"$STACK_DIR/stack-up.err"
-  local rc=$?
-  t2_check "${1}_stack" "$(t2_bool [ $rc -eq 0 ])" "\"gateways\": $STACK_GATEWAYS, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"error\": $(t2_json_str "$(cat "$STACK_DIR/stack-up.err")")"
-  [ $rc -eq 0 ] && ct_start
-  return $rc
+  t2_up "$1" || return
+  ct_start
 }
 
 # down NAME CONNS: every loadgen stopped, the gateways idle, the stack
@@ -338,26 +327,6 @@ def read(p):
     return sums
 a, b = read(sys.argv[1]), read(sys.argv[2])
 print(json.dumps({k: b[k] - a[k] for k in ("insert_failed", "drop", "early_drop", "invalid") if k in a and k in b}))' "$1" "$2" 2>/dev/null || echo null
-}
-
-# gws_counters: {"gw-0": stack_counters, ...} of every gateway; gws_delta A B
-# the same of two readings.
-gws_counters() {
-  local g out=""
-  for g in $(stack_admins | awk '$1 ~ /^gw-/ { print $1 }'); do
-    out+="${out:+, }\"$g\": $(stack_counters "$g" "${GW_COUNTERS[@]}")"
-  done
-  echo "{$out}"
-}
-# (stack_counters_delta per gateway: a key null in A counts as 0).
-gws_delta() {
-  python3 -c 'import json, sys
-a, b = (json.loads(x) for x in sys.argv[1:3])
-def delta(x, y):
-    if x is None or y is None:
-        return None
-    return {k: None if v is None else round(v - (x.get(k) or 0), 6) for k, v in y.items()}
-print(json.dumps({g: delta(a.get(g), y) for g, y in b.items()}))' "$1" "$2" 2>/dev/null || echo null
 }
 
 # hs_sampler NAME FILE PID: appends "unix_ms ok refused pre cpu" every
@@ -466,15 +435,6 @@ logged_in() {
 # timewait: the host's TIME_WAIT sockets now (ss -s).
 timewait() { ss -s 2>/dev/null | sed -n 's/^TCP:.*timewait \([0-9]*\).*/\1/p' | head -n 1 | grep . || echo null; }
 
-# lease PHASE DELTA SECONDS LOGIC_DELTA: checks PHASE_lease over the gateways'
-# counter delta of a window of SECONDS.
-lease() {
-  local floor
-  floor=$(t2_lease_floor "$3")
-  t2_check "${1}_lease" "$(echo "{\"g\": $2, \"l\": $4}" | lg_true - 'all(v["lease_error"] == 0 and v["lease_missing"] == 0 and v["lease_live"] >= '"$floor"' for v in d["g"].values()) and d["l"]["lease_error"] == 0')" \
-    "\"window_s\": $3, \"live_floor\": $floor, \"gateways\": $(echo "$2" | lg_py - '{g: {"live": v["lease_live"], "missing": v["lease_missing"], "error": v["lease_error"]} for g, v in d.items()}'), \"logic_lease_error\": $(echo "$4" | lg_py - 'd["lease_error"]')"
-}
-
 # heartbeats PHASE N DELTA [VERDICT]: checks PHASE_heartbeats over the light
 # result of N clients online (instance main, stopped) and the gateways'
 # counter delta; with VERDICT (slow_verdict's, a JSON string) only "valid"
@@ -489,22 +449,6 @@ heartbeats() {
   [ $# -ge 4 ] && v=${4:-null} gate='d["v"] == "valid" and '
   t2_check "${1}_heartbeats" "$(echo "{\"r\": $(lg_py "$r" d), \"g\": $3, \"v\": $v}" | lg_true - "$gate"'d["r"]["pong_missing"] == 0 and d["r"]["pongs"] >= '"$2"' and d["r"]["pong_rtt"]["max_ms"] < 10000 and d["r"]["lost"] == {} and all(v["closes_heartbeat"] == 0 for v in d["g"].values()) and d["r"]["ping_gap_max_ms"] <= '"$(((HB + 5) * 1000))")" \
     "\"pongs\": $(lg_json 'd["pongs"]'), \"pong_missing\": $(lg_json 'd["pong_missing"]'), \"pong_rtt\": $(lg_json 'd["pong_rtt"]'), \"lost\": $(lg_json 'd["lost"]'), \"closes_heartbeat\": $(echo "$3" | lg_py - '{g: v["closes_heartbeat"] for g, v in d.items()}'), \"ping_gap_max_ms\": $(lg_json 'd["ping_gap_max_ms"]'), \"ping_tick_lag_max_ms\": $(lg_json 'd["ping_tick_lag_max_ms"]'), \"ping_send_max_ms\": $(lg_json 'd["ping_send_max_ms"]'), \"ping_send_timeouts\": $(lg_json 'd["ping_send_timeouts"]')$([ $# -ge 4 ] && echo ", \"verdict\": $v")"
-}
-
-# set_ticks LIST: "busy total" clock ticks of LIST's CPUs since boot
-# (/proc/stat; busy: user, nice, system, irq, softirq, steal; total adds
-# idle and iowait), as t2_cpusets_json counts them.
-set_ticks() {
-  awk -v cpus=" $(t2_cpulist_expand "$1") " '$1 ~ /^cpu[0-9]+$/ && index(cpus, " " substr($1, 4) " ") {
-    b += $2 + $3 + $4 + $7 + $8 + $9; t += $2 + $3 + $4 + $5 + $6 + $7 + $8 + $9 } END { print b + 0, t + 0 }' /proc/stat
-}
-
-# runq_ns PID: nanoseconds PID's threads have waited on a run queue
-# (/proc/PID/task/*/schedstat, field 2; the process's own schedstat is its
-# main thread only); empty if PID is gone.
-runq_ns() {
-  [ -d "/proc/$1/task" ] || return 0
-  cat /proc/"$1"/task/*/schedstat 2>/dev/null | awk '{ s += $2 } END { if (NR) printf "%.0f\n", s }'
 }
 
 # slow_sampler FILE LIGHT FLOOD FLOOD2: appends one JSON line a second to
@@ -534,9 +478,9 @@ slow_sampler() {
   while :; do
     ms=$(date +%s%3N) ticks=""
     for p in "$2" "$3" "$4"; do t=$(stack_ticks "$p"); ticks+="${ticks:+, }${t:-null}"; done
-    sets="\"loadgen\": [$(set_ticks "$T2_CPUS_LOADGEN" | tr ' ' ,)], \"gateway\": [$(set_ticks "$T2_CPUS_GATEWAY" | tr ' ' ,)], \"logic\": [$(set_ticks "$T2_CPUS_LOGIC" | tr ' ' ,)]"
+    sets="\"loadgen\": [$(t2_set_ticks "$T2_CPUS_LOADGEN" | tr ' ' ,)], \"gateway\": [$(t2_set_ticks "$T2_CPUS_GATEWAY" | tr ' ' ,)], \"logic\": [$(t2_set_ticks "$T2_CPUS_LOGIC" | tr ' ' ,)]"
     rq=()
-    for g in $(stack_admins | awk '$1 ~ /^gw-/ { print $1 }'); do rq[$g]=$(runq_ns "${STACK_PIDS[$g]}"); done
+    for g in $(stack_admins | awk '$1 ~ /^gw-/ { print $1 }'); do rq[$g]=$(t2_runq_ns "${STACK_PIDS[$g]}"); done
     gw="" rqj=""
     for g in "${!rq[@]}"; do
       t=$(STACK_CURL_TIMEOUT=1 stack_counters "$g" "${SERIES_COUNTERS[@]}")
@@ -654,7 +598,7 @@ phase_storm() {
   STACK_GATEWAYS=1 STACK_GATEWAY_ARGS=(-max-conns $((n + n / 10)))
   up storm || { stack_down; return; }
   stack_snapshot before
-  s0=$(gws_counters)
+  s0=$(t2_gws_counters "${GW_COUNTERS[@]}")
   t2_record_start storm
   t2_cpustat_snap "$STACK_DIR/cpustat-0"
   ct_stat_snap "$STACK_DIR/ctstat-0"
@@ -673,12 +617,12 @@ phase_storm() {
   usage=$(stack_usage_json)
   t2_cpustat_snap "$STACK_DIR/cpustat-1"
   ct_stat_snap "$STACK_DIR/ctstat-1"
-  s1=$(gws_counters)
+  s1=$(t2_gws_counters "${GW_COUNTERS[@]}")
   wait "$prof"
   prof=""
   t2_record_end storm
   stack_snapshot after
-  d=$(gws_delta "$s0" "$s1")
+  d=$(t2_gws_delta "$s0" "$s1")
   hs=$(hs_rate "$STACK_DIR/artifacts/handshakes-gw-0.tsv" "$n")
   [ "$online" = true ] && online=$(lg_get /stats "$(logged_in "$n")")
   [ "$online" = true ] || online=false # a null /stats reading fails the check, not the run
@@ -717,7 +661,7 @@ phase_garbage() {
   t2_check garbage_online "$online" "\"want\": $n, \"online\": $on, \"by_gateway\": $(lg_get /stats 'd["online_by_gateway"]'), \"gave_up\": $(lg_get /stats 'd["failed"].get("gave-up", 0)'), \"failed\": $(lg_get /stats 'd["failed"]')"
   [ "$online" = true ] || { down garbage $((n + inflight)); return; }
   stack_snapshot before
-  s0=$(gws_counters) l0=$(stack_counters logic lease_error="$LOGIC_LEASE_ERROR")
+  s0=$(t2_gws_counters "${GW_COUNTERS[@]}") l0=$(stack_counters logic lease_error="$LOGIC_LEASE_ERROR")
   t2_tcpstat_snap "$STACK_DIR/tcp0"
   t2_cpustat_snap "$STACK_DIR/cpustat-0"
   ct_stat_snap "$STACK_DIR/ctstat-0"
@@ -731,7 +675,7 @@ phase_garbage() {
   prof=$!
   sleep "$secs"
   usage=$(stack_usage_json)
-  s1=$(gws_counters) l1=$(stack_counters logic lease_error="$LOGIC_LEASE_ERROR")
+  s1=$(t2_gws_counters "${GW_COUNTERS[@]}") l1=$(stack_counters logic lease_error="$LOGIC_LEASE_ERROR")
   lease_s=$((SECONDS - t0))
   t2_tcpstat_snap "$STACK_DIR/tcp1"
   t2_cpustat_snap "$STACK_DIR/cpustat-1"
@@ -743,7 +687,7 @@ phase_garbage() {
   t2_record_end garbage
   stack_snapshot after
   lg_stop
-  d=$(gws_delta "$s0" "$s1")
+  d=$(t2_gws_delta "$s0" "$s1")
   flood=$(lg_py "$STACK_DIR/artifacts/loadgen-garbage.json" 'd["flood"]')
   want=$(python3 -c 'import sys; print(int(0.95 * int(sys.argv[1]) * int(sys.argv[2])))' "$grate" "$secs")
   t2_check garbage_delivered "$(echo "{\"g\": $d, \"f\": $flood}" | lg_true - 'd["f"]["attempts"] >= '"$want"' and sum(v["hs_failed"] + v["hs_no_slot"] + v["hs_no_token"] for v in d["g"].values()) >= '"$want")" \
@@ -754,7 +698,7 @@ phase_garbage() {
     t2_not_covered "garbage: the bucket (${FLOODS_GARBAGE_BUCKET:-25000}/s) refused nothing on $g; the concurrency limit bound first (garbage_limited.dh_per_s)"
   done
   heartbeats garbage "$on" "$d"
-  lease garbage "$d" "$lease_s" "$(stack_counters_delta "$l0" "$l1")"
+  t2_lease garbage "$d" "$lease_s" "$(stack_counters_delta "$l0" "$l1")"
   t2_field garbage "{\"clients\": $n, \"rate\": $rate, \"garbage_rate\": $grate, \"inflight\": $inflight, \"seconds\": $secs, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"usage\": $usage, \"cpu_sets\": $(t2_cpusets_json "$STACK_DIR/cpustat-0" "$STACK_DIR/cpustat-1"), \"conntrack_stat\": $(ct_stat_json "$STACK_DIR/ctstat-0" "$STACK_DIR/ctstat-1"), \"gateways\": $d, \"flood\": $flood}"
   down garbage $((n + inflight))
   for f in before/gw-0 after/gw-0 garbage/gw-0.cpu.pb.gz garbage/gw-1.cpu.pb.gz garbage/loadgen-flood.cpu.pb.gz; do
@@ -773,7 +717,7 @@ phase_slow() {
   STACK_GATEWAYS=2 STACK_GATEWAY_ARGS=(-max-conns $(((n + hs + au) / 2 + (n + hs + au) / 10)) -heartbeat "${HB}s")
   up slow || { stack_down; return; }
   stack_snapshot before
-  s0=$(gws_counters) l0=$(stack_counters logic lease_error="$LOGIC_LEASE_ERROR")
+  s0=$(t2_gws_counters "${GW_COUNTERS[@]}") l0=$(stack_counters logic lease_error="$LOGIC_LEASE_ERROR")
   t2_record_start slow
   t2_cpustat_snap "$STACK_DIR/cpustat-0"
   ct_stat_snap "$STACK_DIR/ctstat-0"
@@ -808,14 +752,14 @@ phase_slow() {
   usage=$(stack_usage_json)
   lg_in flood lg_stop
   lg_in flood2 lg_stop
-  s1=$(gws_counters) l1=$(stack_counters logic lease_error="$LOGIC_LEASE_ERROR")
+  s1=$(t2_gws_counters "${GW_COUNTERS[@]}") l1=$(stack_counters logic lease_error="$LOGIC_LEASE_ERROR")
   lease_s=$((SECONDS - t0))
   t2_cpustat_snap "$STACK_DIR/cpustat-1"
   ct_stat_snap "$STACK_DIR/ctstat-1"
   t2_record_end slow
   stack_snapshot after
   lg_stop
-  d=$(gws_delta "$s0" "$s1")
+  d=$(t2_gws_delta "$s0" "$s1")
   win="{\"ramp\": $(t2_cpusets_json "$STACK_DIR/cpustat-light0" "$STACK_DIR/cpustat-light1"), \"hold\": $(t2_cpusets_json "$STACK_DIR/cpustat-light1" "$STACK_DIR/cpustat-light2")}"
   verdict=$(echo "$win" | lg_py - "$slow_verdict")
   [ "$verdict" = '"valid"' ] ||
@@ -832,7 +776,7 @@ phase_slow() {
   t2_check slow_legit "$(echo "{\"g\": $d, \"o\": ${online:-false}, \"v\": $verdict}" | lg_true - 'd["v"] == "valid" and d["o"] is True and all(v[k] == 0 for v in d["g"].values() for k in ("logins_busy", "rejects_login_queue", "rejects_pending_mem", "rejects_at_capacity", "hs_no_token"))')" \
     "\"verdict\": $verdict, \"want\": $n, \"online\": $on, \"gave_up\": $(lg_json 'd["failed"].get("gave-up", 0)'), \"failed\": $(lg_json 'd["failed"]'), \"login_latency\": $(lg_json 'd["login_latency"]'), \"gateways\": $(echo "$d" | lg_py - '{g: {k: v[k] for k in ("logins_ok", "logins_busy", "rejects_login_queue", "rejects_pending_mem", "rejects_at_capacity", "hs_no_slot", "hs_no_token")} for g, v in d.items()}')"
   heartbeats slow "$on" "$d" "$verdict"
-  lease slow "$d" "$lease_s" "$(stack_counters_delta "$l0" "$l1")"
+  t2_lease slow "$d" "$lease_s" "$(stack_counters_delta "$l0" "$l1")"
   t2_field slow "{\"clients\": $n, \"rate\": $rate, \"slow_handshake\": $hs, \"slow_auth\": $au, \"slow_rate\": $srate, \"hold_s\": $hold, \"flood_cpus\": {\"slowhs\": $(t2_json_str "$HS_CPUS"), \"slowauth\": $(t2_json_str "$AUTH_CPUS")}, \"flood_procs\": {\"slowhs\": ${FLOODS_SLOW_HS_PROCS:-2}, \"slowauth\": ${FLOODS_SLOW_AUTH_PROCS:-4}}, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"usage\": $usage, \"verdict\": $verdict, \"window\": $win, \"series\": $(slow_series "$STACK_DIR/artifacts/slow-series.jsonl"), \"cpu_sets\": $(t2_cpusets_json "$STACK_DIR/cpustat-0" "$STACK_DIR/cpustat-1"), \"conntrack_stat\": $(ct_stat_json "$STACK_DIR/ctstat-0" "$STACK_DIR/ctstat-1"), \"gateways\": $d}"
   down slow $((n + hs + au))
   for f in before/gw-0 after/gw-0; do

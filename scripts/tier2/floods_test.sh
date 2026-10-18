@@ -2,7 +2,8 @@
 # Tests for scripts/tier2/floods.sh's pure parts on any machine (make
 # test-scripts): in_set, heartbeats' verdict gate, slow_verdict and
 # slow_series over synthetic slow_sampler lines (6b3b3 final review I1,
-# M1-M6). The scenario itself runs on the Tier 2 host.
+# M1-M6). The scenario itself runs on the Tier 2 host. t2_kill_tree, now
+# lib.sh's, is tested in lib_test.sh.
 set -uo pipefail
 cd "$(git rev-parse --show-toplevel)"
 . scripts/tier2/lib.sh
@@ -13,7 +14,7 @@ fails=0
 ok() { echo "ok   $1"; }
 bad() { echo "FAIL $1"; fails=$((fails + 1)); }
 expect() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1: got [$2], want [$3]"; fi; }
-for f in in_set heartbeats slow_series kill_tree; do
+for f in in_set heartbeats slow_series; do
   eval "$(sed -n "/^$f() {/,/^}/p" scripts/tier2/floods.sh)"
 done
 eval "$(grep '^slow_verdict=' scripts/tier2/floods.sh)"
@@ -106,15 +107,7 @@ s=$(slow_series "$tmp/i2.jsonl")
 expect "series: run-queue wait through a failed scrape" "$(col "$s" gw_runq_ms_per_s)" "[1000.0, 1000.0]"
 expect "series: columns" "$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])["columns"]))' "$s")" 19
 
-# kill_tree: the exit trap stops a phase's profile subshell and the curls
-# inside it, not only the subshell (6b3b4 final review M4).
-(sleep 30 & (sleep 30 & wait) & wait) >/dev/null 2>&1 & tree=$!
-sleep 0.2
-kids=$(pgrep -P "$tree"); kids="$kids $(for p in $kids; do pgrep -P "$p"; done)"
-kill_tree "$tree"; sleep 0.2
-left=0; for p in $tree $kids; do kill -0 "$p" 2>/dev/null && left=$((left + 1)); done
-[ "$(echo $kids | wc -w)" -eq 3 ] && expect "kill_tree: no process of the tree is left" "$left" 0 || bad "kill_tree: the test tree isn't 4 processes"
-kill $tree $kids 2>/dev/null
-grep -q "^t2_on_exit '\[ -n \"\$prof\" \] && kill_tree \"\$prof\"'$" scripts/tier2/floods.sh && ok "kill_tree: the exit trap uses it" || bad "kill_tree: the exit trap doesn't use it"
+# The exit trap stops the profile subshell with its curls (M4).
+grep -q "^t2_on_exit '\[ -n \"\$prof\" \] && t2_kill_tree \"\$prof\"'$" scripts/tier2/floods.sh && ok "kill_tree: the exit trap uses it" || bad "kill_tree: the exit trap doesn't use it"
 
 [ "$fails" -eq 0 ] && echo "floods_test: all passed" || { echo "floods_test: $fails failed"; exit 1; }
