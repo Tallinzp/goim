@@ -2028,3 +2028,32 @@ Push the branch. Fast-forwarding `main` is the user's call.
   - M8: `rc_sessions_cmp` checks only that there are enough lines, not exactly one per client (a fail, not a false pass).
   - M9: `ErrNotSDK`'s text omits `/ghost`; an epoll failure in `Ghost` also gives 409.
 - Not judged by the reviewer (host data, read in run 31): the 23GiB budget with ~1.2M loadgen sockets, the host's `epoll max_user_watches` and `file-max`, and whether a Kick frame always reaches the socket before the close under load.
+
+**Run 31 (2026-10-18, `32e1dad`, 878s, host 30GB after the UMA change; Docker containers idle on the host, outside CPU 0.4–0.8 cpu-s per phase): 33/34.** Only `ghost_drop` failed, on a check bug: gw-0's periodic Reconcile asked Logic about 4,119 old connections still ONLINE; Logic answered `not_owner` (the relogins owned the sessions), and the gateway Kicked them with close reason `not_owner` (`reconcile.go:364`, by design). The check counted only `kick` + `heartbeat` (595,881 < 600,000; gw-0 122,403 + 4,119 + 73,478 = 200,000). Fixed `69557e7`: `closes_not_owner` joins `GW_COUNTERS`, `ghost_drop`'s sum and the heartbeat allowance (2 cases in `reconnect_test.sh`, the first failed before the fix). The user chose a `ghost`-only rerun.
+
+**Run 31b (2026-10-18, `69557e7`, `RECONNECT_PHASES=ghost`, 348s): 12/12.** Closes: kick 123,826 / 123,524 / 125,831, `not_owner` 4,006 / 0 / 2,861, heartbeat 72,168 / 76,476 / 71,308 (gw-0/1/2); loadgen's ghosts `kick` 385,508, `silent` 214,492, `open` 0. The I-1 fix was needed: loadgen labelled ~8–10k more `kick` than the gateways counted (unread Pongs).
+
+Readings (31 for `reset`/`netchange`, 31b for `ghost`; 31's `ghost` in brackets):
+
+| | `reset` | `netchange` | `ghost` |
+|---|---|---|---|
+| drop: close / ghost ms; detection p99 | 2,441; 2.4s | 1,648; 1.6s | 603; 3.2s [610; 1.9s] |
+| network change after / took | — | 1,701ms / 27.1s | 3,516ms / 35.7s [2,014 / 36.3s] |
+| waits cut to `local` | — | 140,550 | 126,309 [160,238] |
+| from mark p50 / p90 / p99 / max | 22.0 / 38.0 / 47.0 / 87.9s | 22.9 / 38.1 / 48.3 / 93.2s | 28.6 / 51.4 / 75.3 / 161.0s [27.4 / 50.6 / 69.0 / 140.8s] |
+| all back (`back_s`) | 86s | 92s | 161s [140s] |
+| backoff share | 10.2% | 11.9% | 29.5% [28.7%] |
+| `no_slot` per gateway | 0.73–1.0M | 0.88–0.98M | 0.25–0.27M |
+| `rejects_login_queue` (gw-0/1/2) | 31,111 / 5,378 / 4,770 | 1,468 / 1,501 / 23,329 | 0 |
+| `at_capacity` per gateway | 0 | 0 | 0.92–0.93M [0.86–0.87M] |
+| Logic Kicks ok | 142,485 | 139,101 | 373,918 [373,900] |
+| `pending_mem`, funnel, Logouts dropped | 0 | 0 | 0 |
+| loadgen peak RSS, swap-in | 15.3GB, 0 | 15.5GB, 0 | 16.2GB, 0 [15.8GB] |
+| sessions found | 600,000 | 600,000 | 600,000 |
+
+- Every phase was loadgen-bound (`storm_first30` loadgen 11.7–13.4 cores of 14; `lg_runq_ms_per_s` up to 1.5–1.7s/s): the times are upper bounds, as b_stress's (#110). `*_heartbeats` passed in all phases, so no labelled `not_covered` line.
+- Which bound came first (Review Focus 4): the gateway set reached 98–99% busy from ~10s (`reset`) and ~4s (`netchange`, `ghost`), with Logic's set at 99–100% at the same time; `pending_mem` never fired. In `ghost` the cap bound from ~6–9s (`open` 250,000 on each gateway) until the sweep at `DeadAfter` (~41–73s) freed it.
+- `netchange` ≈ `reset`: `/network-change` reached all 600k clients only 27–36s after the mark (`eachSDK` over 600k `NetworkChanged` on a saturated loadgen), after most 0–20s storm waits had ended; it cut 126–160k waits. The spec's "0–1s instead of 0–20s" shape is not what Tier 2 measured; the bound is loadgen's own fan-out.
+- `ghost`: ~62% of old connections were Kicked by a relogin (incl. `not_owner`), ~38% waited for the heartbeat sweep; `at_capacity` (~2.8M refusals in all) and backoff (29.5%) shaped the recovery, which took ~1.9× `reset`'s p99.
+- Redis (single instance, Plan 6c's baseline): `evalsha` p99 75–94µs, p99.9 2.6–3.1ms; `sadd` p99 150–309µs; `hget`/`hset`/`hmget` p99 2–5µs.
+- Deferred minors M1–M9 unchanged (the user's call).
