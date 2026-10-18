@@ -44,6 +44,7 @@ func floodMode(mode string) bool {
 // Flood outcomes, one per attempt. Dial failures use dialReason's names.
 const (
 	FloodClosed       = "closed"        // the gateway closed (FIN or RST): the outcome the spec expects
+	FloodRefused      = "refused"       // slow modes: the gateway closed before slowHeld, not by its timeout (#135)
 	FloodAnswered     = "answered"      // the gateway sent bytes where it should only close
 	FloodTimeout      = "timeout"       // no close within Timeout: loadgen closed it
 	FloodPreHandshake = "pre-handshake" // slow-auth: closed before the handshake reply (the limit)
@@ -59,12 +60,16 @@ const (
 // every client the wheel closed in one tick back into one tick's interval,
 // so the cohort would be closed and redial together every round, a burst
 // of handshakes each tick (Plan 6b3a, O1). The flood still keeps ~90% of
-// its slots.
+// its slots. A slow client closed sooner is counted FloodRefused, not
+// FloodClosed, with no hold: the gateway's timeouts are the closes floods'
+// slow_freed compares with, and a pending_mem refusal is not one (#135,
+// run 30n).
 const slowHeld = 3 * time.Second
 
 // FloodStats are a flood run's counts (Stats.Flood). Held is from the
 // garbage frame's write, the slow-handshake dial or the slow-auth
-// handshake to the gateway's close, over the attempts it closed.
+// handshake to the gateway's close, over the attempts it closed
+// (FloodClosed; a slow client's FloodRefused has no hold).
 //
 // The rest of a flood's Stats (P6b3aI-4): clients is Config.Clients (for
 // ModeGarbage the in-flight cap), started counts ModeGarbage's attempts
@@ -290,6 +295,9 @@ func (r *Runner) awaitClose(ctx context.Context, nc net.Conn, from time.Time) (t
 		return 0, false
 	case n > 0:
 		r.flood.outcome(FloodAnswered, -1)
+	case clientconn.IsClosed(err) && r.cfg.Mode != ModeGarbage && held < slowHeld:
+		r.flood.outcome(FloodRefused, -1)
+		return held, true
 	case clientconn.IsClosed(err):
 		r.flood.outcome(FloodClosed, held)
 		return held, true
