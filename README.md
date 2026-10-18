@@ -59,6 +59,7 @@ The full reasoning, including the rejected alternatives, is in the [design guide
 | `cmd/gateway`, `cmd/logic` | The two server binaries |
 | `cmd/loadgen` | Load generator: light (raw connections) and SDK modes, garbage-handshake and slow-client flood modes, several instances per stack, histograms exact to 1 ms, kill/mark control API |
 | `cmd/devtoken` | Development token issuer (JWKS) |
+| `cmd/imcli` | Minimal test client: Noise handshake, Login, heartbeat Pings, Logout; prints every server frame |
 | `internal/gateway`, `internal/logic` | Gateway and Logic |
 | `internal/store` | Redis session store: Lua scripts for login, logout, lease, sweep, reconcile, revoke |
 | `internal/sdk`, `internal/clientconn` | Client SDK and the low-level client connection |
@@ -116,6 +117,25 @@ Only the gateway port (default 18100) listens on the LAN. Everything else listen
 `make deploy-down` does not kill a process that is slow to stop. It reports it. `make deploy-down FORCE=1` sends SIGKILL.
 
 Tested on Ubuntu. The macOS parts are checked by reading, shellcheck and cross-compiling. They have not run on a real Mac yet.
+
+### A minimal test client
+
+`cmd/imcli` is a small client for the node: Noise handshake, Login, heartbeat Pings, Logout, and a line for every server frame. It has no reconnect policy: it is a probe, not the app.
+
+```sh
+make client USER_ID=alice                                # fresh token, local node defaults
+make client USER_ID=alice CLIENT_ARGS="-duration 10s"    # log out and exit after 10s
+```
+
+On another machine, pass the values `make deploy-status` prints:
+
+```sh
+go run ./cmd/imcli -addr <gateway-ip>:18100 \
+  -key '<noise public key from make deploy-status>' \
+  -token '<token from: make deploy-token USER_ID=alice>'
+```
+
+`-addr` defaults to `127.0.0.1:18100` (or `GOIM_ADDR`), `-key-id` to 1 (`GOIM_KEY_ID`), and `-key` to `$GOIM_HOME/keys/noise-public`. `-ping-every` overrides the heartbeat from `LoginResp`; `-duration 10s` logs out and exits. After login, `ping`, `logout` and `quit` work on stdin, and Ctrl-C logs out. Reusing `-device-id` lets a second client take the same device slot and Kick the first.
 
 ## Status
 
@@ -188,6 +208,7 @@ flowchart LR
 | `cmd/gateway`、`cmd/logic` | 两个服务端程序 |
 | `cmd/loadgen` | 压测工具：light（裸连接）和 SDK 两种模式，垃圾握手和慢客户端洪泛模式，同一栈上可运行多个实例，精确到 1 ms 的直方图，kill/mark 控制接口 |
 | `cmd/devtoken` | 开发用 token 签发服务（JWKS） |
+| `cmd/imcli` | 极简测试客户端：Noise 握手、登录、心跳 Ping、登出，并打印服务端每一帧 |
 | `internal/gateway`、`internal/logic` | 网关与 Logic |
 | `internal/store` | Redis 会话存储：登录、登出、租约、清扫、对账、吊销的 Lua 脚本 |
 | `internal/sdk`、`internal/clientconn` | 客户端 SDK 与底层客户端连接 |
@@ -235,6 +256,25 @@ make deploy-down                  # 停止：先让网关排空，再停 Logic�
 停得慢的进程不会被强杀，只会报告。`make deploy-down FORCE=1` 会发送 SIGKILL。
 
 已在 Ubuntu 上测试。macOS 部分只做了代码检查、shellcheck 和交叉编译，尚未在真实的 Mac 上运行。
+
+### 极简测试客户端
+
+`cmd/imcli` 是节点的命令行测试客户端：Noise 握手、登录、心跳 Ping、登出，并打印服务端发来的每一帧。它不做重连，是探针，不是 App。
+
+```sh
+make client USER_ID=alice                                # 自动签发 token，连接本机节点
+make client USER_ID=alice CLIENT_ARGS="-duration 10s"    # 10 秒后登出并退出
+```
+
+换一台机器时，传入 `make deploy-status` 打印的参数：
+
+```sh
+go run ./cmd/imcli -addr <gateway-ip>:18100 \
+  -key '<noise public key from make deploy-status>' \
+  -token '<token from: make deploy-token USER_ID=alice>'
+```
+
+`-addr` 默认 `127.0.0.1:18100`（或 `GOIM_ADDR`），`-key-id` 默认 1（`GOIM_KEY_ID`），`-key` 默认 `$GOIM_HOME/keys/noise-public`。`-ping-every` 覆盖 `LoginResp` 的心跳；`-duration 10s` 到点登出并退出。登录后可在标准输入执行 `ping`、`logout`、`quit`，Ctrl-C 会登出。复用 `-device-id` 可以让第二个客户端顶掉同一个设备槽位并收到 Kick。
 
 ### 当前状态
 

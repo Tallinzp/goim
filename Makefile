@@ -7,7 +7,7 @@ export GOIM_REDIS_REPLICA_PORT ?= 16380
 COMPOSE_REDIS := docker compose -f deploy/compose/redis-test.yml
 TIER2_GUARD := test "$$GOIM_TEST_TIER" = 2 || { echo "Tier 2 host only: set GOIM_TEST_TIER=2"; exit 1; }
 
-.PHONY: test test-race-suite test-scripts test-load-probe redis-server test-redis-local proto redis-up redis-down test-redis test-tier2 deploy deploy-down deploy-status deploy-logs deploy-token
+.PHONY: test test-race-suite test-scripts test-load-probe redis-server test-redis-local proto redis-up redis-down test-redis test-tier2 deploy deploy-down deploy-status deploy-logs deploy-token client
 
 # Tier 1a (dev machine): unit and Lua tests on in-process miniredis, race detector on.
 test:
@@ -104,3 +104,10 @@ deploy-logs:
 deploy-token:
 	@test -n "$(USER_ID)" || { echo "USER_ID=<uid> is required"; exit 2; }
 	@scripts/deploy.sh token "$(USER_ID)"
+
+# make client USER_ID=alice: the minimal test client (cmd/imcli), logged in
+# with a fresh token. It reads the local node's key from $GOIM_HOME and uses
+# 127.0.0.1:18100; CLIENT_ARGS adds flags, e.g. CLIENT_ARGS="-duration 10s".
+client:
+	@test -n "$(USER_ID)" || { echo "USER_ID=<uid> is required"; exit 2; }
+	go run ./cmd/imcli $(CLIENT_ARGS) -token "$$(scripts/deploy.sh token "$(USER_ID)")"
