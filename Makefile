@@ -7,7 +7,7 @@ export GOIM_REDIS_REPLICA_PORT ?= 16380
 COMPOSE_REDIS := docker compose -f deploy/compose/redis-test.yml
 TIER2_GUARD := test "$$GOIM_TEST_TIER" = 2 || { echo "Tier 2 host only: set GOIM_TEST_TIER=2"; exit 1; }
 
-.PHONY: test test-race-suite test-scripts test-load-probe redis-server test-redis-local proto redis-up redis-down test-redis test-tier2
+.PHONY: test test-race-suite test-scripts test-load-probe redis-server test-redis-local proto redis-up redis-down test-redis test-tier2 deploy deploy-down deploy-status deploy-logs deploy-token
 
 # Tier 1a (dev machine): unit and Lua tests on in-process miniredis, race detector on.
 test:
@@ -30,6 +30,7 @@ test-scripts:
 	scripts/tier2/reconnect_test.sh
 	scripts/loadgen_test.sh
 	STACK_REDIS_SERVER=$(REDIS_SERVER) scripts/stack_test.sh
+	GOIM_REDIS_SERVER=$(REDIS_SERVER) scripts/deploy_test.sh
 
 # The Tier 1a load probe (Plan 6a2, spec: ≤ 5k connections), on the dev
 # machine: a 2-gateway stack.sh stack and cmd/loadgen, light then sdk with a
@@ -79,3 +80,27 @@ test-redis:
 # prints the script's code. Automation that needs it runs the script directly.
 test-tier2:
 	@scripts/tier2/$(SCENARIO).sh; rc=$$?; [ $$rc -eq 0 ] || { echo "test-tier2: $(SCENARIO) exited $$rc" >&2; exit $$rc; }
+
+# A single-node stack for a real client app, on Ubuntu or macOS (scripts/deploy.sh,
+# README: Run a node on your machine). Data and keys live in $GOIM_HOME (~/.goim).
+# Redis: on PATH, else the one make redis-server builds.
+DEPLOY_REDIS := $(if $(wildcard $(REDIS_SERVER)),GOIM_REDIS_SERVER=$(REDIS_SERVER))
+
+deploy:
+	$(DEPLOY_REDIS) scripts/deploy.sh up
+
+# FORCE=1 sends SIGKILL to a process that does not stop in time.
+deploy-down:
+	FORCE=$(FORCE) scripts/deploy.sh down
+
+deploy-status:
+	scripts/deploy.sh status
+
+# NAME is one of redis, devtoken, logic, gateway (default: all).
+deploy-logs:
+	scripts/deploy.sh logs $(NAME)
+
+# make deploy-token USER_ID=alice: a login token for the app.
+deploy-token:
+	@test -n "$(USER_ID)" || { echo "USER_ID=<uid> is required"; exit 2; }
+	@scripts/deploy.sh token "$(USER_ID)"
