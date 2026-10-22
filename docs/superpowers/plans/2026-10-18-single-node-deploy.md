@@ -184,3 +184,17 @@ git commit -m "feat: add deploy targets to the Makefile"
 git add README.md
 git commit -m "docs: add the single-node deploy to the README"
 ```
+
+## Execution Notes
+
+- **Deferred final-review minors fixed 2026-10-21** (`b9a33b3`, branch `fix/deferred-minors`; M6 and M9 were fixed in `7099fb5`):
+  - M1: exit 143 on TERM; a HUP trap rolls back and exits 129.
+  - M2: `deploy_rollback` first waits up to 5s (`deploy_settle`) for the pid file of the spawn a signal cut short.
+  - M3: the gateway client port is also checked on the LAN address (0.0.0.0) or on `GOIM_LISTEN_HOST`. Not on `GOIM_ADVERTISE_HOST`: behind NAT a connect there can hang.
+  - M4: the pid file keeps a third word, the process's `127.0.0.1:PORT`; `deploy_alive` needs it in `ps -o args` (Redis keeps it in its title on Linux and macOS). An old two-word pid file still passes on the name.
+  - M5: "only some processes run ( logic)" names them.
+  - M7: only the summary (up, status) looks up the LAN address.
+  - M8: `GOIM_PORT_BASE`, `GOIM_DOWN_WAIT`, `GOIM_MAX_CONNS` must be whole numbers above 0; else a message and exit 2.
+  - M10: `deploy_conntrack_ok` checks `nf_conntrack_max >= 2 × GOIM_MAX_CONNS` before the start.
+  - `deploy_test.sh` all passed on Ubuntu (new cases for each). macOS still not run on a real Mac.
+

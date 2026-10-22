@@ -2057,3 +2057,14 @@ Readings (31 for `reset`/`netchange`, 31b for `ghost`; 31's `ghost` in brackets)
 - `ghost`: ~62% of old connections were Kicked by a relogin (incl. `not_owner`), ~38% waited for the heartbeat sweep; `at_capacity` (~2.8M refusals in all) and backoff (29.5%) shaped the recovery, which took ~1.9× `reset`'s p99.
 - Redis (single instance, Plan 6c's baseline): `evalsha` p99 75–94µs, p99.9 2.6–3.1ms; `sadd` p99 150–309µs; `hget`/`hset`/`hmget` p99 2–5µs.
 - Deferred minors M1–M9 unchanged (the user's call).
+- **M1–M9 fixed 2026-10-21** (`d99db0c`, branch `fix/deferred-minors`), before Plan 6c:
+  - M1: a socket the keeper cannot take is closed at once and counted in the new `/stats` `ghosts_unkept`, not `silent`. `reconnect.sh` adds `unkept` to the ghost reading; the `kick + silent == population` rule then fails such a run. Test `TestGhostUnkeptClosesAtOnce` (net.Pipe path; the `EPOLL_CTL_ADD` failure path is not reached on dev).
+  - M2: `abort()` acts only on `connOpen`. A test case in `TestGhostKeeperWaitsForThePeer` failed with the old `abort` (peer saw an RST).
+  - M3: `Close` swaps the state in one CAS loop. `TestGhostCloseRace` (200k rounds, two goroutines at one barrier) failed on the old `Close` in each of 3 runs.
+  - M4: the drop wait polls every 0.5s.
+  - M5: the drop-in is now `user@UID.service.d`, `LimitNOFILE=1024:2097152`; host-setup removes the old every-user file. `--uid` added for test mode.
+  - M6: host-setup leaves out any sysctl the host already has higher in every field (fs.nr_open: 1073741816 after systemd's boot). The guard still checks `>=` sysctl.conf.
+  - M7: after `daemon-reload` host-setup reads the running user manager's `/proc/PID/limits` and says when it keeps the old limit.
+  - M8: `rc_sessions_cmp` needs exactly one line per client (`splitlines`); new case "too many lines".
+  - M9: `ErrNotSDK` names `/ghost`; a keeper failure is `ErrGhostKeeper`, 500. Test `TestGhostKeeperFailureIs500`.
+  - Verified: `go vet`, `make test` (race, 20 packages), `make test-scripts` all passed. Run on the host before run 32: `sudo scripts/tier2/host-setup.sh` again (new drop-in path).
