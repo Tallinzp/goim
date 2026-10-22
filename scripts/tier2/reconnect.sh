@@ -582,6 +582,9 @@ for name in $PHASES; do
   t2_check "${name}_processes" "$(t2_bool [ -z "$problems" ])" "\"problems\": $(t2_json_str "$problems")"
 
   cpu_sets="{\"ramp\": $(t2_cpusets_json "$STACK_DIR/cpustat-0" "$STACK_DIR/cpustat-1"), \"storm\": $(t2_cpusets_json "$STACK_DIR/cpustat-2" "$STACK_DIR/cpustat-3")}"
+  # "reset" is the drop's reply: /reset's {"mark", "population", "close_ms"},
+  # in ghost /ghost's {"mark", "population", "ms"} (the ghosting time, not
+  # a close time). The name stays as run 31 recorded it (P6b3c2I-2).
   t2_field "$name" "{\"clients\": $N, \"rate\": $RATE, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"gateway_procs\": $STACK_GATEWAY_PROCS, \"loadgen_env\": $(t2_json_str "${LG_ENV[*]}"), \"ramp_s\": $ramp_s, \"ramp\": $ramp, \"precompute_at_mark\": $precompute, \"reset\": ${reply:-null}, \"network_change\": $nc, \"network_change_after_ms\": $nc_after_ms, \"back_s\": $back_s, \"hold_s\": $HOLD, \"window_s\": $window_s, \"storm\": $storm, \"storm_first30\": $storm30, \"loadgen_bound\": $loadgen_bound, \"slo\": $(cat "$slo"), \"loadgen\": $st, \"gateways\": $d, \"logic\": $ld, \"cpu_sets\": $cpu_sets, \"tcp\": $(t2_tcpstat_json "$STACK_DIR/tcpstat-2" "$STACK_DIR/tcpstat-3"), \"series\": $series, \"redis_latency\": ${redis:-null}, \"redis_reset\": $redis_reset, \"ghosts\": ${gh:-null}, \"sessions\": ${sessions:-null}, \"stop_s\": $stop_s, \"loadgen_exit\": $LG_STATUS}"
   t2_duration "$name" $((SECONDS - t0))
 
@@ -600,5 +603,6 @@ t2_not_covered "the drop as an LB restart or failover: Tier 2's LB is loadgen's 
   "a carrier or regional network recovering for part of the population: ghost drops every client (the spec's worst case)" \
   "heartbeat Pong times: SDK clients record a Pong only by its absence (the 10s Pong timeout), not its delay" \
   "per-shard Redis load with the gwconns shards marked (one redis-server, its per-command latency in P.redis_latency; Redis Cluster in Plan 6c)" \
-  "the session check in Redis Cluster: its EVALs read 500 keys of many slots (one redis-server here)"
+  "the session check in Redis Cluster: its EVALs read 500 keys of many slots (one redis-server here)" \
+  "the network change at once: /network-change calls each client in turn (64 workers, each waits for the client's run loop); at 600k it took 27-36s in run 31, after most storm waits ended; several loadgens at Tier 3 (Plan 6d)"
 t2_finish

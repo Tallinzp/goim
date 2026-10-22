@@ -39,6 +39,8 @@ func (r *Runner) Result(within time.Duration) Result {
 //	POST /network-change                      sdk: NetworkChanged on every client  {"clients", "ms"}; 409: not sdk mode
 //	POST /ghost?mark=ghost                    sdk: mark every gateway, then every connection lost to its client
 //	                                          and kept open, unread, until its gateway closes it  {"mark", "population", "ms"}
+//	                                          ms: the time to ghost every connection after the mark, not a close
+//	                                          time (/reset's is close_ms; both keys are in recorded runs)
 //	                                          409: not sdk mode or the mark taken, nothing changed; 500: ErrGhostKeeper
 //	GET  /clients                             {"uid_prefix", "gateways", "gw": [client i's gateway index, -1: offline]}
 //	GET  /slo?mark=death&within=30s           SLO
