@@ -63,8 +63,10 @@ const (
 // its slots. A slow client closed sooner is counted FloodRefused, not
 // FloodClosed, with no hold: the gateway's timeouts are the closes floods'
 // slow_freed compares with, and a pending_mem refusal is not one (#135,
-// run 30n).
-const slowHeld = 3 * time.Second
+// run 30n). It is 0.5s under the shortest timeout (3s): slow-auth starts
+// its clock after the handshake reply, later than the gateway's, so a 3s
+// timeout can read 2.99s (6b3c1 final review M3). A refusal closes at once.
+const slowHeld = 2500 * time.Millisecond
 
 // FloodStats are a flood run's counts (Stats.Flood). Held is from the
 // garbage frame's write, the slow-handshake dial or the slow-auth

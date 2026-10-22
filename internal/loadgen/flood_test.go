@@ -197,6 +197,11 @@ func TestRedialWaitSpreadsOverATick(t *testing.T) {
 			t.Fatalf("after a timeout: %v, want 0–1s", w)
 		}
 		lo, hi = min(lo, w), max(hi, w)
+		// A 3s timeout read as 2.99s (loadgen's clock starts after the
+		// handshake reply) is still the timeout's close (6b3c1 M3).
+		if w := redialWait(2990*time.Millisecond, true); w >= time.Second {
+			t.Fatalf("after a 3s timeout read as 2.99s: %v, want 0–1s", w)
+		}
 		if w := redialWait(10*time.Millisecond, true); w < 500*time.Millisecond || w >= 1500*time.Millisecond {
 			t.Fatalf("after an early close: %v, want 0.5–1.5s", w)
 		}

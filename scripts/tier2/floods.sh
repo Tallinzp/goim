@@ -136,7 +136,7 @@
 #                         the wheel, plus scheduling slack, 6b3a O7); a
 #                         slow-auth handshake the limiter refused ends
 #                         pre-handshake, with no hold, and is counted (O1);
-#                         a connection the gateway closed before 3s (at
+#                         a connection the gateway closed before 2.5s (at
 #                         capacity, a limit, pending_mem) is refused, with
 #                         no hold, and is counted (#135); the two floods'
 #                         refused are at most the gateways' refusals over
@@ -146,7 +146,7 @@
 #                         review O7)
 #   slow_freed            the gateways counted at least as many
 #                         handshake_timeout and auth_timeout closes as the
-#                         floods' closed outcomes, the closes held >= 3s
+#                         floods' closed outcomes, the closes held >= 2.5s
 #                         (refused ones are not timeouts, #135, run 30n)
 #   slow_legit            every light client logs in beside the floods (or
 #                         gave up as in storm_online): no
@@ -743,7 +743,7 @@ phase_garbage() {
 phase_slow() {
   local n=${FLOODS_CLIENTS:-400000} rate=${FLOODS_RATE:-10000} hs=${FLOODS_SLOW_HANDSHAKE:-80000}
   local au=${FLOODS_SLOW_AUTH:-40000} srate=${FLOODS_SLOW_RATE:-10000} hold=${FLOODS_SLOW_HOLD:-60}
-  local s0 s1 d l0 l1 t0 lease_s flooding=true online on usage inst held f win series verdict
+  local s0 s1 d l0 l1 t0 lease_s flooding=true online on usage inst held f win series verdict refused refusals
   STACK_GATEWAYS=2 STACK_GATEWAY_ARGS=(-max-conns $(((n + hs + au) / 2 + (n + hs + au) / 10)) -heartbeat "${HB}s")
   up slow || { stack_down; return; }
   stack_snapshot before
@@ -797,7 +797,7 @@ phase_slow() {
     t2_not_covered "slow: legitimate logins and heartbeats beside the floods; verdict $verdict, ruled by the order in slow.series.first_s (slow.window, slow.series)"
   # Slow-auth's handshakes meet the limiter: a refused one ends pre-handshake,
   # with no hold, and the bounds are on the holds the timeouts ended (O1). A
-  # close before 3s is refused, with no hold, in both floods (#135).
+  # close before 2.5s (slowHeld) is refused, with no hold, in both floods (#135).
   held=true
   for inst in slowhs:'{"closed", "refused"}' slowauth:'{"closed", "pre-handshake", "refused"}'; do
     [ "$(lg_true "$STACK_DIR/artifacts/loadgen-${inst%%:*}.json" 'set(d["flood"]["outcomes"]) <= '"${inst#*:}"' and "closed" in d["flood"]["outcomes"] and d["flood"]["held"]["p50_ms"] >= 5000 and d["flood"]["held"]["p99_ms"] <= 6500 and d["flood"]["held"]["max_ms"] <= 7500')" = true ] || held=false
