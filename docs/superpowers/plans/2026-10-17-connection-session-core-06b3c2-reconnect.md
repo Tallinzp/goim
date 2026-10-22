@@ -2067,4 +2067,4 @@ Readings (31 for `reset`/`netchange`, 31b for `ghost`; 31's `ghost` in brackets)
   - M7: after `daemon-reload` host-setup reads the running user manager's `/proc/PID/limits` and says when it keeps the old limit.
   - M8: `rc_sessions_cmp` needs exactly one line per client (`splitlines`); new case "too many lines".
   - M9: `ErrNotSDK` names `/ghost`; a keeper failure is `ErrGhostKeeper`, 500. Test `TestGhostKeeperFailureIs500`.
-  - Verified: `go vet`, `make test` (race, 20 packages), `make test-scripts` all passed. Run on the host before run 32: `sudo scripts/tier2/host-setup.sh` again (new drop-in path).
+  - Verified: `go vet`, `make test` (race, 20 packages), `make test-scripts` all passed. Before the next Tier 2 run (none is planned before Plan 6c), run on the host: `sudo scripts/tier2/host-setup.sh` again (new drop-in path).
