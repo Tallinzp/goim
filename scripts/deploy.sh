@@ -23,23 +23,39 @@
 
 D_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
+# deploy_config: the settings; 1 (with a message) if a number setting is not
+# a whole number.
 deploy_config() {
   D_HOME=${GOIM_HOME:-$HOME/.goim}
   D_BASE=${GOIM_PORT_BASE:-18000}
   D_HOST=${GOIM_LISTEN_HOST:-0.0.0.0}
-  if [ -n "${GOIM_ADVERTISE_HOST:-}" ]; then
-    D_ADV=$GOIM_ADVERTISE_HOST
-  elif [ "$D_HOST" != 0.0.0.0 ]; then
-    D_ADV=$D_HOST
-  else
-    D_ADV=$(deploy_lan_ip)
-  fi
   D_REDIS=${GOIM_REDIS_SERVER:-$(command -v redis-server || echo "$D_ROOT/.cache/redis/bin/redis-server")}
   D_WAIT=${GOIM_DOWN_WAIT:-60}
   D_TTL=${GOIM_TOKEN_TTL:-24h}
   D_APPID=${GOIM_APPID:-im}
   D_DRAIN=${GOIM_DRAIN_WINDOW:-5s}
   D_MAXCONNS=${GOIM_MAX_CONNS:-5000}
+  deploy_whole GOIM_PORT_BASE "$D_BASE" && deploy_whole GOIM_DOWN_WAIT "$D_WAIT" &&
+    deploy_whole GOIM_MAX_CONNS "$D_MAXCONNS"
+}
+
+# deploy_whole NAME VALUE: true if VALUE is a whole number above 0.
+deploy_whole() {
+  case $2 in
+    '' | *[!0-9]* | 0*) echo "goim: $1 must be a whole number above 0 (got \"$2\")" >&2; return 1 ;;
+  esac
+}
+
+# deploy_adv: the address printed for the app. Only the summary needs it, so
+# only up and status look up the LAN address.
+deploy_adv() {
+  if [ -n "${GOIM_ADVERTISE_HOST:-}" ]; then
+    echo "$GOIM_ADVERTISE_HOST"
+  elif [ "$D_HOST" != 0.0.0.0 ]; then
+    echo "$D_HOST"
+  else
+    deploy_lan_ip
+  fi
 }
 
 # deploy_lan_ip: this machine's LAN IPv4, else 127.0.0.1 with a warning.
@@ -68,16 +84,43 @@ deploy_preflight() {
   return $bad
 }
 
-# deploy_port_free PORT: true when a connect to 127.0.0.1:PORT is refused.
-deploy_port_free() { ! (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+# deploy_port_free PORT [HOST]: true when a connect to HOST:PORT (default
+# 127.0.0.1) is refused.
+deploy_port_free() { ! (exec 3<>"/dev/tcp/${2:-127.0.0.1}/$1") 2>/dev/null; }
+
+# deploy_mark NAME: a "127.0.0.1:PORT" word in NAME's arguments (Redis keeps
+# it in its process title), so that another process with the same name that
+# reuses the pid is not taken for NAME. Empty for other names.
+deploy_mark() {
+  case $1 in
+    redis) echo "127.0.0.1:$D_BASE" ;;
+    devtoken) echo "127.0.0.1:$((D_BASE + 1))" ;;
+    logic) echo "127.0.0.1:$((D_BASE + 2))" ;;
+    gateway) echo "127.0.0.1:$((D_BASE + 102))" ;;
+  esac
+}
+
+# deploy_conntrack_ok [PATH]: the gateway stays NotReady unless nf_conntrack_max
+# is at least 2 times its connection cap (internal/gateway/limits.go). Checked
+# before the start, so up does not wait 30s for it; no file (conntrack not
+# loaded, or macOS) passes.
+deploy_conntrack_ok() {
+  local f=${1:-/proc/sys/net/netfilter/nf_conntrack_max} n need=$((D_MAXCONNS * 2))
+  [ -r "$f" ] || return 0
+  n=$(cat "$f")
+  [ "$n" -ge "$need" ] && return 0
+  echo "goim: nf_conntrack_max is $n; the gateway needs $need for $D_MAXCONNS connections. Raise it (sudo sysctl -w net.netfilter.nf_conntrack_max=$need) or set a lower GOIM_MAX_CONNS." >&2
+  return 1
+}
 
 # deploy_spawn NAME CMD...: starts CMD detached, output to logs/NAME.log.
-# run/NAME.pid holds "PID COMM"; a supervising subshell writes run/NAME.status
+# run/NAME.pid holds "PID COMM [MARK]" (deploy_mark); a supervising subshell writes run/NAME.status
 # (CMD's exit status) and removes the pid file when CMD ends. Returns once
 # the pid file exists; 1 if CMD ended before that.
 deploy_spawn() {
-  local name=$1 log pidf stf i
+  local name=$1 log pidf stf i mark
   shift
+  mark=$(deploy_mark "$name")
   mkdir -p "$D_HOME/logs" "$D_HOME/run"
   log=$D_HOME/logs/$name.log pidf=$D_HOME/run/$name.pid stf=$D_HOME/run/$name.status
   rm -f "$pidf" "$stf"
@@ -85,7 +128,7 @@ deploy_spawn() {
     trap '' HUP # a closed terminal must not stop the node
     "$@" </dev/null >>"$log" 2>&1 &
     child=$!
-    echo "$child $(basename "$1")" >"$pidf.tmp" && mv "$pidf.tmp" "$pidf"
+    echo "$child $(basename "$1")${mark:+ $mark}" >"$pidf.tmp" && mv "$pidf.tmp" "$pidf"
     wait "$child"
     echo $? >"$stf"
     rm -f "$pidf"
@@ -98,22 +141,35 @@ deploy_spawn() {
   return 1
 }
 
-# deploy_alive NAME: true if NAME's pid is alive and still has its command
-# name. A pid file that fails the check is stale: removed, and nothing
+# deploy_alive NAME: true if NAME's pid is alive, still has its command name
+# and, when the pid file has a mark, the mark in its arguments. A pid file that fails the check is stale: removed, and nothing
 # is signalled.
 deploy_alive() {
-  local f=$D_HOME/run/$1.pid pid comm cur
+  local f=$D_HOME/run/$1.pid pid comm mark cur
   [ -f "$f" ] || return 1
-  read -r pid comm <"$f"
+  read -r pid comm mark <"$f"
   if kill -0 "$pid" 2>/dev/null; then
     cur=$(ps -p "$pid" -o comm= 2>/dev/null)
     cur=${cur##*/}
     cur=${cur%% *} # macOS shows argv[0]; Redis adds "127.0.0.1:PORT" to it
-    [ "${cur:0:15}" = "${comm:0:15}" ] && return 0
+    if [ "${cur:0:15}" = "${comm:0:15}" ]; then
+      [ -z "$mark" ] && return 0
+      case $(ps -p "$pid" -o args= 2>/dev/null) in *"$mark"*) return 0 ;; esac
+    fi
   fi
   rm -f "$f"
   echo "$1: stale pid file removed" >&2
   return 1
+}
+
+# deploy_settle NAME: waits up to 5s for a spawn of NAME that a signal cut
+# short to write its pid or status file, so a rollback finds the process.
+deploy_settle() {
+  local i
+  for ((i = 0; i < 50; i++)); do
+    [ -f "$D_HOME/run/$1.pid" ] || [ -f "$D_HOME/run/$1.status" ] && return 0
+    sleep 0.1
+  done
 }
 
 # deploy_stop NAME WAIT: SIGTERM, then up to WAIT seconds for the exit status.
@@ -204,7 +260,7 @@ deploy_summary() {
   local pubf=$D_HOME/keys/noise-public
   [ -f "$pubf" ] || { echo "goim: nothing deployed yet (make deploy)"; return 0; }
   echo "goim node:"
-  echo "  gateway       $D_ADV:$((D_BASE + 100))"
+  echo "  gateway       $(deploy_adv):$((D_BASE + 100))"
   echo "  noise key id  1"
   echo "  noise public  $(cat "$pubf")"
   echo "  token         make deploy-token USER_ID=<uid>"
@@ -241,8 +297,8 @@ deploy_keys() {
 # nothing. A failure after the first start stops what was started, in order.
 deploy_up() {
   local rc
-  deploy_config
-  D_STARTED=
+  deploy_config || return 2
+  D_STARTED= D_SPAWNING=
   _deploy_up
   rc=$?
   if [ "$rc" -ne 0 ] && [ -n "$D_STARTED" ]; then deploy_down >&2; fi
@@ -250,23 +306,32 @@ deploy_up() {
 }
 
 _deploy_up() {
-  local name n=0 p busy="" pub bin=$D_HOME/bin keys=$D_HOME/keys base=$D_BASE
+  local name n=0 p busy="" on="" gwhost bin=$D_HOME/bin keys=$D_HOME/keys base=$D_BASE
   deploy_preflight || return 1
-  for name in redis devtoken logic gateway; do deploy_alive "$name" && n=$((n + 1)); done
+  for name in redis devtoken logic gateway; do deploy_alive "$name" && { n=$((n + 1)); on="$on $name"; }; done
   if [ "$n" -eq 4 ]; then
     echo "goim: the node is already running"
     deploy_summary
     return 0
   fi
   if [ "$n" -gt 0 ]; then
-    echo "goim: only some processes run; run make deploy-down first" >&2
+    echo "goim: only some processes run ($on); run make deploy-down first" >&2
     return 1
   fi
   for p in $(seq "$base" $((base + 4))) $((base + 100)) $((base + 101)) $((base + 102)); do
     deploy_port_free "$p" || { echo "goim: port $p is in use" >&2; busy=1; }
   done
+  # The gateway client port also binds D_HOST: with 0.0.0.0 a listener on
+  # the LAN address only blocks it too.
+  gwhost=$D_HOST
+  [ "$gwhost" = 0.0.0.0 ] && gwhost=$(deploy_lan_ip 2>/dev/null)
+  if [ "$gwhost" != 127.0.0.1 ] && ! deploy_port_free $((base + 100)) "$gwhost"; then
+    echo "goim: port $((base + 100)) is in use on $gwhost" >&2
+    busy=1
+  fi
   [ -z "$busy" ] || return 1
   (deploy_raise_nofile) || return 1
+  deploy_conntrack_ok || return 1
   mkdir -p "$bin" "$keys/noise" "$D_HOME/logs" "$D_HOME/run" "$D_HOME/redis"
   (cd "$D_ROOT" && CGO_ENABLED=0 go build -o "$bin/" ./cmd/gateway ./cmd/logic ./cmd/devtoken) || return 1
 
@@ -274,6 +339,7 @@ _deploy_up() {
   echo "{\"gw-0\": \"127.0.0.1:$((base + 101))\"}" >"$D_HOME/kick.json"
 
   D_STARTED=1
+  D_SPAWNING=redis
   deploy_spawn redis "$D_REDIS" --port "$base" --bind 127.0.0.1 --dir "$D_HOME/redis" \
     --appendonly yes --save "" --maxmemory-policy noeviction || { echo "goim: redis did not start" >&2; tail -n 20 "$D_HOME/logs/redis.log" >&2; return 1; }
   for p in $(seq 100); do
@@ -282,13 +348,16 @@ _deploy_up() {
     sleep 0.1
   done
   deploy_redis_ready || { echo "goim: redis not answering on port $base" >&2; return 1; }
+  D_SPAWNING=devtoken
   deploy_spawn devtoken "$bin/devtoken" serve -addr "127.0.0.1:$((base + 1))" -jwks "$keys/jwks.json" || return 1
   deploy_ready devtoken "http://127.0.0.1:$((base + 1))/" 30 || return 1
+  D_SPAWNING=logic
   deploy_spawn logic "$bin/logic" -redis "127.0.0.1:$base" -redis-cluster=false \
     -grpc-addr "127.0.0.1:$((base + 2))" -lease-addr "127.0.0.1:$((base + 3))" -admin-addr "127.0.0.1:$((base + 4))" \
     -jwks-url "http://127.0.0.1:$((base + 1))/" -jwks-fallback "$keys/jwks.json" \
     -kick-addr-file "$D_HOME/kick.json" || return 1
   deploy_ready logic "http://127.0.0.1:$((base + 4))/readyz" 30 || return 1
+  D_SPAWNING=gateway
   (
     deploy_raise_nofile
     deploy_spawn gateway "$bin/gateway" -id gw-0 -listen "tcp://$D_HOST:$((base + 100))" \
@@ -297,6 +366,7 @@ _deploy_up() {
       -drain-window "$D_DRAIN" -max-conns "$D_MAXCONNS" -pending-cap $((D_MAXCONNS / 2)) -logout-queue "$D_MAXCONNS"
   ) || return 1
   deploy_ready gateway "http://127.0.0.1:$((base + 102))/readyz" 30 || return 1
+  D_SPAWNING=
   deploy_summary
 }
 
@@ -304,7 +374,7 @@ _deploy_up() {
 # all four; 1 if any did not stop clean.
 deploy_down() {
   local name rc=0 n=0
-  deploy_config
+  deploy_config || return 2
   for name in gateway logic devtoken redis; do deploy_alive "$name" && n=$((n + 1)); done
   if [ "$n" -eq 0 ]; then
     echo "goim: no node is running"
@@ -318,7 +388,7 @@ deploy_down() {
 # deploy_status: the summary, one line per process; 0 when all run and are ready.
 deploy_status() {
   local name rc=0 pid state
-  deploy_config
+  deploy_config || return 2
   deploy_summary
   for name in redis devtoken logic gateway; do
     if deploy_alive "$name"; then
@@ -340,7 +410,7 @@ deploy_status() {
 # deploy_logs [NAME]: follows one log or all four.
 deploy_logs() {
   local name=${1:-} f files=()
-  deploy_config
+  deploy_config || return 2
   for f in redis devtoken logic gateway; do
     [ -z "$name" ] || [ "$name" = "$f" ] || continue
     files+=("$D_HOME/logs/$f.log")
@@ -354,7 +424,7 @@ deploy_logs() {
 
 # deploy_token UID: a login token for UID (devtoken signs it).
 deploy_token() {
-  deploy_config
+  deploy_config || return 2
   if [ -z "${1:-}" ]; then
     echo "token: UID is required" >&2
     return 2
@@ -367,14 +437,25 @@ deploy_token() {
     -platform "${GOIM_PLATFORM:-mobile}" -ttl "$D_TTL"
 }
 
+# deploy_rollback: the signal traps' cleanup of a cut-short up.
+deploy_rollback() {
+  trap '' INT TERM HUP
+  [ -n "${D_STARTED:-}" ] || return 0
+  [ -n "${D_SPAWNING:-}" ] && deploy_settle "$D_SPAWNING"
+  deploy_down >&2
+}
+
 deploy_main() {
   local cmd=${1:-}
   [ $# -gt 0 ] && shift
   set -uo pipefail
   case $cmd in
     up)
-      # Ctrl-C or SIGTERM after the first start stops what runs.
-      trap '[ -n "${D_STARTED:-}" ] && deploy_down >&2; exit 130' INT TERM
+      # Ctrl-C, SIGTERM or a closed terminal after the first start stops what
+      # runs, after the spawn it cut short has written its pid file.
+      trap 'deploy_rollback; exit 130' INT
+      trap 'deploy_rollback; exit 143' TERM
+      trap 'deploy_rollback; exit 129' HUP
       deploy_up
       ;;
     down) deploy_down ;;

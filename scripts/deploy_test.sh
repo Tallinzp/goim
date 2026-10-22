@@ -38,6 +38,13 @@ chmod +x "$TMP/bin/trapper" "$TMP/bin/stubborn"
   echo "$D_BASE $D_HOST $D_WAIT $D_TTL $D_APPID $D_DRAIN $D_HOME"
 ) >"$TMP/cfg"
 expect "config: defaults" "$(cat "$TMP/cfg")" "18000 0.0.0.0 60 24h im 5s $TMP/.goim"
+msg=$(GOIM_DOWN_WAIT=60s deploy_config 2>&1); rc=$?
+case $rc:$msg in 1:*"GOIM_DOWN_WAIT must be a whole number"*'"60s"'*) ok "config: a bad number is named" ;; *) bad "config: a bad number is named: [$rc:$msg]" ;; esac
+msg=$(GOIM_HOME="$TMP/x" GOIM_MAX_CONNS=lots deploy_down 2>&1); rc=$?
+expect "config: a bad number stops down with 2" "$rc" 2
+empty=$(mktemp -d)
+msg=$(PATH=$empty deploy_config 2>&1)
+expect "config: no LAN lookup (down, logs, token)" "$msg" ""
 
 deploy_config 2>/dev/null
 SECONDS=0
@@ -45,6 +52,7 @@ out=$(deploy_spawn sleeper sleep 300)
 expect "spawn: returns at once, no inherited pipe" "$([ "$SECONDS" -lt 3 ] && echo fast)" fast
 deploy_alive sleeper && ok "spawn: alive right after" || bad "spawn: alive right after"
 expect "spawn: pid file has two fields" "$(wc -w <"$D_HOME/run/sleeper.pid" | tr -d ' ')" 2
+expect "mark: redis port" "$(deploy_mark redis) $(deploy_mark gateway) [$(deploy_mark sleeper)]" "127.0.0.1:$D_BASE 127.0.0.1:$((D_BASE + 102)) []"
 deploy_spawn talker sh -c 'echo hello-from-talker; sleep 300'
 sleep 0.3
 grep -q hello-from-talker "$D_HOME/logs/talker.log" && ok "spawn: output in the log" || bad "spawn: output in the log"
@@ -83,6 +91,27 @@ kill -0 $$ && ok "alive: the unrelated process is untouched" || bad "alive: the 
   deploy_alive mac ) && ok "alive: a process title with arguments (macOS)" || bad "alive: a process title with arguments (macOS)"
 rm -f "$D_HOME/run/mac.pid"
 
+# A reused pid: same name, but the mark is not in its arguments.
+echo "$$ bash 127.0.0.1:1" >"$D_HOME/run/reused.pid"
+deploy_alive reused 2>/dev/null && bad "alive: same name without the mark is stale" || ok "alive: same name without the mark is stale"
+echo "$$ bash deploy_test" >"$D_HOME/run/marked.pid"
+deploy_alive marked && ok "alive: the mark in the arguments" || bad "alive: the mark in the arguments"
+rm -f "$D_HOME/run/marked.pid"
+
+# A spawn cut short by a signal writes its pid file late; the rollback waits.
+(sleep 0.5; echo "1 x" >"$D_HOME/run/late.pid") &
+deploy_settle late
+[ -f "$D_HOME/run/late.pid" ] && ok "settle: waits for a late pid file" || bad "settle: waits for a late pid file"
+rm -f "$D_HOME/run/late.pid"
+
+echo 9999 >"$TMP/ct"
+D_MAXCONNS=5000 deploy_conntrack_ok "$TMP/ct" 2>/dev/null && bad "conntrack: too low" || ok "conntrack: too low"
+msg=$(D_MAXCONNS=5000 deploy_conntrack_ok "$TMP/ct" 2>&1)
+case $msg in *"needs 10000"*) ok "conntrack: says what it needs" ;; *) bad "conntrack: says what it needs: [$msg]" ;; esac
+echo 10000 >"$TMP/ct"
+D_MAXCONNS=5000 deploy_conntrack_ok "$TMP/ct" && ok "conntrack: enough" || bad "conntrack: enough"
+deploy_conntrack_ok "$TMP/no-such-file" && ok "conntrack: not loaded passes" || bad "conntrack: not loaded passes"
+
 PORT=$((18900 + RANDOM % 50))
 deploy_port_free "$PORT" && ok "port: free" || bad "port: free"
 python3 -c 'import socket,sys,time
@@ -93,7 +122,6 @@ sleep 0.5
 deploy_port_free "$PORT" && bad "port: busy" || ok "port: busy"
 kill "$HOLD_PID"; HOLD_PID=
 
-empty=$(mktemp -d)
 msg=$(PATH=$empty deploy_lan_ip 2>"$TMP/lan.err")
 expect "lan ip: fallback" "$msg" 127.0.0.1
 grep -q 'no LAN address' "$TMP/lan.err" && ok "lan ip: warns" || bad "lan ip: warns"
@@ -178,6 +206,11 @@ c=json.loads(base64.urlsafe_b64decode(p)); print(c["sub"], c["appid"], int(c["ex
   expect "down: nothing running" "$rc" 0
   case $msg in *"no node is running"*) ok "down: says so" ;; *) bad "down: says so: [$msg]" ;; esac
 
+  echo "$$ bash" >"$GOIM_HOME/run/logic.pid"
+  msg=$(deploy_up 2>&1); rc=$?
+  case $rc:$msg in *"only some processes run ( logic)"*) ok "up: names the processes that run" ;; *) bad "up: names the processes that run: [$rc:$msg]" ;; esac
+  rm -f "$GOIM_HOME/run/logic.pid"
+
   # Keys: each one on its own; the pinned Noise key is never replaced.
   k=$GOIM_HOME/keys
   noise_before=$(cksum <"$k/noise/1")
@@ -200,7 +233,7 @@ c=json.loads(base64.urlsafe_b64decode(p)); print(c["sub"], c["appid"], int(c["ex
   expect "up: failure rolls back" "$rc" 1
   no_pid_files && all_ports_free >/dev/null && ok "up: failure leaves nothing" || bad "up: failure leaves nothing"
 
-  for sig in INT TERM; do
+  for sig in INT TERM HUP; do
     rm -f "$GOIM_HOME"/run/*.status
     set -m
     scripts/deploy.sh up >"$TMP/sig.out" 2>&1 &
@@ -208,9 +241,10 @@ c=json.loads(base64.urlsafe_b64decode(p)); print(c["sub"], c["appid"], int(c["ex
     set +m
     for _ in $(seq 100); do [ -f "$GOIM_HOME/run/redis.pid" ] && break; sleep 0.1; done
     kill -$sig "$UP"
-    wait "$UP" 2>/dev/null
+    wait "$UP" 2>/dev/null; rc=$?
     sleep 1
     no_pid_files && all_ports_free >/dev/null && ok "up: SIG$sig rolls back" || bad "up: SIG$sig rolls back: $(ls "$GOIM_HOME"/run 2>&1 | tr '\n' ' ')"
+    case $sig:$rc in INT:130 | TERM:143 | HUP:129) ok "up: SIG$sig exit status" ;; *) bad "up: SIG$sig exit status $rc" ;; esac
   done
 fi
 
