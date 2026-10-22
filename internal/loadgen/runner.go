@@ -57,9 +57,11 @@ type Stats struct {
 	BalancerOpen map[string]int `json:"balancer_open"`
 	// GhostsOpen is the sockets POST /ghost keeps that no gateway closed
 	// yet; GhostsClosed the ones closed, per gateway, by a Kick or silently
-	// (the heartbeat sweep).
+	// (the heartbeat sweep); GhostsUnkept the ones the keeper could not take,
+	// closed by loadgen at once.
 	GhostsOpen   int64                  `json:"ghosts_open"`
 	GhostsClosed map[string]GhostCloses `json:"ghosts_closed"`
+	GhostsUnkept int64                  `json:"ghosts_unkept"`
 	Counts
 }
 
@@ -299,9 +301,9 @@ func (r *Runner) Mark(gw int, name string, down bool) (int, error) {
 	return n, err
 }
 
-// ErrNotSDK refuses /reset and /network-change outside sdk mode: only SDK
-// clients follow the spec's reconnect rules (#134). Nothing changes.
-var ErrNotSDK = errors.New("loadgen: /reset and /network-change need sdk mode")
+// ErrNotSDK refuses /reset, /network-change and /ghost outside sdk mode:
+// only SDK clients follow the spec's reconnect rules (#134). Nothing changes.
+var ErrNotSDK = errors.New("loadgen: /reset, /network-change and /ghost need sdk mode")
 
 // Reset is POST /reset (P6a2bI-2, #134): mark name on every gateway, its
 // population every client logged in now, then close every SDK client's
@@ -375,7 +377,7 @@ func (r *Runner) Up(gw int) { r.bal.SetUp(gw) }
 // Stats is the run's state now.
 func (r *Runner) Stats() Stats {
 	s := Stats{Mode: r.cfg.Mode, Clients: r.cfg.Clients, Sources: r.cfg.Sources, Started: r.started.Load(),
-		RampDone: r.rampDone.Load(), BalancerOpen: map[string]int{}, GhostsOpen: r.ghosts.open.Load(),
+		RampDone: r.rampDone.Load(), BalancerOpen: map[string]int{}, GhostsOpen: r.ghosts.open.Load(), GhostsUnkept: r.ghosts.unkept.Load(),
 		GhostsClosed: map[string]GhostCloses{}, Counts: r.rec.Counts()}
 	for i, n := range r.bal.Open() {
 		s.BalancerOpen[r.env.GatewayIDs[i]] = n

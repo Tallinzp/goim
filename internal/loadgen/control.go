@@ -39,7 +39,7 @@ func (r *Runner) Result(within time.Duration) Result {
 //	POST /network-change                      sdk: NetworkChanged on every client  {"clients", "ms"}; 409: not sdk mode
 //	POST /ghost?mark=ghost                    sdk: mark every gateway, then every connection lost to its client
 //	                                          and kept open, unread, until its gateway closes it  {"mark", "population", "ms"}
-//	                                          409: not sdk mode or the mark taken, nothing changed
+//	                                          409: not sdk mode or the mark taken, nothing changed; 500: ErrGhostKeeper
 //	GET  /clients                             {"uid_prefix", "gateways", "gw": [client i's gateway index, -1: offline]}
 //	GET  /slo?mark=death&within=30s           SLO
 //	GET  /runtime                             Runtime: loadgen's GC, memory and scheduling counters
@@ -108,7 +108,10 @@ func (r *Runner) Handler() http.Handler {
 			return
 		}
 		n, took, err := r.Ghost(q.FormValue("mark"))
-		if err != nil {
+		if errors.Is(err, ErrGhostKeeper) {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		} else if err != nil {
 			http.Error(w, err.Error(), http.StatusConflict)
 			return
 		}

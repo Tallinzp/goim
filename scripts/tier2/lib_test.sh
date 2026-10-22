@@ -207,16 +207,28 @@ done
 
 # Host setup.
 mkdir -p "$tmp/hs"
-(cd "$tmp/hs" && "$OLDPWD/scripts/tier2/host-setup.sh" --root "$tmp/hs/root" --user alice) >"$tmp/hs/out" 2>&1
+mkdir -p "$tmp/hs/root/etc/systemd/system/user@.service.d"
+echo old >"$tmp/hs/root/etc/systemd/system/user@.service.d/90-goim-tier2.conf"
+(cd "$tmp/hs" && "$OLDPWD/scripts/tier2/host-setup.sh" --root "$tmp/hs/root" --user alice --uid 1001) >"$tmp/hs/out" 2>&1
 expect "setup: test mode exits 0" "$?" 0
 expect "setup: sudoers line" "$(cat "$tmp/hs/root/etc/sudoers.d/goim-netdrop")" "alice ALL=(root) NOPASSWD: /usr/local/sbin/goim-netdrop"
 expect "setup: sudoers mode" "$(stat -c %a "$tmp/hs/root/etc/sudoers.d/goim-netdrop")" 440
 expect "setup: helper mode" "$(stat -c %a "$tmp/hs/root/usr/local/sbin/goim-netdrop")" 755
 expect "setup: nofile hard limit" "$(cat "$tmp/hs/root/etc/security/limits.d/90-goim-tier2.conf")" "alice hard nofile 2097152"
-expect "setup: user manager's nofile" "$(grep LimitNOFILE "$tmp/hs/root/etc/systemd/system/user@.service.d/90-goim-tier2.conf")" "LimitNOFILE=1048576:2097152"
-again=$(scripts/tier2/host-setup.sh --root "$tmp/hs/root" --user alice | grep -c '^unchanged')
+expect "setup: alice's user manager's nofile" "$(grep LimitNOFILE "$tmp/hs/root/etc/systemd/system/user@1001.service.d/90-goim-tier2.conf")" "LimitNOFILE=1024:2097152"
+expect "setup: every user's drop-in removed" "$([ -e "$tmp/hs/root/etc/systemd/system/user@.service.d" ] || echo gone)" gone
+expect "setup: sysctl.conf as is on a host with nothing higher" "$(cmp -s scripts/tier2/sysctl.conf "$tmp/hs/root/etc/sysctl.d/90-goim-tier2.conf" && echo same)" same
+again=$(scripts/tier2/host-setup.sh --root "$tmp/hs/root" --user alice --uid 1001 | grep -c '^unchanged')
 expect "setup: idempotent" "$again" 6
 scripts/tier2/host-setup.sh --root "$tmp/hs/root" --user 'a b' >/dev/null 2>&1; expect "setup: odd user refused" "$?" 2
+# A host whose systemd raised fs.nr_open at boot, and one lower tcp_mem field.
+mkdir -p "$tmp/hs2/root/proc/sys/fs" "$tmp/hs2/root/proc/sys/net/ipv4"
+echo 1073741816 >"$tmp/hs2/root/proc/sys/fs/nr_open"
+printf '4194304\t1000000\t4194304\n' >"$tmp/hs2/root/proc/sys/net/ipv4/tcp_mem"
+scripts/tier2/host-setup.sh --root "$tmp/hs2/root" --user alice --uid 1001 >/dev/null 2>&1
+f=$tmp/hs2/root/etc/sysctl.d/90-goim-tier2.conf
+expect "setup: a higher nr_open is not lowered" "$(grep "^# fs.nr_open" "$f")" "# fs.nr_open: the host's 1073741816 is higher, not lowered"
+expect "setup: a lower field keeps the key" "$(grep -c '^net.ipv4.tcp_mem = ' "$f")" 1
 scripts/tier2/host-setup.sh --root "$tmp/hs/root" >/dev/null 2>&1 </dev/null; rc=$?
 [ -n "${SUDO_USER:-}" ] || expect "setup: no user refused" "$rc" 2
 # A fake /proc/sys and /sys/module that match sysctl.conf, then break them.

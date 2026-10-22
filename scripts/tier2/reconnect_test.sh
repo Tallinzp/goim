@@ -60,6 +60,8 @@ expect "sessions: counts" "$(get "$c" '[d[k] for k in ("clients", "found", "miss
 expect "sessions: examples" "$(get "$c" 'd["examples"]')" "[['u-2', 'missing'], ['u-3', 'extra'], ['u-4', 'wrong_gateway'], ['u-5', 'stale'], ['u-6', 'offline']]"
 head -n 3 "$tmp/sessions.txt" >"$tmp/short.txt"
 expect "sessions: too few lines" "$(rc_sessions_cmp "$tmp/clients.json" "$tmp/short.txt" 1000)" null
+{ cat "$tmp/sessions.txt"; echo "ERR something"; } >"$tmp/long.txt"
+expect "sessions: too many lines" "$(rc_sessions_cmp "$tmp/clients.json" "$tmp/long.txt" 1000)" null
 
 # rc_heartbeats_ok: gw-0 kept 5 ghosts and Kicked 3 of them, so 2
 # heartbeat closes are its ghosts. A Pong left unread at the ghost instant

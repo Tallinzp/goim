@@ -72,8 +72,12 @@ func (r *Runner) newSDK(i int) (*sdkClient, error) {
 }
 
 // abort closes c with an RST, not a FIN (SO_LINGER 0): an LB resetting
-// the flow (Reset, #134).
+// the flow (Reset, #134). Only an open connection: a ghosted one's socket
+// is the keeper's (6b3c2 review M2).
 func (c *replyConn) abort() {
+	if !c.state.CompareAndSwap(connOpen, connClosed) {
+		return
+	}
 	if tc := c.tcp(); tc != nil {
 		tc.SetLinger(0)
 	}

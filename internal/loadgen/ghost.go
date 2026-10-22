@@ -2,6 +2,7 @@ package loadgen
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -14,6 +15,10 @@ import (
 // lost connection, and nothing it writes reaches the gateway (Ghost).
 var errGhost = errors.New("loadgen: ghost: the network dropped the connection")
 
+// ErrGhostKeeper is POST /ghost's failure to open the keeper's epoll set:
+// loadgen's own, not a refusal (500). Nothing changed.
+var ErrGhostKeeper = errors.New("loadgen: /ghost: the ghost keeper's epoll set")
+
 // ghosts keeps the sockets of POST /ghost open and unread, so their
 // gateways see only silence, as when a carrier's network drops every flow
 // (Plan 6b3c, review O1). A gateway closes each one when a relogin's Kick
@@ -22,7 +27,9 @@ var errGhost = errors.New("loadgen: ghost: the network dropped the connection")
 // socket), then drains and closes the socket, so none stays in CLOSE_WAIT,
 // and counts the close per gateway: "kick" when a frame came first (the
 // Kick), "silent" when none did (the sweep). A ghost keeps its balancer slot
-// until then: the LB still holds the flow.
+// until then: the LB still holds the flow. A socket the keeper cannot take
+// (not TCP, or EPOLL_CTL_ADD fails, e.g. at fs.epoll.max_user_watches) is
+// closed at once and counted "unkept", not "silent" (6b3c2 review M1).
 type ghosts struct {
 	once   sync.Once
 	ep     int
@@ -32,6 +39,7 @@ type ghosts struct {
 	work   chan *replyConn
 	done   chan struct{}
 	open   atomic.Int64
+	unkept atomic.Int64
 	kick   []atomic.Int64 // per gateway
 	silent []atomic.Int64 // per gateway
 }
@@ -70,12 +78,12 @@ func (g *ghosts) start() error {
 func (g *ghosts) keep(c *replyConn) {
 	tc := c.tcp()
 	if tc == nil || g.start() != nil {
-		c.Conn.Close()
+		g.unkeep(c)
 		return
 	}
 	rc, err := tc.SyscallConn()
 	if err != nil {
-		c.Conn.Close()
+		g.unkeep(c)
 		return
 	}
 	g.open.Add(1)
@@ -92,8 +100,16 @@ func (g *ghosts) keep(c *replyConn) {
 		}
 	})
 	if !added {
-		g.close(c)
+		g.open.Add(-1)
+		g.unkeep(c)
 	}
+}
+
+// unkeep closes a socket the keeper could not take, at once: the SDK's
+// Close does not wait for a drain.
+func (g *ghosts) unkeep(c *replyConn) {
+	c.Conn.Close()
+	g.unkept.Add(1)
 }
 
 // loop hands every socket its gateway closed (or reset) to a closer.
@@ -197,15 +213,23 @@ func (c *replyConn) ghost() bool {
 
 var aLongTimeAgo = time.Unix(1, 0)
 
+// Close moves the state with one compare-and-swap, so a ghost() in between
+// cannot make it close a socket the keeper should take (6b3c2 review M3).
 func (c *replyConn) Close() error {
-	if c.state.CompareAndSwap(connGhost, connClosed) {
-		c.sc.r.ghosts.keep(c)
-		return nil
+	for {
+		s := c.state.Load()
+		if s == connClosed {
+			return nil
+		}
+		if !c.state.CompareAndSwap(s, connClosed) {
+			continue // ghost() moved it first: look again
+		}
+		if s == connGhost {
+			c.sc.r.ghosts.keep(c)
+			return nil
+		}
+		return c.Conn.Close()
 	}
-	if c.state.Swap(connClosed) == connClosed {
-		return nil
-	}
-	return c.Conn.Close()
 }
 
 // Ghost is POST /ghost (Plan 6b3c, review O1): mark name on every gateway,
@@ -221,7 +245,7 @@ func (r *Runner) Ghost(name string) (n int, took time.Duration, err error) {
 		return 0, 0, ErrNotSDK
 	}
 	if err := r.ghosts.start(); err != nil {
-		return 0, 0, err
+		return 0, 0, fmt.Errorf("%w: %v", ErrGhostKeeper, err)
 	}
 	if n, err = r.Mark(-1, name, false); err != nil {
 		return 0, 0, err

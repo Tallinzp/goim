@@ -5,7 +5,10 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -119,10 +122,70 @@ func TestGhostKeeperWaitsForThePeer(t *testing.T) {
 		t.Fatalf("kick %d, silent %d: want one each", r.ghosts.kick[0].Load(), r.ghosts.silent[0].Load())
 	}
 
+	rc, peer = ghost() // a /reset after the /ghost leaves the kept socket (M2)
+	rc.Close()
+	rc.abort()
+	peer.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if n, err := peer.Read(buf[:]); !errors.Is(err, os.ErrDeadlineExceeded) || r.ghosts.open.Load() != 1 {
+		t.Fatalf("peer read %d, %v, ghosts open %d: want the socket kept after abort", n, err, r.ghosts.open.Load())
+	}
+	peer.Close()
+	waitFor(t, "the third ghost closed", 5*time.Second, func() bool { return r.ghosts.open.Load() == 0 })
+
 	rc, _ = ghost() // closed before the ghost: not ghosted
 	rc.state.Store(connClosed)
 	if rc.ghost() {
 		t.Fatal("ghost took a closed connection")
+	}
+}
+
+// A socket the keeper cannot take is closed at once and counted unkept,
+// not silent: the SDK's Close does not wait (6b3c2 review M1).
+func TestGhostUnkeptClosesAtOnce(t *testing.T) {
+	r := &Runner{ghosts: newGhosts(1)}
+	defer r.ghosts.stop()
+	a, b := net.Pipe() // not TCP: no epoll for it
+	defer b.Close()
+	rc := (&sdkClient{r: r}).track(a, 1)
+	rc.gw = 0
+	if !rc.ghost() {
+		t.Fatal("ghost refused an open connection")
+	}
+	begin := time.Now()
+	rc.Close()
+	if took := time.Since(begin); took > 100*time.Millisecond {
+		t.Fatalf("Close took %v, want at once", took)
+	}
+	if _, err := b.Read(make([]byte, 1)); err == nil {
+		t.Fatal("peer read: want the pipe closed")
+	}
+	if u, s, o := r.ghosts.unkept.Load(), r.ghosts.silent[0].Load(), r.ghosts.open.Load(); u != 1 || s != 0 || o != 0 {
+		t.Fatalf("unkept %d, silent %d, open %d: want 1, 0, 0", u, s, o)
+	}
+}
+
+// Close racing ghost: a connection ghost() took is always handed to the
+// keeper, never closed by Close (6b3c2 review M3).
+func TestGhostCloseRace(t *testing.T) {
+	r := &Runner{ghosts: newGhosts(1)}
+	defer r.ghosts.stop()
+	sc := &sdkClient{r: r}
+	for i := range 200000 {
+		a, b := net.Pipe()
+		rc := sc.track(a, uint64(i))
+		before := r.ghosts.unkept.Load()
+		var start, done sync.WaitGroup
+		start.Add(1)
+		done.Add(2)
+		var ghosted bool
+		go func() { defer done.Done(); start.Wait(); ghosted = rc.ghost() }()
+		go func() { defer done.Done(); start.Wait(); rc.Close() }()
+		start.Done()
+		done.Wait()
+		if kept := r.ghosts.unkept.Load() != before; kept != ghosted {
+			t.Fatalf("round %d: ghost() %v, keeper got it %v", i, ghosted, kept)
+		}
+		b.Close()
 	}
 }
 
@@ -155,5 +218,24 @@ func TestClientsGivesEachGateway(t *testing.T) {
 	}
 	if by := r.Stats().OnlineByGateway; n[env.GatewayIDs[0]] != by[env.GatewayIDs[0]] || n[env.GatewayIDs[1]] != by[env.GatewayIDs[1]] {
 		t.Fatalf("/clients per gateway %v, online by gateway %v", n, by)
+	}
+}
+
+// The keeper's epoll set failing is loadgen's own error, 500, not a
+// refusal like sdk mode's 409 (6b3c2 review M9).
+func TestGhostKeeperFailureIs500(t *testing.T) {
+	g := newGhosts(1)
+	g.once.Do(func() { g.err = errors.New("epoll_create1: too many open files") })
+	r := &Runner{cfg: Config{Mode: "sdk"}, ghosts: g}
+	if _, _, err := r.Ghost("ghost"); !errors.Is(err, ErrGhostKeeper) {
+		t.Fatalf("Ghost: %v, want ErrGhostKeeper", err)
+	}
+	srv := httptest.NewServer(r.Handler())
+	defer srv.Close()
+	if code, _ := post(t, srv.URL+"/ghost?mark=ghost"); code != http.StatusInternalServerError {
+		t.Fatalf("/ghost: %d, want 500", code)
+	}
+	if !strings.Contains(ErrNotSDK.Error(), "/ghost") {
+		t.Fatalf("ErrNotSDK %q does not name /ghost", ErrNotSDK)
 	}
 }

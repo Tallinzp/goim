@@ -374,14 +374,14 @@ rc_heartbeats_ok() {
 # logged in at loadgen, "found": one session on the client's gateway with
 # login_ms >= MARK_MS, "missing", "extra": more than one, "wrong_gateway",
 # "stale": logged in before the mark, "examples": up to 5 [uid, why]}; null
-# if a file is unreadable or SESSIONS has too few lines.
+# if a file is unreadable or SESSIONS has not exactly one line per client.
 rc_sessions_cmp() {
   python3 -c 'import json, sys
 c = json.load(open(sys.argv[1]))
-lines = open(sys.argv[2]).read().split("\n")
+lines = open(sys.argv[2]).read().splitlines()
 mark = int(sys.argv[3])
 gw = c["gw"]
-if len(lines) < len(gw):
+if len(lines) != len(gw):
     raise SystemExit(1)
 r = {"clients": len(gw), "offline": 0, "found": 0, "missing": 0, "extra": 0, "wrong_gateway": 0, "stale": 0, "examples": []}
 for i, (g, l) in enumerate(zip(gw, lines)):
@@ -499,11 +499,12 @@ for name in $PHASES; do
   reply=$(lg_post "/$mark?mark=$mark" | lg_py - d)
   mark_t=$SECONDS
   # Every client notices the RST (ghost: its failed read) at once; until
-  # then a network change would find it online and do nothing.
+  # then a network change would find it online and do nothing. Each /slo
+  # walks every member under the recorder's lock: polled every 0.5s.
   dropped=false
   until [ "$(lg_get "/slo?mark=$mark&within=30s" 'd["lost"] == d["population"]')" = true ]; do
     [ $((SECONDS - mark_t)) -lt "$DROP_MAX" ] || break
-    sleep 0.2
+    sleep 0.5
   done
   [ "$(lg_get "/slo?mark=$mark&within=30s" 'd["lost"] == d["population"]')" = true ] && dropped=true
   nc=null nc_after_ms=null
@@ -519,7 +520,7 @@ for name in $PHASES; do
   left=$((mark_t + DEAD + 5 - SECONDS))
   [ "$name" = ghost ] && [ "$left" -gt 0 ] && sleep "$left"
   redis=$(stack_redis_latency)
-  gh=$(lg_get /stats '{"open": d["ghosts_open"], "closed": d["ghosts_closed"]}')
+  gh=$(lg_get /stats '{"open": d["ghosts_open"], "closed": d["ghosts_closed"], "unkept": d["ghosts_unkept"]}')
   kill "$smp" 2>/dev/null; wait "$smp" 2>/dev/null; smp=""
   wait "$prof"; prof=""
   storm=$(stack_usage_json)
