@@ -20,7 +20,7 @@ Inputs:
 
 **Decisions:**
 - **#137 (the user, 2026-10-24, before writing):** 6c is split into 6c1 (this plan), 6c2 (failover incl. zone loss) and 6c3 (`gwconns` shard load, ReconcileEnd/drain deadline sizing); the Cluster is 3 masters + 3 replicas.
-- **#138 (proposed by this plan):** see *Implementation choices this plan makes*.
+- **#138 (decided by the user 2026-10-24, with no advocatus-diaboli review):** *Implementation choices this plan makes* as written; run 33 keeps run 31's Logic set (11, 23); the slot map from any live node is Plan 6c2's (Review Focus 3).
 
 **Branch:** `feat/plan6c` (from `main` `7bc215d`). Execute from its head, this plan's own commit or later.
 
@@ -47,7 +47,7 @@ Inputs:
 
 ## Implementation choices this plan makes
 
-These are #138 in the roadmap (proposed).
+These are #138 in the roadmap (decided 2026-10-24).
 1. **Zones as labels.** One host has no zones. Master i is in zone zi, its replica in z((i+1) mod 3), so one zone holds one master and another master's replica, the spec's placement (R5S-O9). `redis/layout` records it for Plan 6c2's zone loss.
 2. **The bus port named** (`--cluster-port`): the default (port + 10000) lands in the race suite's range.
 3. **`cluster-node-timeout` 15s** (Redis's default), as `REDIS_CLUSTER_NODE_TIMEOUT_MS`. Plan 6c2 measures the failover it gives against the lease rule (TTL 30s > failover + renewal 10s).
@@ -1564,7 +1564,7 @@ Expected: run 31's `reset` checks, now with Logic and the 6 nodes on Logic's 2 C
 
 - [ ] **Step 6: Record**
 
-In this plan's *Execution Notes*: the commits; runs 32 and 33 (commit, duration, checks; run 33 against run 31's `reset`: p99 from the mark, all back, backoff share; per node `evalsha` p99/p99.9 against run 31's single-instance `evalsha` p99 75–94µs, p99.9 2.6–3.1ms; the session check's time). In the roadmap: the plan 6 row (6c1 executed, runs 32/33) and #138 (decided, or as amended by the review). `README.md` only if run 33 gives a row the user wants.
+In this plan's *Execution Notes*: the commits; runs 32 and 33 (commit, duration, checks; run 33 against run 31's `reset`: p99 from the mark, all back, backoff share; per node `evalsha` p99/p99.9 against run 31's single-instance `evalsha` p99 75–94µs, p99.9 2.6–3.1ms; the session check's time). In the roadmap: the plan 6 row (6c1 executed, runs 32/33). `README.md` only if run 33 gives a row the user wants.
 
 ```bash
 git add docs/superpowers/plans/2026-10-07-connection-session-core-00-roadmap.md docs/superpowers/plans/2026-10-24-connection-session-core-06c1-redis-cluster.md
