@@ -40,7 +40,7 @@ func (staticKeys) Run(context.Context) {}
 // stack is Logic and its gateways.
 type stack struct {
 	t        *testing.T
-	rdb      *redis.Client
+	rdb      redis.UniversalClient
 	jwt      auth.PrivateKey
 	noise    wire.Key
 	grpcAddr string

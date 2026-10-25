@@ -7,7 +7,7 @@ export GOIM_REDIS_REPLICA_PORT ?= 16380
 COMPOSE_REDIS := docker compose -f deploy/compose/redis-test.yml
 TIER2_GUARD := test "$$GOIM_TEST_TIER" = 2 || { echo "Tier 2 host only: set GOIM_TEST_TIER=2"; exit 1; }
 
-.PHONY: test test-race-suite test-scripts test-load-probe redis-server test-redis-local proto redis-up redis-down test-redis test-tier2 deploy deploy-down deploy-status deploy-logs deploy-token
+.PHONY: test test-race-suite test-scripts test-load-probe redis-server test-redis-local test-redis-cluster-local proto redis-up redis-down test-redis test-redis-cluster test-tier2 deploy deploy-down deploy-status deploy-logs deploy-token
 
 # Tier 1a (dev machine): unit and Lua tests on in-process miniredis, race detector on.
 test:
@@ -51,6 +51,11 @@ redis-server:
 test-redis-local:
 	scripts/redis-local.sh $(REDIS_SERVER) go test -race -count=1 ./...
 
+# The same on a local Redis Cluster (P5bI-4, Plan 6c1): 3 masters and 3
+# replicas from scripts/redis-cluster-local.sh, no Docker.
+test-redis-cluster-local:
+	scripts/redis-cluster-local.sh $(REDIS_SERVER) go test -race -count=1 ./...
+
 # Regenerate api/internalpb and api/clientpb from api/internal.proto and
 # api/client.proto. Needs protoc 33.1 and the two pinned plugins (Plan 2,
 # Task 1); the generated code is committed.
@@ -71,6 +76,11 @@ redis-down:
 test-redis:
 	@$(TIER2_GUARD)
 	GOIM_TEST_REDIS=127.0.0.1:$(GOIM_REDIS_PORT) GOIM_TEST_REDIS_REPLICA=127.0.0.1:$(GOIM_REDIS_REPLICA_PORT) go test -race -count=1 ./...
+
+# Tier 2 host: every test on the pinned 7.4.11 as a Redis Cluster (P5bI-4).
+test-redis-cluster:
+	@$(TIER2_GUARD)
+	scripts/redis-cluster-local.sh $(REDIS_SERVER) go test -race -count=1 ./...
 
 # Tier 2 scenario entry point (spec: automation contract). The caller sets
 # GOIM_TEST_TIER (P5bI-5), e.g. GOIM_TEST_TIER=2 make test-tier2 SCENARIO=race;

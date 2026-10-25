@@ -13,7 +13,7 @@ var ctx = context.Background()
 
 const field = "im:mobile"
 
-func newStore(t *testing.T) (*Store, *redis.Client) {
+func newStore(t *testing.T) (*Store, redis.UniversalClient) {
 	t.Helper()
 	rdb := testredis.New(t)
 	return New(rdb, DefaultConfig()), rdb
@@ -43,7 +43,7 @@ func login1(t *testing.T, s *Store, uid string, e session.Entry) LoginResult {
 	return res
 }
 
-func stored(t *testing.T, rdb *redis.Client, uid string) string {
+func stored(t *testing.T, rdb redis.UniversalClient, uid string) string {
 	t.Helper()
 	v, err := rdb.HGet(ctx, sessKey(uid), field).Result()
 	if err == redis.Nil {

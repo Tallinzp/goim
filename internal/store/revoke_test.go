@@ -146,18 +146,18 @@ func TestRevokeEndToEnd(t *testing.T) {
 func TestRevokeFailsWhenReplicaDoesNotAck(t *testing.T) {
 	testredis.RequireReal(t)
 	rdb := testredis.New(t)
-	replica := testredis.NewReplica(t)
+	uid := testredis.UID()
+	replica := testredis.ReplicaOf(t, rdb, revKey(uid))
 	cfg := DefaultConfig()
 	cfg.WaitTimeout = 200 * time.Millisecond
 	s := New(rdb, cfg)
-	uid := testredis.UID()
 	e := entry(1, "d", 1, nowMs(t, s))
 	if err := rdb.HSet(ctx, sessKey(uid), field, e.Encode()).Err(); err != nil {
 		t.Fatal(err)
 	}
 
 	// Every write so far is acknowledged; only the marker write will not be.
-	waitReplicaAcked(t, rdb)
+	waitReplicaAcked(t, testredis.MasterOf(t, rdb, revKey(uid)))
 
 	slept := make(chan error, 1)
 	go func() { slept <- replica.Do(ctx, "DEBUG", "SLEEP", "1").Err() }()

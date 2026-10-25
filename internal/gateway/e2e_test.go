@@ -25,7 +25,7 @@ import (
 // gateway package itself does not (TestGatewayDoesNotImportTheStore).
 type e2e struct {
 	*core
-	rdb *redis.Client
+	rdb redis.UniversalClient
 	key auth.PrivateKey
 }
 

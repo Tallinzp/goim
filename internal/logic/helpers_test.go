@@ -39,7 +39,7 @@ func testConfig() Config {
 }
 
 // newStore returns a real store on a fresh miniredis (or the Tier 2 Redis).
-func newStore(t *testing.T, cfg Config) (*store.Store, *redis.Client) {
+func newStore(t *testing.T, cfg Config) (*store.Store, redis.UniversalClient) {
 	t.Helper()
 	rdb := testredis.New(t)
 	return store.New(rdb, cfg.Store), rdb

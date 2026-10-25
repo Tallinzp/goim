@@ -54,7 +54,7 @@ type env struct {
 	cfg   Config
 	svc   *Service
 	real  *store.Store
-	rdb   *redis.Client
+	rdb   redis.UniversalClient
 	kicks *kickRecorder
 	m     *Metrics
 	key   auth.PrivateKey
