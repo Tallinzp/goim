@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	pb "github.com/Tallinzp/goim/api/internalpb"
 )
 
@@ -76,4 +78,33 @@ func TestRenewalAfterFailuresForALeaseTTLTriggersAPass(t *testing.T) {
 	<-failing
 	failing <- false
 	waitFor(t, "triggered pass", func() bool { return passes(l) >= 1 })
+}
+
+// A failed renewal is retried after LeaseRetry, not at the next tick, so a
+// lease outlives a Redis failover of up to TTL − interval (spec: the lease
+// rule, R2-O5; roadmap #139). Back on the tick once a call succeeds.
+func TestFailedRenewalIsRetriedBeforeTheNextTick(t *testing.T) {
+	fails := 3
+	l := startLive(t, func(c *Config) {
+		c.LeaseInterval, c.LeaseTTL, c.LeaseRetry = time.Hour, 2*time.Hour, 20*time.Millisecond
+	},
+		func(_ *Gateway, f *fakeLogic) {
+			f.lease = func(*pb.LeaseRequest) (*pb.LeaseReply, error) {
+				f.mu.Lock()
+				defer f.mu.Unlock()
+				if fails > 0 {
+					fails--
+					return nil, errors.New("shard failing over")
+				}
+				return &pb.LeaseReply{Missing: true}, nil // a new epoch's key is absent
+			}
+		})
+	waitFor(t, "first lease after 3 failed calls", l.g.leaseOK.Load)
+	time.Sleep(200 * time.Millisecond) // 10 × LeaseRetry
+	if n := get(l.logic, func() int { return len(l.logic.leaseCalls) }); n != 4 {
+		t.Fatalf("%d lease calls, want 4: 3 failed and retried, then the hourly tick", n)
+	}
+	if got := testutil.ToFloat64(l.g.m.LeaseCalls.WithLabelValues("error")); got != 3 {
+		t.Fatalf("lease_calls_total{result=error} %v, want 3", got)
+	}
 }

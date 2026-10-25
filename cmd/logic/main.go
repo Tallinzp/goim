@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/Tallinzp/goim/internal/auth"
 	"github.com/Tallinzp/goim/internal/fault"
@@ -33,6 +34,7 @@ func main() {
 type options struct {
 	redisAddrs   string
 	redisCluster bool
+	redisReload  time.Duration
 	jwksURL      string
 	jwksFallback string
 	jwks         auth.ManagerConfig // its intervals; URL and fallback come from the two flags above
@@ -48,6 +50,7 @@ func parseFlags(args []string) (logic.Config, logic.ServerConfig, options, error
 	fs := flag.NewFlagSet("logic", flag.ContinueOnError)
 	fs.StringVar(&o.redisAddrs, "redis", "127.0.0.1:6379", "Redis address(es), comma-separated")
 	fs.BoolVar(&o.redisCluster, "redis-cluster", true, "Redis Cluster (false: one node, for tests)")
+	fs.DurationVar(&o.redisReload, "redis-reload", time.Second, "Redis Cluster: reload the slot map when it is older than this; a failed-over master's slots reach its replica within it (#139)")
 	fs.StringVar(&o.jwksURL, "jwks-url", "", "account service JWKS URL")
 	fs.StringVar(&o.jwksFallback, "jwks-fallback", "/etc/goim/jwks-fallback/jwks.json", "jwks-fallback ConfigMap file")
 	fs.DurationVar(&o.jwks.Refresh, "jwks-refresh", o.jwks.Refresh, "periodic JWKS refresh")
@@ -99,6 +102,9 @@ func parseFlags(args []string) (logic.Config, logic.ServerConfig, options, error
 	if o.jwks.Refresh <= 0 || o.jwks.RetryEmpty <= 0 || o.jwks.UnknownKid <= 0 {
 		return cfg, sc, o, errors.New("config: the JWKS intervals must be positive")
 	}
+	if o.redisReload <= 0 { // go-redis reads 0 as its 60s default
+		return cfg, sc, o, errors.New("config: -redis-reload must be positive")
+	}
 	return cfg, sc, o, nil
 }
 
@@ -110,7 +116,12 @@ func run(args []string) error {
 	addrs := strings.Split(o.redisAddrs, ",")
 	var rdb redis.UniversalClient
 	if o.redisCluster {
-		rdb = redis.NewClusterClient(&redis.ClusterOptions{Addrs: addrs})
+		// The client reloads its slot map after a MOVED, ASK or READONLY
+		// reply, or once it is older than ClusterStateReloadInterval (60s by
+		// default). A master that died answers nothing, so without a short
+		// interval its slots stay on the dead address for up to a minute
+		// after its replica took over (Plan 6c2a prototype, #139).
+		rdb = redis.NewClusterClient(&redis.ClusterOptions{Addrs: addrs, ClusterStateReloadInterval: o.redisReload})
 	} else {
 		rdb = redis.NewClient(&redis.Options{Addr: addrs[0]})
 	}

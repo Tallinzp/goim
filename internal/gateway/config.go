@@ -56,6 +56,7 @@ type Config struct {
 
 	LeaseInterval time.Duration // GatewayLease period (10s)
 	LeaseTimeout  time.Duration // per call (5s)
+	LeaseRetry    time.Duration // after a failed call, in place of the next tick (1s; #139)
 	LeaseTTL      time.Duration // Logic's lease TTL (30s), for the trigger rule
 
 	Reconcile ReconcileConfig
@@ -129,6 +130,7 @@ func DefaultConfig() Config {
 		RetryMaxDelay:    10 * time.Second,
 		LeaseInterval:    10 * time.Second,
 		LeaseTimeout:     5 * time.Second,
+		LeaseRetry:       time.Second,
 		LeaseTTL:         30 * time.Second,
 		Reconcile: ReconcileConfig{Cycle: 10 * time.Minute, Jitter: time.Minute, Chunk: 200,
 			TriggeredRate: 5000, MinRate: 10, MaxInFlight: 4, MaxRequeues: 3, DeleteRate: 10_000},
@@ -212,6 +214,7 @@ func (c Config) Validate() error {
 	for name, d := range map[string]time.Duration{"LoginLinger": c.LoginLinger, "LogoutLinger": c.LogoutLinger,
 		"RPCTimeout": c.RPCTimeout, "RetryFor": c.RetryFor, "RetryBackoff": c.RetryBackoff,
 		"RetryMaxDelay": c.RetryMaxDelay, "LeaseInterval": c.LeaseInterval, "LeaseTimeout": c.LeaseTimeout,
+		"LeaseRetry":      c.LeaseRetry,
 		"Reconcile.Cycle": c.Reconcile.Cycle, "Drain.Window": c.Drain.Window, "Drain.Jitter": c.Drain.Jitter} {
 		if d <= 0 {
 			bad("%s %v must be positive", name, d)
@@ -219,6 +222,9 @@ func (c Config) Validate() error {
 	}
 	if c.LeaseTimeout > c.LeaseInterval {
 		bad("LeaseTimeout %v must not exceed LeaseInterval %v", c.LeaseTimeout, c.LeaseInterval)
+	}
+	if c.LeaseRetry > c.LeaseInterval {
+		bad("LeaseRetry %v must not exceed LeaseInterval %v", c.LeaseRetry, c.LeaseInterval)
 	}
 	if c.LeaseTTL <= c.LeaseInterval {
 		bad("LeaseTTL %v must exceed LeaseInterval %v", c.LeaseTTL, c.LeaseInterval)

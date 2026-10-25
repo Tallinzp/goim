@@ -170,7 +170,7 @@ type live struct {
 
 // fastConfig shrinks the background intervals so tests run quickly.
 func fastConfig(c *Config) {
-	c.LeaseInterval, c.LeaseTimeout, c.LeaseTTL = 100*time.Millisecond, 100*time.Millisecond, 300*time.Millisecond
+	c.LeaseInterval, c.LeaseTimeout, c.LeaseTTL, c.LeaseRetry = 100*time.Millisecond, 100*time.Millisecond, 300*time.Millisecond, 20*time.Millisecond
 	c.Reconcile.Cycle, c.Reconcile.Jitter = time.Hour, 0 // passes only when a test triggers one
 	c.RetryBackoff, c.RetryMaxDelay = 20*time.Millisecond, 50*time.Millisecond
 }
