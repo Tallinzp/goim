@@ -8,11 +8,14 @@
 #
 #   redis_cluster_layout          # "NODE ROLE ZONE MASTER" per node: redis-0..2 masters, redis-3..5 replicas
 #   redis_cluster_args PORT BUS DIR   # sets REDIS_CLUSTER_ARGS: one node's redis-server flags
-#   redis_cluster_join CLI PORT... # the 6 ports in layout order: create, attach replicas, wait until
-#                                 #   every node reports cluster_state:ok and every replica is linked
+#   redis_cluster_join CLI PORT... # the 6 ports in layout order: create, attach replicas, then
+#                                 #   redis_cluster_wait
+#   redis_cluster_wait CLI SECONDS PORT...  # until every node reports cluster_state:ok, sees 3
+#                                 #   replicas and no failed node, and every replica is linked
 #
 # Settings: REDIS_CLUSTER_NODE_TIMEOUT_MS (cluster-node-timeout, default
-# 15000, Redis's default; Plan 6c2 measures the failover it gives);
+# 10000: a SIGKILLed master fails over in ~16.5s, inside the lease rule's
+# TTL 30s - interval 10s; Redis's 15000 took 20.6-22.7s, #139);
 # REDIS_CLUSTER_JOIN_TIMEOUT_S (how long the join waits, default 30).
 
 redis_cluster_layout() {
@@ -27,7 +30,7 @@ redis_cluster_args() {
   REDIS_CLUSTER_ARGS=(--port "$1" --cluster-port "$2" --bind 127.0.0.1 --dir "$3"
     --save "" --appendonly no --maxmemory-policy noeviction
     --cluster-enabled yes --cluster-config-file nodes.conf
-    --cluster-node-timeout "${REDIS_CLUSTER_NODE_TIMEOUT_MS:-15000}"
+    --cluster-node-timeout "${REDIS_CLUSTER_NODE_TIMEOUT_MS:-10000}"
     --repl-diskless-sync yes --repl-diskless-sync-delay 0)
 }
 
@@ -55,24 +58,37 @@ redis_cluster_join() {
       --cluster-slave --cluster-master-id "$id" >/dev/null ||
       { echo "redis-cluster: replica on port ${ports[i + 3]} not added" >&2; return 1; }
   done
-  deadline=$((SECONDS + ${REDIS_CLUSTER_JOIN_TIMEOUT_S:-30}))
+  redis_cluster_wait "$cli" "${REDIS_CLUSTER_JOIN_TIMEOUT_S:-30}" "${ports[@]}"
+}
+
+# redis_cluster_wait CLI SECONDS PORT...: waits until every node answers,
+# reports cluster_state:ok, sees 3 replicas and no node flagged fail or
+# fail?, and every node that is a replica now has its master link up: the
+# join's end, and a Cluster whole again after a failover (Plan 6c2a). Each
+# call is bounded by 1s, so a stopped node fails the wait, not hangs it.
+# Fails, naming what did not happen, after SECONDS.
+redis_cluster_wait() {
+  local cli=$1 secs=$2 p ok deadline
+  shift 2
+  deadline=$((SECONDS + secs))
   while :; do
     ok=1
     # Every node must also see the 3 replicas: gossip spreads the new roles
     # after the replicas link, and a client that loads the slot map from a
     # node that has not heard yet sees 6 masters.
-    for p in "${ports[@]}"; do
-      "$cli" -p "$p" cluster info 2>/dev/null | grep -q '^cluster_state:ok' || ok=""
-      [ "$("$cli" -p "$p" cluster nodes 2>/dev/null | grep -cE '[ ,]slave ')" = 3 ] || ok=""
-    done
-    for p in "${ports[@]:3}"; do
-      "$cli" -p "$p" info replication 2>/dev/null | grep -q '^master_link_status:up' || ok=""
+    for p in "$@"; do
+      timeout 1 "$cli" -p "$p" cluster info 2>/dev/null | grep -q '^cluster_state:ok' || { ok=""; break; }
+      timeout 1 "$cli" -p "$p" cluster nodes 2>/dev/null | awk '$3 ~ /(^|,)slave(,|$)/ { s++ } $3 ~ /(^|,)fail\??(,|$)/ { f++ }
+        END { exit !(s == 3 && f == 0) }' || { ok=""; break; }
+      if timeout 1 "$cli" -p "$p" info replication 2>/dev/null | grep -q '^role:slave'; then
+        timeout 1 "$cli" -p "$p" info replication 2>/dev/null | grep -q '^master_link_status:up' || { ok=""; break; }
+      fi
     done
     [ -n "$ok" ] && return 0
     [ "$SECONDS" -ge "$deadline" ] && break
     sleep 0.1
   done
-  echo "redis-cluster: not every node reports cluster_state:ok with its replicas linked within ${REDIS_CLUSTER_JOIN_TIMEOUT_S:-30}s" >&2
-  "$cli" -p "${ports[0]}" cluster nodes >&2
+  echo "redis-cluster: not every node reports cluster_state:ok with its replicas linked within ${secs}s" >&2
+  timeout 1 "$cli" -p "$1" cluster nodes >&2
   return 1
 }
