@@ -1601,3 +1601,29 @@ Push the branch. Fast-forwarding `main` is the user's call.
 **Run 32 (2026-10-25, `3c1db43` (before the minor fixes), 147s, setup 8s): 8/8.** `tests` 55s, `no_skips` 0, `mutation` pass (11s), `eviction` `noeviction`; `cluster_tests` 73s, `cluster_no_skips` 0 (`cluster_test_passed` 1), `cluster_mutation` pass, `cluster_eviction` `noeviction=6`. The single run uses the Docker Redis (jemalloc), the Cluster the pinned build (libc malloc): same 7.4.11. Both mutant logs fail `TestRevokeFailsWhenReplicaDoesNotAck` with `want ErrNotReplicated`. P5bI-4 holds: every package passes on a Cluster. `not_covered`: the failover (Plan 6c2) and lost replies after a write.
 
 **Run 32b (2026-10-25, `e4eeb3b`, after the minor fixes, 137s): 8/8.** `tests` 50s, `mutation` 4s, `cluster_tests` 75s; skips 0 and 0; `cluster_test_passed` 1; `noeviction`, `noeviction=6`. The stronger `TestMasterAddrOnClusterIsTheOwner` (M3) and the 5s `dialCluster` (M7) pass on the host.
+
+**Run 33 (2026-10-25, `7dde736`, `RECONNECT_REDIS=cluster RECONNECT_PHASES=reset`, 297s; a first try at 07:33 was refused by the host guard: the NOTRACK rules were gone after a reboot, `host-setup.sh` again): 12/12.** Logic and the 6 nodes on Logic's set (11, 23); 600k online in 121s; `mem_budget` 23GB wanted, 28GB available; no swap. Against run 31's `reset` (one Redis on the same set):
+
+| | run 31 `reset` (one Redis) | run 33 `reset` (Cluster) |
+|---|---|---|
+| drop: close ms; detection p99 | 2,441; 2.4s | 1,656; 1.6s |
+| from mark p50 / p90 / p99 / max | 22.0 / 38.0 / 47.0 / 87.9s | 24.8 / 43.2 / 53.8 / 92.4s |
+| all back (`back_s`) | 86s | 90s |
+| backoff share | 10.2% | 11.5% |
+| `rejects_login_queue` (gw-0/1/2) | 31,111 / 5,378 / 4,770 | 51,010 / 60,555 / 14,839 |
+| Logic Kicks ok | 142,485 | 159,807 |
+| `pending_mem`, funnel, Logouts dropped | 0 | 0 |
+| loadgen-bound | yes | yes |
+
+- Redis per node (`P.redis_latency`, the storm window): `evalsha` on each master ~400k calls, p99 124 / 119 / 121µs, p99.9 4.0 / 3.9 / 3.8ms (redis-0/1/2), against run 31's 75–94µs and 2.6–3.1ms. `sadd` (`gwconns`) only on redis-1 (7,628 calls) and redis-2 (4,200): the 3 gateways' `gwconns:gw-n:{epoch}` keys fell on 2 masters (the hash tag is the boot epoch, so the shards change at each run); p99 319 / 295µs, p99.9 6.2 / 4.1ms (run 31: p99 150–309µs). `hget`/`hset`/`hmget` p99 3–6µs. The replicas apply `MULTI`/`EXEC` (p99 13µs).
+- CPU: in the storm's first 30s Logic used 1.36 cores and the 6 nodes 0.63 (masters 0.17 each, replicas 0.04); `logic_set_busy_pct` stayed 99–100% from the mark to ~45s. RSS: masters 105–141MB, replicas 96–135MB.
+- The session check: 600,000 found, 0 missing, wrong gateway or stale; `ms` 7,019 (one EVAL per slot, ~16k, sent to the 3 masters in turn).
+- Reading: the Cluster costs ~7s at p99 (47.0 → 53.8s) and more `login_queue` refusals, on a Logic set shared by Logic and 6 nodes. The plan expected this (choice 4: scenarios opt in); it is a reading for Plan 6c3's sizing, not a defect. All checks pass; the SLO from the mark (30s) fails as in run 31 (loadgen-bound, #110).
+
+**Interface review (short form, the user's choice 2026-10-25), proposed:** P6c1I-1..6, over what Plans 6c2 and 6c3 build on (`stack.sh`'s Cluster helpers, `redis-cluster.sh`, `rc_sessions`, `P.redis_latency` per node).
+- **P6c1I-1 (6c2):** `stack_redis_slots` reads `CLUSTER NODES` from `redis-0` only. After a failover of `redis-0` it prints nothing and `P_sessions` is null (Review Focus 3). 6c2 reads the map from the first node in `stack_redis_names` that answers.
+- **P6c1I-2 (6c2):** `stack_redis_cluster_up` now deletes each node's directory (M1). A restart of one node (after a SIGKILL) must keep its `nodes.conf`: 6c2 restarts it with `stack_start` and the same `REDIS_CLUSTER_ARGS`, not through `stack_redis_cluster_up`. `redis/layout` stays the start layout; roles change after a failover.
+- **P6c1I-3 (6c2):** a master that a node suspects (`fail?`) keeps its slots in `stack_redis_slots` until it is marked `fail` (M2). In that window (up to `REDIS_CLUSTER_NODE_TIMEOUT_MS`, 15s) the session check's EVALs for those slots fail and `P_sessions` is null. 6c2 runs the session check after `cluster_state:ok` returns, or names the window.
+- **P6c1I-4 (6c2, 6c3):** new names: `REDIS_CLUSTER_JOIN_TIMEOUT_S` (default 30) and the session check's `"ms"`. Run 33: 7,019ms on the Cluster. The single-Redis cost of the per-slot check (Review Focus 4) is not measured yet: the next single-Redis `reconnect` run records it.
+- **P6c1I-5 (6c3):** run 33's shared Logic set (Logic and 6 nodes, 99–100% busy for ~45s; p99 +7s; `login_queue` refusals up) is the baseline for the `gwconns` shard load and the deadline sizing. 6c3 decides: keep the shared set (as #66) or give the nodes their own CPUs.
+- **P6c1I-6 (6c3):** the per-node baseline for "the `gwconns` shard's p99 ≤ 2× the others'" (R4M-9): `evalsha` p99 119–124µs on all 3 masters; `sadd` landed only on redis-1 and redis-2 (p99 295–319µs). The `gwconns` key's hash tag is the gateway's boot epoch (`keys.go`), so each run puts the 3 gateways' sets on random masters, and one master can hold none. 6c3 reads each epoch key's slot owner at the start and records which master holds which `gwconns` set (or names the run where a master holds none).
