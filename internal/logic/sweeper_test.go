@@ -16,7 +16,7 @@ type sweepEnv struct {
 	t   *testing.T
 	sw  *Sweeper
 	st  Store
-	rdb *redis.Client
+	rdb redis.UniversalClient
 	clk *fakeClock
 	m   *Metrics
 	cfg Config

@@ -100,7 +100,7 @@ func staticDial(addrs map[string]string) DialFunc {
 type kickEnv struct {
 	k   *Kicker
 	st  *store.Store
-	rdb *redis.Client
+	rdb redis.UniversalClient
 	m   *Metrics
 	cfg KickConfig
 }

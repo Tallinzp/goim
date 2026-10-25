@@ -146,8 +146,25 @@ func TestEachReportsInvalidAtOnceAndKeepsOrderInSlices(t *testing.T) {
 }
 
 func TestMasterAddrOnSingleNodeIsOneGroup(t *testing.T) {
+	if testredis.Cluster() {
+		t.Skip("a Cluster run: TestMasterAddrOnClusterIsTheOwner")
+	}
 	s, _ := newStore(t)
 	if a, b := s.masterAddr(ctx, sessKey("u1")), s.masterAddr(ctx, sessKey("u2")); a != "" || b != "" {
 		t.Fatalf("a single node must form the one \"\" group: %q, %q", a, b)
+	}
+}
+
+// Tier 2 Cluster (P5bI-4): runEach groups by the master that owns the key.
+func TestMasterAddrOnClusterIsTheOwner(t *testing.T) {
+	if !testredis.Cluster() {
+		t.Skip("not a Cluster run: TestMasterAddrOnSingleNodeIsOneGroup")
+	}
+	s, rdb := newStore(t)
+	for _, uid := range []string{"a", "b", "c"} { // one on each master
+		key := sessKey(uid)
+		if got, want := s.masterAddr(ctx, key), testredis.MasterOf(t, rdb, key).Options().Addr; got != want {
+			t.Fatalf("masterAddr(%s) = %q, want its owner %q", key, got, want)
+		}
 	}
 }

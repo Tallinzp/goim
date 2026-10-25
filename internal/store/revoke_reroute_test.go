@@ -29,16 +29,17 @@ func failedOverMaster(t *testing.T, reply string) *redis.Client {
 }
 
 // rerouteStore resolves every key to old until the slot map has been reloaded
-// mapAfter times, and to the store's own node after that (mapAfter < 0: never).
-// It returns the store, its own node and the reload counter.
-func rerouteStore(t *testing.T, old *redis.Client, mapAfter int32) (*Store, *redis.Client, *atomic.Int32) {
+// mapAfter times, and to the key's master on the store's own Redis after that
+// (mapAfter < 0: never). It returns the store, its own client and the reload
+// counter.
+func rerouteStore(t *testing.T, old *redis.Client, mapAfter int32) (*Store, redis.UniversalClient, *atomic.Int32) {
 	t.Helper()
 	s, rdb := newStore(t)
 	var reloads atomic.Int32
 	s.reloadSlots = func(context.Context) { reloads.Add(1) }
-	s.masterFor = func(context.Context, string) (*redis.Client, error) {
+	s.masterFor = func(_ context.Context, key string) (*redis.Client, error) {
 		if mapAfter >= 0 && reloads.Load() >= mapAfter {
-			return rdb, nil
+			return testredis.MasterOf(t, rdb, key), nil
 		}
 		return old, nil
 	}
@@ -110,12 +111,12 @@ func TestRevokeGivesUpWhenTheSlotMapDoesNotChange(t *testing.T) {
 	}
 }
 
-// PI-6: a single-node client has no slot map, and ErrNotReplicated or a
+// PI-6: only a cluster client has a slot map, and ErrNotReplicated or a
 // script error is final: neither triggers a re-route.
 func TestRevokeDoesNotRerouteFinalErrors(t *testing.T) {
 	s, _ := newStore(t)
-	if s.reloadSlots != nil {
-		t.Fatal("a single-node client must not get a slot-map reload")
+	if got := s.reloadSlots != nil; got != testredis.Cluster() {
+		t.Fatalf("slot-map reload set = %v, want %v: only a cluster client has one", got, testredis.Cluster())
 	}
 	for _, err := range []error{ErrNotReplicated, context.DeadlineExceeded,
 		redis.Nil /* a Redis reply */, nil} {
