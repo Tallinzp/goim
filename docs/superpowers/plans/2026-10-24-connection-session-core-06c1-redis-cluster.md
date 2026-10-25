@@ -1583,4 +1583,19 @@ Push the branch. Fast-forwarding `main` is the user's call.
 
 ## Execution Notes
 
-(Filled in during execution.)
+**Tasks 1–3 (code) executed 2026-10-24** (inline, superpowers:executing-plans) on `feat/plan6c` from `d4a7a08`: `ed9932c` (Task 1), `48ac535` (Task 2), `3c1db43` (Task 3, `store.sh`). The code is byte-identical to `proto-6c1`.
+- Task 1: the old `testredis` fails vet (`undefined: testredis.Cluster`); on the local Cluster every package passes under `-race` with 0 "TODO: Tier 2" skips; `make test`, `go vet ./...`, `make test-redis-local` green; the four named tests pass, `TestMasterAddrOnSingleNodeIsOneGroup` skips.
+- Task 2: on the old scripts `stack_cluster_test.sh` fails `ports`, `names`, `up: STACK_REDIS=bogus` and stops at `REDIS_MODE: unbound variable`; `reconnect_test.sh` 7 `FAIL`. Then `make test-scripts` green; `stack_cluster_test.sh` has 29 checks and the `0 failure(s)` line (the plan's "30 ok lines" counts that line). The 4 scenarios pin by `stack_redis_names`.
+- Task 3: the Cluster part alone: `mutation: pass`, `policy: noeviction=6`, `unmutated: fail: …` (the reading for an unmutated tree), `parses`.
+
+**Final review (fresh Opus reviewer, 2026-10-24):** 0 Critical, 0 Important, 7 Minor. All 7 fixed on the user's request 2026-10-25 (`898795c`, `66150d5`); each fix but M7 has a check that failed first:
+- M1: `stack_redis_cluster_up` kept an old `nodes.conf` in a reused `STACK_DIR`, so `--cluster create` refused the node. Now each node directory is new (check `up again`).
+- M2: `stack_redis_slots` dropped a master only suspected down (`fail?`). Now only `fail` drops it (check with a fixed `CLUSTER NODES`). Plan 6c2 must still read the map from a live node (Review Focus 3).
+- M3: `TestMasterAddrOnClusterIsTheOwner` compared `MasterForKey` with itself. Now the owner comes from `CLUSTER SHARDS` and the 3 keys need 3 masters (a mutant on both lookups: old test passed, new failed).
+- M4: "sess keys on every master" counted `DBSIZE` (lease, `gwconns`, `gwepochs` keys too). Now it scans `sess:*` (a mutant with `redis-1`'s sess keys deleted, `gwepochs` left: old passed, new failed).
+- M5: the session check's time was not recorded. `rc_sessions` now adds `"ms"` to its JSON (so to `P_sessions`'s detail and the phase field).
+- M6: the join's limit was 300 passes (~45–60s on 2 cores), its message said 30s. Now a clock deadline, `REDIS_CLUSTER_JOIN_TIMEOUT_S` (default 30).
+- M7: `dialCluster` waits 5s, not 2s (it also loads the slot map). No failing test is possible for a timeout value.
+- Not judged by the reviewer (host data): the 23GiB budget with 6 nodes (replicas double the Redis memory), Logic and 6 nodes on 2 CPUs against run 31, the single-mode cost of ~16k one-slot EVALs, `store.sh`'s Docker part.
+
+**Run 32 (2026-10-25, `3c1db43` (before the minor fixes), 147s, setup 8s): 8/8.** `tests` 55s, `no_skips` 0, `mutation` pass (11s), `eviction` `noeviction`; `cluster_tests` 73s, `cluster_no_skips` 0 (`cluster_test_passed` 1), `cluster_mutation` pass, `cluster_eviction` `noeviction=6`. The single run uses the Docker Redis (jemalloc), the Cluster the pinned build (libc malloc): same 7.4.11. Both mutant logs fail `TestRevokeFailsWhenReplicaDoesNotAck` with `want ErrNotReplicated`. P5bI-4 holds: every package passes on a Cluster. `not_covered`: the failover (Plan 6c2) and lost replies after a write.
