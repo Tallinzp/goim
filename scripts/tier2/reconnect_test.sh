@@ -3,7 +3,8 @@
 # rc_sampler lines (make test-scripts): the per-gateway rates, a late
 # scrape, loadgen's run-queue wait, and the funnel reading and its bar
 # (#133, review O3, O6); rc_sessions_cmp (review O4); and rc_heartbeats_ok
-# (the final review's I-1: the ghost allowance). The scenario
+# (the final review's I-1: the ghost allowance); rc_sessions_cmds and
+# rc_sessions_join (Plan 6c1: the session check per slot). The scenario
 # itself runs on the Tier 2 host.
 set -uo pipefail
 cd "$(git rev-parse --show-toplevel)"
@@ -15,7 +16,7 @@ fails=0
 ok() { echo "ok   $1"; }
 bad() { echo "FAIL $1"; fails=$((fails + 1)); }
 expect() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1: got [$2], want [$3]"; fi; }
-eval "$(sed -n '/^rc_series() {/,/^}/p; /^rc_sessions_cmp() {/,/^}/p; /^rc_heartbeats_ok() {/,/^}/p' scripts/tier2/reconnect.sh)"
+eval "$(sed -n '/^rc_series() {/,/^}/p; /^rc_sessions_cmp() {/,/^}/p; /^rc_sessions_cmds() {/,/^}/p; /^rc_sessions_join() {/,/^}/p; /^rc_heartbeats_ok() {/,/^}/p' scripts/tier2/reconnect.sh)"
 
 # gw HANDSHAKE ONLINE PENDING_MEM: one gateway's reading (its Kick closes
 # = ONLINE); line MS SKEW GW0 GW1 [RQ] one sample (loadgen 10 online, the
@@ -48,6 +49,33 @@ expect "series: unreadable" "$(rc_series "$tmp/none.jsonl" 0 100 5)" null
 { line 1000 10 "$(gw 0 1 0)" "$(gw 0 1 0)" 5000000; line 2000 10 "$(gw 0 1 0)" "$(gw 0 1 0)" null
   line 3000 10 "$(gw 0 1 0)" "$(gw 0 1 0)" 9000000; line 4000 10 "$(gw 0 1 0)" "$(gw 0 1 0)" 1000; } >"$tmp/q.jsonl"
 expect "series: run-queue gaps are null" "$(get "$(rc_series "$tmp/q.jsonl" 1000 100 5)" '[r[d["columns"].index("lg_runq_ms_per_s")] for r in d["rows"]]')" "[None, None, None]"
+
+# rc_sessions_cmds: 13 clients u-0..u-12. CLUSTER KEYSLOT sess:{u-12} is
+# 6674 (Redis 7.4.11), so with 6674 alone on redis-1 its file holds u-12's
+# EVAL only; every client is on exactly one line; a slot with no owner fails.
+mkdir -p "$tmp/sc"
+python3 -c 'import json; print(json.dumps({"uid_prefix": "u", "gw": [0] * 13, "gateways": ["gw-0"]}))' >"$tmp/sc/clients.json"
+printf '%s\n' "0 6673 redis-0" "6674 6674 redis-1" "6675 16383 redis-0" >"$tmp/sc/slots.txt"
+rc_sessions_cmds "$tmp/sc/clients.json" "$tmp/sc/slots.txt" "$tmp/sc" && ok "slots: commands written" || bad "slots: commands"
+expect "slots: u-12 alone on its slot's master" "$(cat "$tmp/sc/redis-1.idx" 2>/dev/null)" 12
+expect "slots: one EVAL of one key there" "$(awk '{ print $1, $(NF-1), $NF }' "$tmp/sc/redis-1.cmd" 2>/dev/null)" "EVAL 1 sess:{u-12}"
+expect "slots: each client once" "$(cat "$tmp/sc"/*.idx | sort -n | paste -sd, -)" "$(seq 0 12 | paste -sd, -)"
+expect "slots: each EVAL's key count" "$(awk '{ k = 0; for (i = 1; i <= NF; i++) if ($i ~ /^sess:[{]/) k++; if ($(NF - k) != k) bad++ } END { print bad + 0 }' "$tmp/sc"/*.cmd)" 0
+printf '%s\n' "0 100 redis-0" >"$tmp/sc/short.txt"
+rc_sessions_cmds "$tmp/sc/clients.json" "$tmp/sc/short.txt" "$tmp/sc/none" 2>/dev/null && bad "slots: a slot with no owner must fail" || ok "slots: a slot with no owner fails"
+
+# rc_sessions_join: each node's reply lines go back to their clients; a
+# reply short of its .idx fails.
+mkdir -p "$tmp/sj"
+cp "$tmp/sc/clients.json" "$tmp/sj/"
+printf '%s\n' 3 0 7 >"$tmp/sj/redis-0.idx"
+printf '%s\n' "1|c3" "1|c0" "1|c7" >"$tmp/sj/redis-0.out"
+for i in 1 2 4 5 6 8 9 10 11 12; do echo "$i"; done >"$tmp/sj/redis-1.idx"
+for i in 1 2 4 5 6 8 9 10 11 12; do echo "0|c$i"; done >"$tmp/sj/redis-1.out"
+expect "join: client order" "$(rc_sessions_join "$tmp/sj/clients.json" "$tmp/sj" | head -n 4 | paste -sd' ' -)" "1|c0 0|c1 0|c2 1|c3"
+expect "join: one line per client" "$(rc_sessions_join "$tmp/sj/clients.json" "$tmp/sj" | wc -l)" 13
+head -n 2 "$tmp/sj/redis-0.out" >"$tmp/sj/x" && mv "$tmp/sj/x" "$tmp/sj/redis-0.out"
+rc_sessions_join "$tmp/sj/clients.json" "$tmp/sj" >/dev/null 2>&1 && bad "join: a short reply must fail" || ok "join: a short reply fails"
 
 # rc_sessions_cmp: 7 clients on gw-0/gw-1, the mark at 1000: one good on
 # each gateway, one missing, one with two sessions, one on the wrong

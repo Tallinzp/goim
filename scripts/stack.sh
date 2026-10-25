@@ -1,6 +1,7 @@
 # shellcheck shell=bash
 # stack.sh: a goim stack as local processes for load runs (Plan 6a1, P5bI-1):
-# one redis-server, devtoken serving the JWKS, Logic and N gateways, built
+# one redis-server (or a Redis Cluster, STACK_REDIS=cluster: Plan 6c1),
+# devtoken serving the JWKS, Logic and N gateways, built
 # without -race and run at production timing. Tier 2 scenarios pin it by
 # core type (choice #71); the Tier 1a load probe (Plan 6a2) runs it unpinned.
 # Source it, set STACK_DIR, then:
@@ -25,8 +26,12 @@
 #   stack_counters_delta A B    # {"KEY": B - A, ...} of two stack_counters readings
 #   stack_buckets NAME METRIC   # {"LE": cumulative count, ...} of histogram METRIC on NAME (null: no answer)
 #   stack_hist_quantile A B Q   # Q's bucket bound in ms over two stack_buckets readings (null: no sample)
-#   stack_redis_resetstat       # Redis CONFIG RESETSTAT: a latency window starts
-#   stack_redis_latency         # {"CMD": {"calls", "p50_us", "p99_us", "p999_us"}...} since the reset (null: no answer)
+#   stack_redis_names           # the Redis processes: "redis", or redis-0..5 on a Cluster
+#   stack_redis_node_cli NAME ARGS...  # redis-cli against one Redis process
+#   stack_redis_slots           # "START END NAME" per master's slot range ("0 16383 redis" on one Redis)
+#   stack_redis_resetstat       # Redis CONFIG RESETSTAT on every node: a latency window starts
+#   stack_redis_latency         # {"CMD": {"calls", "p50_us", "p99_us", "p999_us"}...} since the reset (null: no answer);
+#                               #   on a Cluster {NAME: {"role", "zone", "cmds": {"CMD": ...}}...}
 #   stack_down                  # gateways, then Logic, devtoken, Redis (#78); call it from the exit trap
 #   stack_health                # one line per problem: dead process, unclean stop, panic in a log
 #
@@ -34,8 +39,12 @@
 #   STACK_DIR            work dir (required): bin/, keys/, logs/, artifacts/, stack.env
 #   STACK_GATEWAYS       gateways, ids gw-0.. (default 1)
 #   STACK_PORT_BASE      redis +0, devtoken +1, Logic gRPC +2, lease +3, admin +4;
+#                        Cluster node j: +20+j, its bus +30+j;
 #                        gateway i: listen +100+10i, Kick +101+10i, admin +102+10i (default 17000:
 #                        below the race suite's 20000-32000 and the ephemeral range)
+#   STACK_REDIS          single (default): one redis-server; cluster: 3 masters and 3
+#                        replicas (scripts/redis-cluster.sh: zones z0-z2 as labels,
+#                        layout in redis/layout), Logic with -redis-cluster
 #   STACK_PIN            1: taskset gateways to T2_CPUS_GATEWAY, Logic and Redis
 #                        to T2_CPUS_LOGIC (lib.sh sets both); 0: no pinning (default)
 #   STACK_REDIS_SERVER   default: redis-server on PATH, else .cache/redis/bin/redis-server
@@ -54,7 +63,8 @@
 # the same gateway order: GATEWAY_ADDRS (client listeners), GATEWAY_IDS,
 # GATEWAY_ADMINS, GATEWAY_KICK_ADDRS; then GATEWAY_PROCS (each gateway's
 # GOMAXPROCS), NOISE_KEY_ID, NOISE_PUBLIC, JWT_KEY (the devtoken private key
-# file), REDIS_ADDR and LOGIC_ADMIN. Every process is started from this shell
+# file), REDIS_ADDR (on a Cluster the 6 nodes, comma-separated), REDIS_MODE
+# (single or cluster) and LOGIC_ADMIN. Every process is started from this shell
 # in a process group of its own, added to T2_OURS_PGIDS (lib.sh counts it as
 # ours), so a Ctrl-C reaches the run's script, whose teardown stops the stack
 # in order.
@@ -110,6 +120,10 @@ stack_port_free() { timeout 2 bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$0"' "$1" 2>/
 stack_ports() {
   local base=${STACK_PORT_BASE:-17000} i
   seq "$base" $((base + 8))
+  if [ "${STACK_REDIS:-single}" = cluster ]; then
+    seq $((base + 20)) $((base + 25))
+    seq $((base + 30)) $((base + 35))
+  fi
   for ((i = 0; i < ${STACK_GATEWAYS:-1}; i++)); do
     echo $((base + 100 + 10 * i)) $((base + 101 + 10 * i)) $((base + 102 + 10 * i))
   done
@@ -141,6 +155,10 @@ stack_up() {
     return 1
   fi
   [ -x "$redis" ] || { echo "stack: $redis not found (make redis-server)" >&2; return 1; }
+  case ${STACK_REDIS:-single} in
+    single | cluster) ;;
+    *) echo "stack: STACK_REDIS=$STACK_REDIS: want single or cluster" >&2; return 1 ;;
+  esac
   local busy
   busy=$(stack_busy_ports)
   if [ -n "$busy" ]; then
@@ -178,17 +196,24 @@ stack_up() {
   done
   echo "{$kick}" >"$STACK_DIR/kick.json"
 
-  stack_start redis "$logic_cpus" "$redis" --port "$base" --bind 127.0.0.1 --dir "$STACK_DIR/redis" \
-    --save "" --appendonly no --maxmemory-policy noeviction
-  local pong=""
-  for i in $(seq 100); do
-    "$(dirname "$redis")/redis-cli" -p "$base" ping >/dev/null 2>&1 && { pong=1; break; }
-    sleep 0.1
-  done
-  if [ -z "$pong" ]; then
-    echo "stack: redis not answering on port $base within 10s; last log lines:" >&2
-    tail -n 20 "$STACK_DIR/logs/redis.log" >&2
-    return 1
+  if [ "${STACK_REDIS:-single}" = cluster ]; then
+    stack_redis_cluster_up "$redis" "$logic_cpus" || return 1
+    local j
+    redis_addr=""
+    for j in 0 1 2 3 4 5; do redis_addr+="${redis_addr:+,}127.0.0.1:$((base + 20 + j))"; done
+  else
+    stack_start redis "$logic_cpus" "$redis" --port "$base" --bind 127.0.0.1 --dir "$STACK_DIR/redis" \
+      --save "" --appendonly no --maxmemory-policy noeviction
+    local pong=""
+    for i in $(seq 100); do
+      "$(dirname "$redis")/redis-cli" -p "$base" ping >/dev/null 2>&1 && { pong=1; break; }
+      sleep 0.1
+    done
+    if [ -z "$pong" ]; then
+      echo "stack: redis not answering on port $base within 10s; last log lines:" >&2
+      tail -n 20 "$STACK_DIR/logs/redis.log" >&2
+      return 1
+    fi
   fi
   stack_start devtoken "$logic_cpus" "$bin/devtoken" serve -addr "$devtoken" -jwks "$STACK_DIR/keys/jwks.json"
   stack_wait devtoken "http://$devtoken/" || return 1
@@ -198,7 +223,7 @@ stack_up() {
   local logic=("$bin/logic")
   [ -n "${STACK_LOGIC_CPU_QUOTA:-}" ] &&
     logic=(systemd-run --user --scope --quiet -p "CPUQuota=$STACK_LOGIC_CPU_QUOTA" -- "$bin/logic")
-  stack_start logic "$logic_cpus" "${logic[@]}" -redis "$redis_addr" -redis-cluster=false \
+  stack_start logic "$logic_cpus" "${logic[@]}" -redis "$redis_addr" -redis-cluster="$([ "${STACK_REDIS:-single}" = cluster ] && echo true || echo false)" \
     -grpc-addr "$grpc" -lease-addr "$lease" -admin-addr "$admin" \
     -jwks-url "http://$devtoken/" -jwks-fallback "$STACK_DIR/keys/jwks.json" \
     -kick-addr-file "$STACK_DIR/kick.json" "${STACK_LOGIC_ARGS[@]}"
@@ -227,8 +252,33 @@ NOISE_KEY_ID=1
 NOISE_PUBLIC=$pub
 JWT_KEY=$STACK_DIR/keys/jwt.jwk
 REDIS_ADDR=$redis_addr
+REDIS_MODE=${STACK_REDIS:-single}
 LOGIC_ADMIN=$admin
 ENV
+}
+
+# stack_redis_cluster_up SERVER CPUS: the Cluster's 6 nodes (redis-0..5,
+# each a process of its own pinned to CPUS like the single Redis), joined
+# in scripts/redis-cluster.sh's layout; redis/layout gets "NAME PORT ROLE
+# ZONE MASTER" per node, the layout at the start (roles change in a failover).
+stack_redis_cluster_up() {
+  local server=$1 cpus=$2 base=${STACK_PORT_BASE:-17000} j name role zone master ports=()
+  . "$(dirname "${BASH_SOURCE[0]}")/redis-cluster.sh"
+  : >"$STACK_DIR/redis/layout"
+  j=0
+  while read -r name role zone master; do
+    mkdir -p "$STACK_DIR/redis/$name"
+    redis_cluster_args $((base + 20 + j)) $((base + 30 + j)) "$STACK_DIR/redis/$name"
+    stack_start "$name" "$cpus" "$server" "${REDIS_CLUSTER_ARGS[@]}"
+    echo "$name $((base + 20 + j)) $role $zone $master" >>"$STACK_DIR/redis/layout"
+    ports+=($((base + 20 + j)))
+    j=$((j + 1))
+  done < <(redis_cluster_layout)
+  redis_cluster_join "$(dirname "$server")/redis-cli" "${ports[@]}" >"$STACK_DIR/logs/redis-join.log" 2>&1 || {
+    echo "stack: the Redis Cluster did not form; last log lines:" >&2
+    tail -n 20 "$STACK_DIR/logs/redis-join.log" "$STACK_DIR/logs/redis-0.log" >&2
+    return 1
+  }
 }
 
 # stack_admins: "NAME ADMIN" for Logic and each running gateway.
@@ -253,27 +303,72 @@ stack_snapshot() {
     curl -sf "http://$admin/debug/pprof/goroutine?debug=1" >"$dir/$name.goroutine.txt"
   done < <(stack_admins)
   stack_redis_cli info all >"$dir/redis.info" 2>&1
+  if [ "${STACK_REDIS:-single}" = cluster ]; then
+    for name in $(stack_redis_names); do
+      stack_redis_node_cli "$name" info all >"$dir/$name.info" 2>&1
+    done
+    stack_redis_cli cluster nodes >"$dir/cluster-nodes.txt" 2>&1
+  fi
 }
 
-# stack_redis_cli ARGS...: redis-cli against the stack's Redis.
-stack_redis_cli() {
+# stack_redis_names: the Redis processes, "redis" or redis-0..5.
+stack_redis_names() {
+  if [ "${STACK_REDIS:-single}" = cluster ]; then echo redis-0 redis-1 redis-2 redis-3 redis-4 redis-5; else echo redis; fi
+}
+
+# stack_redis_node_cli NAME ARGS...: redis-cli against one Redis process
+# (redis-j on port base + 20 + j), no redirects followed.
+stack_redis_node_cli() {
   local redis=${STACK_REDIS_SERVER:-$(command -v redis-server || echo "$PWD/.cache/redis/bin/redis-server")}
-  "$(dirname "$redis")/redis-cli" -p "${STACK_PORT_BASE:-17000}" "$@"
+  local base=${STACK_PORT_BASE:-17000} port name=$1
+  shift
+  case $name in
+    redis) port=$base ;;
+    redis-[0-5]) port=$((base + 20 + ${name#redis-})) ;;
+    *) echo "stack: no Redis process $name" >&2; return 1 ;;
+  esac
+  "$(dirname "$redis")/redis-cli" -p "$port" "$@"
 }
 
-# stack_redis_resetstat: CONFIG RESETSTAT, so Redis's per-command latency
-# percentiles and call counts cover a window from now (Plan 6b2a-stress).
-stack_redis_resetstat() { [ "$(stack_redis_cli config resetstat 2>/dev/null)" = OK ]; }
+# stack_redis_cli ARGS...: redis-cli against the stack's Redis: the one
+# redis-server, or on a Cluster redis-0 (a key it does not own answers
+# MOVED: per-key commands go through stack_redis_slots, review P6b3c2I-3).
+stack_redis_cli() {
+  if [ "${STACK_REDIS:-single}" = cluster ]; then stack_redis_node_cli redis-0 "$@"; else stack_redis_node_cli redis "$@"; fi
+}
 
-# stack_redis_latency: Redis's own per-command latency since the last
-# resetstat, from INFO latencystats (p50, p99 and p99.9 in µs, Redis 7's
+# stack_redis_slots: "START END NAME" for each master's slot range, from
+# CLUSTER NODES as redis-0 sees it now (after a failover too); "0 16383
+# redis" on one Redis. Prints nothing if Redis does not answer.
+stack_redis_slots() {
+  if [ "${STACK_REDIS:-single}" != cluster ]; then
+    stack_redis_cli ping >/dev/null 2>&1 && echo "0 16383 redis"
+    return
+  fi
+  stack_redis_cli cluster nodes 2>/dev/null | awk -v base="${STACK_PORT_BASE:-17000}" '
+    $3 ~ /master/ && $3 !~ /fail/ {
+      split($2, a, "[:@]"); name = "redis-" (a[2] - base - 20)
+      for (i = 9; i <= NF; i++) { if ($i ~ /^\[/) continue; n = split($i, r, "-"); print r[1], r[n], name } }' | sort -n
+}
+
+# stack_redis_resetstat: CONFIG RESETSTAT on every Redis process, so their
+# per-command latency percentiles and call counts cover a window from now
+# (Plan 6b2a-stress). Fails if any node did not answer OK.
+stack_redis_resetstat() {
+  local name
+  for name in $(stack_redis_names); do
+    [ "$(stack_redis_node_cli "$name" config resetstat 2>/dev/null)" = OK ] || return 1
+  done
+}
+
+# stack_redis_node_latency NAME: one node's per-command latency since the
+# last resetstat, from INFO latencystats (p50, p99 and p99.9 in µs, Redis 7's
 # defaults) and the calls from INFO commandstats, as {"CMD": {"calls",
-# "p50_us", "p99_us", "p999_us"}, ...}: the single Redis's p99 for the
-# spec's per-shard numbers (R4M-9), which need a Cluster (6c). The readers'
-# own INFO and CONFIG are left out. Prints null if Redis does not answer.
-stack_redis_latency() {
+# "p50_us", "p99_us", "p999_us"}, ...}. The readers' own INFO and CONFIG
+# are left out. Prints null if the node does not answer.
+stack_redis_node_latency() {
   local info
-  info=$(stack_redis_cli info latencystats 2>/dev/null && stack_redis_cli info commandstats 2>/dev/null) &&
+  info=$(stack_redis_node_cli "$1" info latencystats 2>/dev/null && stack_redis_node_cli "$1" info commandstats 2>/dev/null) &&
     grep -q '^# Latencystats' <<<"$info" || { echo null; return; }
   awk -F'[:,=]' '{ sub(/\r$/, "") }
     /^latency_percentiles_usec_/ { c = substr($1, 26); p50[c] = $3; p99[c] = $5; p999[c] = $7; cmd[++n] = c }
@@ -281,9 +376,31 @@ stack_redis_latency() {
     END { out = ""
           for (i = 1; i <= n; i++) {
             c = cmd[i]
-            if (c == "info" || index(c, "config") == 1) continue
+            if (c == "info" || index(c, "config") == 1 || index(c, "cluster") == 1) continue
             out = out (out == "" ? "" : ", ") sprintf("\"%s\": {\"calls\": %d, \"p50_us\": %s, \"p99_us\": %s, \"p999_us\": %s}", c, calls[c], p50[c], p99[c], p999[c]) }
           print "{" out "}" }' <<<"$info"
+}
+
+# stack_redis_latency: stack_redis_node_latency of the one Redis; on a
+# Cluster, per node with its role now (master or replica) and its zone from
+# redis/layout: {NAME: {"role", "zone", "cmds": {...}}, ...}, the per-shard
+# numbers the spec asks for (R4M-9). Prints null if no node answers; a node
+# that does not answer is null.
+stack_redis_latency() {
+  [ "${STACK_REDIS:-single}" = cluster ] || { stack_redis_node_latency redis; return; }
+  local name role zone cmds out="" any=""
+  for name in $(stack_redis_names); do
+    cmds=$(stack_redis_node_latency "$name")
+    role=$(stack_redis_node_cli "$name" info replication 2>/dev/null | tr -d '\r' | sed -n 's/^role://p')
+    zone=$(awk -v n="$name" '$1 == n { print $4 }' "$STACK_DIR/redis/layout" 2>/dev/null)
+    if [ "$cmds" = null ]; then
+      out+="${out:+, }\"$name\": null"
+    else
+      any=1
+      out+="${out:+, }\"$name\": {\"role\": \"$([ "$role" = slave ] && echo replica || echo "${role:-unknown}")\", \"zone\": \"$zone\", \"cmds\": $cmds}"
+    fi
+  done
+  if [ -n "$any" ]; then echo "{$out}"; else echo null; fi
 }
 
 # stack_profile NAME SECONDS: a CPU profile of Logic and every running
@@ -611,9 +728,16 @@ stack_down() {
     [[ $name == gw-* ]] && gws+=("$name")
   done
   [ ${#gws[@]} -gt 0 ] && stack_term "${STACK_DOWN_WAIT:-10}" "${gws[@]}"
-  for name in logic devtoken redis; do
+  for name in logic devtoken; do
     [ -n "${STACK_PIDS[$name]:-}" ] && stack_term 5 "$name"
   done
+  # Redis last; a Cluster's nodes together, so no replica is left to
+  # fail over a stopped master.
+  local rs=()
+  for name in "${STACK_ORDER[@]}"; do
+    [[ $name == redis || $name == redis-* ]] && rs+=("$name")
+  done
+  [ ${#rs[@]} -gt 0 ] && stack_term 5 "${rs[@]}"
   STACK_ORDER=()
   STACK_PIDS=()
 }
