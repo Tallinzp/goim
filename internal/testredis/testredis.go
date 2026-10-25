@@ -125,7 +125,9 @@ func dial(t testing.TB, addr string) *redis.Client {
 func dialCluster(t testing.TB, addrs []string) *redis.ClusterClient {
 	t.Helper()
 	c := redis.NewClusterClient(&redis.ClusterOptions{Addrs: addrs})
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	// 5s, not dial's 2s: the first call also loads the slot map, and the
+	// race suite's packages run in parallel on 2 cores.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := c.ForEachShard(ctx, func(ctx context.Context, n *redis.Client) error { return n.Ping(ctx).Err() }); err != nil {
 		t.Fatalf("test Redis Cluster not reachable at %v (make test-redis-cluster-local): %v", addrs, err)

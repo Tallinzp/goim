@@ -35,6 +35,23 @@ expect "names: redis-0..5" "$(stack_redis_names)" "redis-0 redis-1 redis-2 redis
 out=$(STACK_REDIS=bogus; stack_up 2>&1) && bad "up: STACK_REDIS=bogus must fail" ||
   case $out in *"want single or cluster"*) ok "up: an unknown STACK_REDIS is refused" ;; *) bad "up: STACK_REDIS=bogus: [$out]" ;; esac
 
+# The join gives up at REDIS_CLUSTER_JOIN_TIMEOUT_S and says so: a fake
+# redis-cli that answers nothing never forms a Cluster.
+printf '#!/bin/sh\nexit 0\n' >"$STACK_DIR/fake-cli" && chmod +x "$STACK_DIR/fake-cli"
+t=$SECONDS
+out=$(. scripts/redis-cluster.sh; REDIS_CLUSTER_JOIN_TIMEOUT_S=2 redis_cluster_join "$STACK_DIR/fake-cli" 1 2 3 4 5 6 2>&1) && bad "join: a Cluster that never forms must fail" || {
+  case $out in *"within 2s"*) [ $((SECONDS - t)) -le 4 ] && ok "join: gives up at its timeout" || bad "join: took $((SECONDS - t))s for a 2s timeout" ;;
+    *) bad "join: timeout message: [$out]" ;; esac
+}
+# stack_redis_slots keeps a master that a node only suspects (fail?) and
+# drops one marked fail.
+nodes="a 127.0.0.1:$((b + 20))@$((b + 30)) myself,master - 0 0 1 connected 0-5460
+b 127.0.0.1:$((b + 21))@$((b + 31)) master,fail? - 0 0 2 connected 5461-10922
+c 127.0.0.1:$((b + 22))@$((b + 32)) master,fail - 0 0 3 connected 10923-16383
+d 127.0.0.1:$((b + 23))@$((b + 33)) slave a 0 0 1 connected"
+expect "slots: a suspected master keeps its range, a failed one does not" \
+  "$(stack_redis_cli() { echo "$nodes"; }; stack_redis_slots | paste -sd' ' -)" "0 5460 redis-0 5461 10922 redis-1"
+
 stack_build || { echo "build failed"; exit 1; }
 if stack_up; then ok "up: every process Ready"; else bad "up"; exit 1; fi
 . "$STACK_DIR/stack.env"
@@ -53,8 +70,9 @@ expect "slots: 3 ranges, 0-16383, one per master" "$(stack_redis_slots | paste -
 
 stack_redis_resetstat && ok "redis: resetstat on every node" || bad "redis: resetstat"
 lg_start c -mode light -clients 30 -rate 100 -uid-prefix sc && lg_wait_online 30 30 && ok "loadgen: 30 online" || bad "loadgen: not online"
-# 30 uids over 3 masters: each gets some (all on two: p ~ 1.5e-5).
-expect "logins: sess keys on every master" "$(for j in 0 1 2; do [ "$(stack_redis_node_cli redis-$j dbsize)" -gt 0 ] && echo y; done | wc -l)" 3
+# 30 uids over 3 masters: each gets some (all on two: p ~ 1.5e-5). Only
+# sess keys count: DBSIZE would also count lease and gwconns keys.
+expect "logins: sess keys on every master" "$(for j in 0 1 2; do [ -n "$(stack_redis_node_cli redis-$j --scan --pattern 'sess:*' | head -n 1)" ] && echo y; done | wc -l)" 3
 lat=$(stack_redis_latency)
 expect "latency: every node, its role and zone" "$(get "$lat" '[(n, d[n]["role"], d[n]["zone"]) for n in sorted(d)]')" \
   "[('redis-0', 'master', 'z0'), ('redis-1', 'master', 'z1'), ('redis-2', 'master', 'z2'), ('redis-3', 'replica', 'z1'), ('redis-4', 'replica', 'z2'), ('redis-5', 'replica', 'z0')]"
@@ -63,6 +81,7 @@ expect "latency: no reader's own commands" "$(get "$lat" 'any(k == "info" or k.s
 mkdir -p "$STACK_DIR/artifacts"
 s=$(rc_sessions 0)
 expect "sessions: every client found per slot" "$(get "$s" '(d["clients"], d["found"])')" "(30, 30)"
+expect "sessions: the check's time is recorded" "$(get "$s" 'd.get("ms", -1) >= 0')" True
 expect "sessions: no CROSSSLOT" "$(cat "$STACK_DIR/sessions"/*.out | grep -c CROSSSLOT)" 0
 stack_snapshot snap
 for f in redis-0.info redis-5.info cluster-nodes.txt; do
@@ -80,6 +99,12 @@ left=0
 for p in "${pids[@]}"; do kill -0 "$p" 2>/dev/null && left=$((left + 1)); done
 expect "down: no process left" "$left" 0
 expect "down: no port left" "$(stack_busy_ports)" ""
+
+# A second stack_up in the same STACK_DIR forms a new Cluster: the old
+# nodes.conf files must not survive.
+if stack_up >"$STACK_DIR/up2.log" 2>&1; then ok "up again: the same STACK_DIR forms a Cluster"; else bad "up again: $(tail -n 3 "$STACK_DIR/up2.log" | paste -sd' ' -)"; fi
+expect "up again: 3 ranges" "$(stack_redis_slots | wc -l)" 3
+stack_down
 
 echo "$fails failure(s)"
 [ "$fails" -eq 0 ]

@@ -12,7 +12,8 @@
 #                                 #   every node reports cluster_state:ok and every replica is linked
 #
 # Settings: REDIS_CLUSTER_NODE_TIMEOUT_MS (cluster-node-timeout, default
-# 15000, Redis's default; Plan 6c2 measures the failover it gives).
+# 15000, Redis's default; Plan 6c2 measures the failover it gives);
+# REDIS_CLUSTER_JOIN_TIMEOUT_S (how long the join waits, default 30).
 
 redis_cluster_layout() {
   printf '%s\n' "redis-0 master z0 -" "redis-1 master z1 -" "redis-2 master z2 -" \
@@ -32,9 +33,9 @@ redis_cluster_args() {
 
 # redis_cluster_join CLI P0 P1 P2 P3 P4 P5: P0-P2 become the masters (slots
 # split evenly by redis-cli), P3-P5 the replicas of P0-P2 in that order.
-# Fails, naming what did not happen, after 30s.
+# Fails, naming what did not happen, after REDIS_CLUSTER_JOIN_TIMEOUT_S.
 redis_cluster_join() {
-  local cli=$1 i p id ok
+  local cli=$1 i p id ok deadline
   shift
   local ports=("$@")
   [ ${#ports[@]} -eq 6 ] || { echo "redis-cluster: want 6 ports, got ${#ports[@]}" >&2; return 1; }
@@ -54,7 +55,8 @@ redis_cluster_join() {
       --cluster-slave --cluster-master-id "$id" >/dev/null ||
       { echo "redis-cluster: replica on port ${ports[i + 3]} not added" >&2; return 1; }
   done
-  for i in $(seq 300); do
+  deadline=$((SECONDS + ${REDIS_CLUSTER_JOIN_TIMEOUT_S:-30}))
+  while :; do
     ok=1
     # Every node must also see the 3 replicas: gossip spreads the new roles
     # after the replicas link, and a client that loads the slot map from a
@@ -67,9 +69,10 @@ redis_cluster_join() {
       "$cli" -p "$p" info replication 2>/dev/null | grep -q '^master_link_status:up' || ok=""
     done
     [ -n "$ok" ] && return 0
+    [ "$SECONDS" -ge "$deadline" ] && break
     sleep 0.1
   done
-  echo "redis-cluster: not every node reports cluster_state:ok with its replicas linked within 30s" >&2
+  echo "redis-cluster: not every node reports cluster_state:ok with its replicas linked within ${REDIS_CLUSTER_JOIN_TIMEOUT_S:-30}s" >&2
   "$cli" -p "${ports[0]}" cluster nodes >&2
   return 1
 }

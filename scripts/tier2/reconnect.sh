@@ -406,7 +406,9 @@ for i, (g, l) in enumerate(zip(gw, lines)):
             r["examples"].append(["%s-%d" % (c["uid_prefix"], i), why])
     else:
         r["found"] += 1
-print(json.dumps(r))' "$1" "$2" "$3" 2>/dev/null || echo null
+if len(sys.argv) > 4:
+    r["ms"] = int(sys.argv[4])
+print(json.dumps(r))' "$@" 2>/dev/null || echo null
 }
 
 # rc_sessions_cmds CLIENTS SLOTS DIR: the session check's commands. Each
@@ -469,7 +471,8 @@ print("\n".join(lines))' "$@"
 # client's sess key, read per slot on each key's master (rc_sessions_cmds):
 # at 600k ~16k short scripts after the hold, on one Redis or a Cluster alike.
 rc_sessions() {
-  local a=$STACK_DIR/artifacts d=$STACK_DIR/sessions f name
+  local a=$STACK_DIR/artifacts d=$STACK_DIR/sessions f name t0
+  t0=$(date +%s%3N)
   curl -sf -m 60 "http://$(lg_control)/clients" >"$a/clients.json" || { echo null; return; }
   rm -rf "$d" && mkdir -p "$d"
   stack_redis_slots >"$d/slots.txt"
@@ -479,7 +482,7 @@ rc_sessions() {
     stack_redis_node_cli "$name" --raw <"$f" >"$d/$name.out" 2>&1
   done
   rc_sessions_join "$a/clients.json" "$d" >"$a/sessions.txt" 2>>"$a/sessions.err" || { echo null; return; }
-  rc_sessions_cmp "$a/clients.json" "$a/sessions.txt" "$1"
+  rc_sessions_cmp "$a/clients.json" "$a/sessions.txt" "$1" $(($(date +%s%3N) - t0))
 }
 
 t=$SECONDS

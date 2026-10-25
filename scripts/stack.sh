@@ -267,7 +267,9 @@ stack_redis_cluster_up() {
   : >"$STACK_DIR/redis/layout"
   j=0
   while read -r name role zone master; do
-    mkdir -p "$STACK_DIR/redis/$name"
+    # A fresh node directory: an old nodes.conf (a STACK_DIR used again)
+    # holds the old Cluster, and --cluster create refuses such a node.
+    rm -rf "${STACK_DIR:?}/redis/$name" && mkdir -p "$STACK_DIR/redis/$name"
     redis_cluster_args $((base + 20 + j)) $((base + 30 + j)) "$STACK_DIR/redis/$name"
     stack_start "$name" "$cpus" "$server" "${REDIS_CLUSTER_ARGS[@]}"
     echo "$name $((base + 20 + j)) $role $zone $master" >>"$STACK_DIR/redis/layout"
@@ -338,7 +340,8 @@ stack_redis_cli() {
 }
 
 # stack_redis_slots: "START END NAME" for each master's slot range, from
-# CLUSTER NODES as redis-0 sees it now (after a failover too); "0 16383
+# CLUSTER NODES as redis-0 sees it now (after a failover too; a master
+# only suspected, "fail?", keeps its range until it is marked "fail"); "0 16383
 # redis" on one Redis. Prints nothing if Redis does not answer.
 stack_redis_slots() {
   if [ "${STACK_REDIS:-single}" != cluster ]; then
@@ -346,7 +349,7 @@ stack_redis_slots() {
     return
   fi
   stack_redis_cli cluster nodes 2>/dev/null | awk -v base="${STACK_PORT_BASE:-17000}" '
-    $3 ~ /master/ && $3 !~ /fail/ {
+    $3 ~ /master/ && $3 !~ /(^|,)fail(,|$)/ {
       split($2, a, "[:@]"); name = "redis-" (a[2] - base - 20)
       for (i = 9; i <= NF; i++) { if ($i ~ /^\[/) continue; n = split($i, r, "-"); print r[1], r[n], name } }' | sort -n
 }

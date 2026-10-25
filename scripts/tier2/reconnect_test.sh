@@ -87,6 +87,8 @@ c=$(rc_sessions_cmp "$tmp/clients.json" "$tmp/sessions.txt" 1000)
 expect "sessions: counts" "$(get "$c" '[d[k] for k in ("clients", "found", "missing", "extra", "wrong_gateway", "stale", "offline")]')" "[7, 2, 1, 1, 1, 1, 1]"
 expect "sessions: examples" "$(get "$c" 'd["examples"]')" "[['u-2', 'missing'], ['u-3', 'extra'], ['u-4', 'wrong_gateway'], ['u-5', 'stale'], ['u-6', 'offline']]"
 head -n 3 "$tmp/sessions.txt" >"$tmp/short.txt"
+expect "sessions: the check's time" "$(get "$(rc_sessions_cmp "$tmp/clients.json" "$tmp/sessions.txt" 1000 1234)" 'd["ms"]')" 1234
+expect "sessions: no time given" "$(get "$c" '"ms" in d')" False
 expect "sessions: too few lines" "$(rc_sessions_cmp "$tmp/clients.json" "$tmp/short.txt" 1000)" null
 { cat "$tmp/sessions.txt"; echo "ERR something"; } >"$tmp/long.txt"
 expect "sessions: too many lines" "$(rc_sessions_cmp "$tmp/clients.json" "$tmp/long.txt" 1000)" null
