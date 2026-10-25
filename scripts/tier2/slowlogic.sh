@@ -284,7 +284,7 @@ want_max="$(python3 -c 'import sys; print(round(float(sys.argv[1]) * 100000))' "
 gomaxprocs=$(stack_metric logic go_sched_gomaxprocs_threads)
 wrong=""
 for g in gw-0 gw-1; do stack_pinned "$g" "$T2_CPUS_GATEWAY" || wrong+=" $g"; done
-for n in logic redis; do stack_pinned "$n" "$T2_CPUS_LOGIC" || wrong+=" $n"; done
+for n in logic $(stack_redis_names); do stack_pinned "$n" "$T2_CPUS_LOGIC" || wrong+=" $n"; done
 scope=false
 [ "$cpu_max" = "$want_max" ] && [ -z "$wrong" ] && scope=true
 t2_check slow_scope "$scope" \

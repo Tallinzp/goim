@@ -70,6 +70,9 @@
 #                         Pong, or its 10s Pong timeout); ghost holds at
 #                         least until DeadAfter + 5s after the mark
 #   RECONNECT_FUNNEL_BAR_S  the funnel's bar, seconds in a row (default 5)
+#   RECONNECT_REDIS       single (default, run 31's) or cluster: 3 masters and
+#                         3 replicas on the Logic set (stack.sh STACK_REDIS,
+#                         Plan 6c1); P.redis_latency is then per node
 #   RECONNECT_LG_MEMLIMIT loadgen's GOMEMLIMIT (default 16GiB, as b_stress)
 #   RECONNECT_CPUS_LOADGEN, RECONNECT_CPUS_GATEWAY, RECONNECT_CPUS_LOGIC
 #                         the CPU sets (default b_stress's: 0-5,10,12-17,22;
@@ -146,6 +149,7 @@ for v in RECONNECT_CLIENTS RECONNECT_RATE RECONNECT_HEARTBEAT RECONNECT_CAP RECO
   RECONNECT_BACK_WAIT RECONNECT_HOLD RECONNECT_GATEWAY_PROCS RECONNECT_FUNNEL_BAR_S; do
   case ${!v-1} in ''|*[!0-9]*|0*) echo "reconnect: $v must be a positive whole number" >&2; exit 1 ;; esac
 done
+case ${RECONNECT_REDIS:-single} in single | cluster) ;; *) echo "reconnect: RECONNECT_REDIS must be single or cluster" >&2; exit 1 ;; esac
 HB=${RECONNECT_HEARTBEAT:-30}
 [ "$HB" -ge 30 ] && [ "$HB" -le 300 ] || { echo "reconnect: RECONNECT_HEARTBEAT must be 30 to 300 (the gateway's -heartbeat)" >&2; exit 1; }
 N=${RECONNECT_CLIENTS:-600000} RATE=${RECONNECT_RATE:-5000}
@@ -162,7 +166,7 @@ t2_mem_budget 23
 # loadgen's fds, over the host's former 1,048,576 (#136.5, host-setup.sh).
 case " $PHASES " in *" ghost "*) t2_nofile 2097152 ;; *) t2_nofile 1048576 ;; esac
 
-export STACK_PIN=1 STACK_GATEWAYS=3
+export STACK_PIN=1 STACK_GATEWAYS=3 STACK_REDIS=${RECONNECT_REDIS:-single}
 export T2_CPUS_GATEWAY=${RECONNECT_CPUS_GATEWAY:-6-9,18-21} T2_CPUS_LOADGEN=${RECONNECT_CPUS_LOADGEN:-0-5,10,12-17,22}
 export T2_CPUS_LOGIC=${RECONNECT_CPUS_LOGIC:-11,23}
 export STACK_GATEWAY_PROCS=${RECONNECT_GATEWAY_PROCS:-4}
@@ -405,20 +409,76 @@ for i, (g, l) in enumerate(zip(gw, lines)):
 print(json.dumps(r))' "$1" "$2" "$3" 2>/dev/null || echo null
 }
 
-# rc_sessions MARK_MS: rc_sessions_cmp over loadgen's /clients and every
-# client's sess key, read in EVALs of 500 keys (HVALS each) through one
-# redis-cli: ~1,200 short scripts on the one Redis after the hold.
-rc_sessions() {
-  local a=$STACK_DIR/artifacts
-  curl -sf -m 60 "http://$(lg_control)/clients" >"$a/clients.json" || { echo null; return; }
+# rc_sessions_cmds CLIENTS SLOTS DIR: the session check's commands. Each
+# client's sess key goes to the master that owns its slot (SLOTS:
+# stack_redis_slots's "START END NAME" lines), in one EVAL per slot (HVALS
+# each; ~37 keys at 600k): a Cluster refuses a script whose keys span slots
+# (CROSSSLOT, review P6b3c2I-3). Writes DIR/NAME.cmd and DIR/NAME.idx (the
+# client index of each output line, in order) per master; fails if a slot
+# has no owner.
+rc_sessions_cmds() {
   python3 -c 'import json, sys
 c = json.load(open(sys.argv[1]))
+ranges = [(int(a), int(b), n) for a, b, n in (l.split() for l in open(sys.argv[2]) if l.strip())]
+out = sys.argv[3]
+def crc16(b):  # CRC16-XMODEM, Redis Cluster key slots
+    r = 0
+    for x in b:
+        r ^= x << 8
+        for _ in range(8):
+            r = ((r << 1) ^ 0x1021 if r & 0x8000 else r << 1) & 0xFFFF
+    return r
 lua = "local r = {} for i, k in ipairs(KEYS) do local v = redis.call(\"HVALS\", k) r[i] = #v .. \"|\" .. (v[1] or \"\") end return r"
-keys = ["sess:{%s-%d}" % (c["uid_prefix"], i) for i in range(len(c["gw"]))]
-for j in range(0, len(keys), 500):
-    b = keys[j:j + 500]
-    print("EVAL %s %d %s" % (json.dumps(lua), len(b), " ".join(b)))' "$a/clients.json" >"$STACK_DIR/sessions.cmd" || { echo null; return; }
-  stack_redis_cli --raw <"$STACK_DIR/sessions.cmd" >"$a/sessions.txt" 2>&1
+slots = {}
+for i in range(len(c["gw"])):
+    uid = "%s-%d" % (c["uid_prefix"], i)
+    slots.setdefault(crc16(uid.encode()) % 16384, []).append(i)
+files = {}
+for slot in sorted(slots):
+    name = next((n for a, b, n in ranges if a <= slot <= b), None)
+    if name is None:
+        raise SystemExit("slot %d has no owner" % slot)
+    if name not in files:
+        files[name] = (open("%s/%s.cmd" % (out, name), "w"), open("%s/%s.idx" % (out, name), "w"))
+    cmd, idx = files[name]
+    b = slots[slot]
+    cmd.write("EVAL %s %d %s\n" % (json.dumps(lua), len(b), " ".join("sess:{%s-%d}" % (c["uid_prefix"], i) for i in b)))
+    idx.write("".join("%d\n" % i for i in b))' "$@"
+}
+
+# rc_sessions_join CLIENTS DIR: the replies (DIR/NAME.out, one line per key)
+# put back in client order, the SESSIONS lines rc_sessions_cmp reads. Fails
+# if a reply's line count is not its NAME.idx's or a client has no line.
+rc_sessions_join() {
+  python3 -c 'import glob, json, sys
+n = len(json.load(open(sys.argv[1]))["gw"])
+lines = [None] * n
+for f in glob.glob(sys.argv[2] + "/*.idx"):
+    idx = [int(x) for x in open(f).read().split()]
+    out = open(f[:-4] + ".out").read().splitlines()
+    if len(out) != len(idx):
+        raise SystemExit(1)
+    for i, l in zip(idx, out):
+        lines[i] = l
+if None in lines:
+    raise SystemExit(1)
+print("\n".join(lines))' "$@"
+}
+
+# rc_sessions MARK_MS: rc_sessions_cmp over loadgen's /clients and every
+# client's sess key, read per slot on each key's master (rc_sessions_cmds):
+# at 600k ~16k short scripts after the hold, on one Redis or a Cluster alike.
+rc_sessions() {
+  local a=$STACK_DIR/artifacts d=$STACK_DIR/sessions f name
+  curl -sf -m 60 "http://$(lg_control)/clients" >"$a/clients.json" || { echo null; return; }
+  rm -rf "$d" && mkdir -p "$d"
+  stack_redis_slots >"$d/slots.txt"
+  rc_sessions_cmds "$a/clients.json" "$d/slots.txt" "$d" 2>"$a/sessions.err" || { echo null; return; }
+  for f in "$d"/*.cmd; do
+    name=$(basename "$f" .cmd)
+    stack_redis_node_cli "$name" --raw <"$f" >"$d/$name.out" 2>&1
+  done
+  rc_sessions_join "$a/clients.json" "$d" >"$a/sessions.txt" 2>>"$a/sessions.err" || { echo null; return; }
   rc_sessions_cmp "$a/clients.json" "$a/sessions.txt" "$1"
 }
 
@@ -450,7 +510,7 @@ for name in $PHASES; do
   t2_check "${name}_online" "$online" "\"want\": $N, \"online\": $(lg_get /stats 'd["online"]'), \"by_gateway\": $(lg_get /stats 'd["online_by_gateway"]'), \"ramp_s\": $ramp_s, \"failed\": $(lg_get /stats 'd["failed"]')"
   wrong=""
   for ((i = 0; i < STACK_GATEWAYS; i++)); do stack_pinned "gw-$i" "$T2_CPUS_GATEWAY" || wrong+=" gw-$i"; done
-  for n in logic redis; do stack_pinned "$n" "$T2_CPUS_LOGIC" || wrong+=" $n"; done
+  for n in logic $(stack_redis_names); do stack_pinned "$n" "$T2_CPUS_LOGIC" || wrong+=" $n"; done
   have=$(taskset -pc "$LG_PID" 2>/dev/null)
   [ "$(t2_cpulist_expand "${have##*: }")" = "$(t2_cpulist_expand "$T2_CPUS_LOADGEN")" ] || wrong+=" loadgen"
   t2_check "${name}_pinning" "$(t2_bool [ -z "$wrong" ])" "\"gateway_cpus\": $(t2_json_str "$T2_CPUS_GATEWAY"), \"logic_cpus\": $(t2_json_str "$T2_CPUS_LOGIC"), \"loadgen_cpus\": $(t2_json_str "$T2_CPUS_LOADGEN"), \"gateway_procs\": $STACK_GATEWAY_PROCS, \"wrong\": $(t2_json_str "${wrong# }")"
@@ -585,7 +645,7 @@ for name in $PHASES; do
   # "reset" is the drop's reply: /reset's {"mark", "population", "close_ms"},
   # in ghost /ghost's {"mark", "population", "ms"} (the ghosting time, not
   # a close time). The name stays as run 31 recorded it (P6b3c2I-2).
-  t2_field "$name" "{\"clients\": $N, \"rate\": $RATE, \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"gateway_procs\": $STACK_GATEWAY_PROCS, \"loadgen_env\": $(t2_json_str "${LG_ENV[*]}"), \"ramp_s\": $ramp_s, \"ramp\": $ramp, \"precompute_at_mark\": $precompute, \"reset\": ${reply:-null}, \"network_change\": $nc, \"network_change_after_ms\": $nc_after_ms, \"back_s\": $back_s, \"hold_s\": $HOLD, \"window_s\": $window_s, \"storm\": $storm, \"storm_first30\": $storm30, \"loadgen_bound\": $loadgen_bound, \"slo\": $(cat "$slo"), \"loadgen\": $st, \"gateways\": $d, \"logic\": $ld, \"cpu_sets\": $cpu_sets, \"tcp\": $(t2_tcpstat_json "$STACK_DIR/tcpstat-2" "$STACK_DIR/tcpstat-3"), \"series\": $series, \"redis_latency\": ${redis:-null}, \"redis_reset\": $redis_reset, \"ghosts\": ${gh:-null}, \"sessions\": ${sessions:-null}, \"stop_s\": $stop_s, \"loadgen_exit\": $LG_STATUS}"
+  t2_field "$name" "{\"clients\": $N, \"rate\": $RATE, \"redis\": \"$STACK_REDIS\", \"gateway_args\": $(t2_json_str "${STACK_GATEWAY_ARGS[*]}"), \"gateway_procs\": $STACK_GATEWAY_PROCS, \"loadgen_env\": $(t2_json_str "${LG_ENV[*]}"), \"ramp_s\": $ramp_s, \"ramp\": $ramp, \"precompute_at_mark\": $precompute, \"reset\": ${reply:-null}, \"network_change\": $nc, \"network_change_after_ms\": $nc_after_ms, \"back_s\": $back_s, \"hold_s\": $HOLD, \"window_s\": $window_s, \"storm\": $storm, \"storm_first30\": $storm30, \"loadgen_bound\": $loadgen_bound, \"slo\": $(cat "$slo"), \"loadgen\": $st, \"gateways\": $d, \"logic\": $ld, \"cpu_sets\": $cpu_sets, \"tcp\": $(t2_tcpstat_json "$STACK_DIR/tcpstat-2" "$STACK_DIR/tcpstat-3"), \"series\": $series, \"redis_latency\": ${redis:-null}, \"redis_reset\": $redis_reset, \"ghosts\": ${gh:-null}, \"sessions\": ${sessions:-null}, \"stop_s\": $stop_s, \"loadgen_exit\": $LG_STATUS}"
   t2_duration "$name" $((SECONDS - t0))
 
   a=$STACK_DIR/artifacts
@@ -602,7 +662,6 @@ t2_check artifacts "$(t2_bool [ -z "$missing" ])" "\"missing\": $(t2_json_str "$
 t2_not_covered "the drop as an LB restart or failover: Tier 2's LB is loadgen's in-process balancer (#134); Tier 3 (Plan 6d)" \
   "a carrier or regional network recovering for part of the population: ghost drops every client (the spec's worst case)" \
   "heartbeat Pong times: SDK clients record a Pong only by its absence (the 10s Pong timeout), not its delay" \
-  "per-shard Redis load with the gwconns shards marked (one redis-server, its per-command latency in P.redis_latency; Redis Cluster in Plan 6c)" \
-  "the session check in Redis Cluster: its EVALs read 500 keys of many slots (one redis-server here)" \
+  "$([ "$STACK_REDIS" = cluster ] && echo "the gwconns shards marked in P.redis_latency (Plan 6c3)" || echo "per-shard Redis load (one redis-server, its per-command latency in P.redis_latency; RECONNECT_REDIS=cluster for a Cluster)")" \
   "the network change at once: /network-change calls each client in turn (64 workers, each waits for the client's run loop); at 600k it took 27-36s in run 31, after most storm waits ended; several loadgens at Tier 3 (Plan 6d)"
 t2_finish

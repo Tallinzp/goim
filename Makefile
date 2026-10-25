@@ -30,6 +30,7 @@ test-scripts:
 	scripts/tier2/reconnect_test.sh
 	scripts/loadgen_test.sh
 	STACK_REDIS_SERVER=$(REDIS_SERVER) scripts/stack_test.sh
+	STACK_REDIS_SERVER=$(REDIS_SERVER) scripts/stack_cluster_test.sh
 	GOIM_REDIS_SERVER=$(REDIS_SERVER) scripts/deploy_test.sh
 
 # The Tier 1a load probe (Plan 6a2, spec: ≤ 5k connections), on the dev
