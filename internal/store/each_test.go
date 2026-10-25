@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -156,15 +157,49 @@ func TestMasterAddrOnSingleNodeIsOneGroup(t *testing.T) {
 }
 
 // Tier 2 Cluster (P5bI-4): runEach groups by the master that owns the key.
+// The owner comes from CLUSTER SHARDS, not from MasterForKey (masterAddr's
+// own source), and the 3 keys must land on 3 different masters.
 func TestMasterAddrOnClusterIsTheOwner(t *testing.T) {
 	if !testredis.Cluster() {
 		t.Skip("not a Cluster run: TestMasterAddrOnSingleNodeIsOneGroup")
 	}
 	s, rdb := newStore(t)
+	c := rdb.(*redis.ClusterClient)
+	shards, err := c.ClusterShards(ctx).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
 	for _, uid := range []string{"a", "b", "c"} { // one on each master
 		key := sessKey(uid)
-		if got, want := s.masterAddr(ctx, key), testredis.MasterOf(t, rdb, key).Options().Addr; got != want {
-			t.Fatalf("masterAddr(%s) = %q, want its owner %q", key, got, want)
+		slot, err := c.ClusterKeySlot(ctx, key).Result()
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := shardOwner(shards, slot)
+		if got := s.masterAddr(ctx, key); got != want {
+			t.Fatalf("masterAddr(%s) = %q, want its owner %q (slot %d)", key, got, want, slot)
+		}
+		seen[want] = true
+	}
+	if len(seen) != 3 {
+		t.Fatalf("the 3 keys land on %d masters %v, want 3", len(seen), seen)
+	}
+}
+
+// shardOwner is "IP:PORT" of the master whose slot range holds slot, or "".
+func shardOwner(shards []redis.ClusterShard, slot int64) string {
+	for _, sh := range shards {
+		for _, r := range sh.Slots {
+			if slot < r.Start || slot > r.End {
+				continue
+			}
+			for _, n := range sh.Nodes {
+				if n.Role == "master" {
+					return fmt.Sprintf("%s:%d", n.IP, n.Port)
+				}
+			}
 		}
 	}
+	return ""
 }
