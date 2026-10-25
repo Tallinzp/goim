@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Tier 2: run Plan 1's store tests against a real Redis primary + replica.
+# Tier 2: run every test against a real Redis primary + replica, then
+# against a Redis Cluster (P5bI-4, Plan 6c1).
 #
 # Usage (on the Tier 2 host, from the repo root):
 #   GOIM_TEST_TIER=2 make test-tier2 SCENARIO=store
@@ -14,6 +15,11 @@
 #   3. mutation: with Revoke's WAIT moved to a pooled connection,
 #                TestRevokeFailsWhenReplicaDoesNotAck fails (the test catches the bug)
 #   4. eviction: the test Redis reports maxmemory-policy noeviction
+#   5-8. cluster_tests, cluster_no_skips, cluster_mutation, cluster_eviction:
+#        1-4 again on a Redis Cluster of the pinned 7.4.11 (make redis-server;
+#        scripts/redis-cluster-local.sh: 3 masters, 3 replicas, no Docker);
+#        cluster_no_skips also needs TestClusterHasThreeMastersWithReplicas
+#        passed, so the suite really ran on a Cluster
 set -uo pipefail
 
 . "$(dirname "$0")/lib.sh"
@@ -42,6 +48,12 @@ t2_report_extra() {
   fi
   t2_section "mutation.log"
   tail -n 200 "$out/mutation.log" 2>/dev/null
+  t2_section "tests-cluster.log (RUN/PASS lines removed)"
+  if [ -f "$out/tests-cluster.log" ]; then
+    grep -vE '^[[:space:]]*(=== (RUN|PAUSE|CONT)|--- PASS)' "$out/tests-cluster.log" | head -n 3000
+  fi
+  t2_section "mutation-cluster.log"
+  tail -n 200 "$out/mutation-cluster.log" 2>/dev/null
   t2_section "redis logs (last 100 lines each)"
   cat "$out/redis.log" 2>/dev/null
 }
@@ -76,6 +88,22 @@ skips=$(grep -c 'TODO: Tier 2 integration' "$out/tests.log")
 failed=$(grep -E '^[[:space:]]*--- FAIL' "$out/tests.log" | sed 's/^[[:space:]]*--- FAIL: //; s/ (.*//' | paste -sd, -)
 tests_s=$((SECONDS - t))
 
+# mutant_run LOG [WRAPPER...]: the mutant's WAIT test, run in $mutdir under
+# WRAPPER (a command that runs the rest, e.g. the Cluster script), appended
+# to LOG; prints the verdict.
+mutant_run() {
+  local log=$1
+  shift
+  if (cd "$mutdir" && "$@" go test -race -count=1 -v -run '^TestRevokeFailsWhenReplicaDoesNotAck$' ./internal/store/) >>"$log" 2>&1; then
+    echo "fail: test still passes with WAIT on a pooled connection"
+  elif grep -q -- '--- FAIL: TestRevokeFailsWhenReplicaDoesNotAck' "$log" &&
+       grep -q 'want ErrNotReplicated' "$log"; then
+    echo pass
+  else
+    echo "error: the test failed for another reason, see $(basename "$log")"
+  fi
+}
+
 # 3: mutation check in a throwaway worktree, so the checkout is never modified.
 # The mutant sends WAIT through node (the pooled *redis.Client) instead of the
 # Conn that wrote the marker. It counts as caught only if it compiles and the
@@ -88,13 +116,8 @@ if ! grep -q 'node.Wait(ctx, 1' "$mutdir/internal/store/revoke.go"; then
   mutation="error: could not apply the mutation"
 elif ! (cd "$mutdir" && go vet ./internal/store/) >"$out/mutation.log" 2>&1; then
   mutation="error: the mutant does not compile"
-elif (cd "$mutdir" && go test -race -count=1 -v -run '^TestRevokeFailsWhenReplicaDoesNotAck$' ./internal/store/) >>"$out/mutation.log" 2>&1; then
-  mutation="fail: test still passes with WAIT on a pooled connection"
-elif grep -q -- '--- FAIL: TestRevokeFailsWhenReplicaDoesNotAck' "$out/mutation.log" &&
-     grep -q 'want ErrNotReplicated' "$out/mutation.log"; then
-  mutation="pass"
 else
-  mutation="error: the test failed for another reason, see mutation.log"
+  mutation=$(mutant_run "$out/mutation.log")
 fi
 mutation_s=$((SECONDS - t))
 
@@ -107,6 +130,33 @@ t2_check tests "$(t2_bool [ "$tests_rc" -eq 0 ])" "\"failed\": $(t2_json_str "$f
 t2_check no_skips "$(t2_bool [ "$skips" -eq 0 ])" "\"tier2_skips\": $skips"
 t2_check mutation "$(t2_bool [ "$mutation" = pass ])" "\"detail\": $(t2_json_str "$mutation"), \"duration_s\": $mutation_s"
 t2_check eviction "$(t2_bool [ "$policy" = noeviction ])" "\"maxmemory_policy\": $(t2_json_str "$policy")"
-t2_not_covered "Redis Cluster: MasterForKey, MOVED after failover, multi-node NOSCRIPT, CRC16 key slots" \
+# 5-8: the same on a Redis Cluster (P5bI-4). The mutant reuses the worktree.
+t=$SECONDS
+server=$PWD/.cache/redis/bin/redis-server
+cluster=$PWD/scripts/redis-cluster-local.sh
+if ! make redis-server >"$out/redis-build.log" 2>&1; then
+  ctests_rc=2 cskips=0 cfailed="make redis-server failed, see redis-build.log" cmutation="error: no redis-server" cpolicy=""
+else
+  "$cluster" "$server" go test -race -count=1 -v ./... >"$out/tests-cluster.log" 2>&1
+  ctests_rc=$?
+  cskips=$(grep -c 'TODO: Tier 2 integration' "$out/tests-cluster.log")
+  cfailed=$(grep -E '^[[:space:]]*--- FAIL' "$out/tests-cluster.log" | sed 's/^[[:space:]]*--- FAIL: //; s/ (.*//' | paste -sd, -)
+  if [ "$mutation" = "error: could not apply the mutation" ] || [ "$mutation" = "error: the mutant does not compile" ]; then
+    cmutation=$mutation
+  else
+    cmutation=$(mutant_run "$out/mutation-cluster.log" "$cluster" "$server")
+  fi
+  # Every node's policy, one line each.
+  cpolicy=$("$cluster" "$server" bash -c 'for a in ${GOIM_TEST_REDIS_CLUSTER//,/ }; do "$0" -p "${a#*:}" config get maxmemory-policy | tail -1; done' \
+    "$(dirname "$server")/redis-cli" 2>/dev/null | grep -v '^redis-cluster-local:' | sort | uniq -c | awk '{ print $2 "=" $1 }' | paste -sd, -)
+fi
+cluster_s=$((SECONDS - t))
+cran=$(grep -c -- '--- PASS: TestClusterHasThreeMastersWithReplicas' "$out/tests-cluster.log" 2>/dev/null)
+t2_field redis_cluster "$(t2_json_str "$("$server" --version 2>/dev/null)")"
+t2_check cluster_tests "$(t2_bool [ "$ctests_rc" -eq 0 ])" "\"failed\": $(t2_json_str "$cfailed"), \"duration_s\": $cluster_s"
+t2_check cluster_no_skips "$(t2_bool [ "$cskips" -eq 0 ] && [ "${cran:-0}" -eq 1 ])" "\"tier2_skips\": $cskips, \"cluster_test_passed\": ${cran:-0}"
+t2_check cluster_mutation "$(t2_bool [ "$cmutation" = pass ])" "\"detail\": $(t2_json_str "$cmutation")"
+t2_check cluster_eviction "$(t2_bool [ "$cpolicy" = noeviction=6 ])" "\"maxmemory_policy\": $(t2_json_str "$cpolicy")"
+t2_not_covered "Redis Cluster failover: MOVED and NOSCRIPT on a new master, the lease across it (Plan 6c2)" \
   "lost replies after a write (needs a fault-injecting proxy)"
 t2_finish
