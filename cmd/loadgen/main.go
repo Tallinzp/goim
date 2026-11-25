@@ -59,6 +59,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	fs.IntVar(&cfg.SourceNet, "source-net", 0, "third octet of the source addresses, one per instance on a stack; floods: required, 1–255")
 	fs.DurationVar(&cfg.PingEvery, "ping-every", 150*time.Second, "light: Ping interval (the gateway's -heartbeat)")
 	fs.DurationVar(&cfg.Timeout, "timeout", 10*time.Second, "light: dial + handshake + Login per attempt; floods: dial, then the wait for the gateway's close")
+	fs.IntVar(&cfg.Attempts, "light-attempts", 10, "light: login attempts before a client gives up (0.5-1.5s apart)")
 	down := fs.String("down", "", "gateway ids out of the balancer until POST /up, comma-separated")
 	fs.BoolVar(&cfg.Precompute, "precompute", false, "sdk: prepare each logged-in client's next handshake until the first mark (#106)")
 	control := fs.String("control", "", "control API listen address (none if empty)")
@@ -70,6 +71,9 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	}
 	if *envPath == "" {
 		return errors.New("-env is required")
+	}
+	if cfg.Attempts < 1 {
+		return errors.New("-light-attempts must be at least 1")
 	}
 	if *down != "" {
 		cfg.Down = strings.Split(*down, ",")

@@ -19,7 +19,7 @@ import (
 // lightConn is one light client (choice #80): no reconnect once logged in,
 // no timers of its own; one goroutine reads, the shared pinger writes Pings.
 // Until it logs in, it retries any failure after 0.5–1.5s, at most
-// lightAttempts times, as the SDK retries a pre-handshake close: a gateway's
+// Config.Attempts times (default lightAttempts), as the SDK retries a pre-handshake close: a gateway's
 // handshake limit closes the excess of a fast ramp (spec: Admission control).
 type lightConn struct {
 	i        int
@@ -59,7 +59,7 @@ func (r *Runner) light(ctx context.Context, lc *lightConn) {
 		if ctx.Err() != nil {
 			return
 		}
-		if attempt == lightAttempts {
+		if attempt == r.cfg.Attempts {
 			r.rec.Failed("gave-up")
 			r.rec.LoginLog(lc.i, first, time.Time{}, attempt)
 			return

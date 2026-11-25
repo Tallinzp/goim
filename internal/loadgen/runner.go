@@ -39,6 +39,7 @@ type Config struct {
 	Precompute bool          // sdk: prepare each logged-in client's next handshake until the first mark (#106)
 	PingEvery  time.Duration // light: the Ping interval (cmd/loadgen: 150s, the gateway's default heartbeat)
 	Timeout    time.Duration // light: dial + handshake + Login; flood modes: dial, and then the wait for the close (cmd/loadgen: 10s)
+	Attempts   int           // light: attempts before a client gives up; 0: lightAttempts (cmd/loadgen: 10)
 	windows    sdk.Windows   // tests only: the SDK's built-in reconnect windows
 }
 
@@ -101,8 +102,13 @@ func New(cfg Config, env Env) (*Runner, error) {
 		return nil, errors.New("loadgen: light mode needs PingEvery and Timeout")
 	case floodMode(cfg.Mode) && cfg.Timeout <= 0:
 		return nil, errors.New("loadgen: flood modes need Timeout")
+	case cfg.Attempts < 0:
+		return nil, errors.New("loadgen: Attempts must not be negative")
 	case cfg.SourceNet < 0 || cfg.SourceNet > 255:
 		return nil, fmt.Errorf("loadgen: source net %d, want 0–255", cfg.SourceNet)
+	}
+	if cfg.Attempts == 0 {
+		cfg.Attempts = lightAttempts
 	}
 	var down []int
 	for _, id := range cfg.Down {

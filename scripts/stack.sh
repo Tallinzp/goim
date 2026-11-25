@@ -62,7 +62,7 @@
 #                        below the race suite's 20000-32000 and the ephemeral range)
 #   STACK_REDIS          single (default): one redis-server; cluster: 3 masters and 3
 #                        replicas (scripts/redis-cluster.sh: zones z0-z2 as labels,
-#                        layout in redis/layout, cluster-node-timeout 10s), Logic with
+#                        layout in redis/layout, cluster-node-timeout 5s), Logic with
 #                        -redis-cluster
 #   STACK_PIN            1: taskset gateways to T2_CPUS_GATEWAY, Logic and Redis
 #                        to T2_CPUS_LOGIC (lib.sh sets both); 0: no pinning (default)

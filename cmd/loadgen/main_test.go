@@ -29,6 +29,7 @@ func TestRunRefusesBadFlags(t *testing.T) {
 		{[]string{"-env", "ENV", "-mode", "slow-auth", "-timeout", "0s"}, "Timeout"},
 		{[]string{"-env", "ENV", "-mode", "garbage", "-source-net", "256"}, "source net"},
 		{[]string{"-env", "ENV", "-mode", "slow-handshake"}, "-source-net"},
+		{[]string{"-env", "ENV", "-light-attempts", "0"}, "-light-attempts must be at least 1"},
 	} {
 		for i, a := range tc.args {
 			if a == "ENV" {

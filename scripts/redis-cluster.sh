@@ -14,8 +14,10 @@
 #                                 #   replicas and no failed node, and every replica is linked
 #
 # Settings: REDIS_CLUSTER_NODE_TIMEOUT_MS (cluster-node-timeout, default
-# 10000: a SIGKILLed master fails over in ~16.5s, inside the lease rule's
-# TTL 30s - interval 10s; Redis's 15000 took 20.6-22.7s, #139);
+# 5000: a SIGKILLed master fails over in ~7.8s, a stopped zone's in
+# 7.1-9.2s, well inside the lease rule's TTL 30s - interval 10s; 10000 took
+# ~16.5s and let a lease expire at zone loss, #140; Redis's 15000 took
+# 20.6-22.7s, #139);
 # REDIS_CLUSTER_JOIN_TIMEOUT_S (how long the join waits, default 30).
 
 redis_cluster_layout() {
@@ -25,12 +27,15 @@ redis_cluster_layout() {
 
 # redis_cluster_args PORT BUS DIR: nothing persisted, noeviction (as the
 # single Redis), the cluster bus on BUS (not PORT + 10000, which lands in
-# the race suite's 20000-32000), nodes.conf in DIR.
+# the race suite's 20000-32000), nodes.conf in DIR. Not full coverage: a
+# master marked failed stops only its own slots; with Redis's default every
+# node refuses every command (CLUSTERDOWN) until its replica takes over,
+# ~1s, so logins on the other shards failed too (Plan 6c2b's dry run, #142).
 redis_cluster_args() {
   REDIS_CLUSTER_ARGS=(--port "$1" --cluster-port "$2" --bind 127.0.0.1 --dir "$3"
     --save "" --appendonly no --maxmemory-policy noeviction
     --cluster-enabled yes --cluster-config-file nodes.conf
-    --cluster-node-timeout "${REDIS_CLUSTER_NODE_TIMEOUT_MS:-10000}"
+    --cluster-node-timeout "${REDIS_CLUSTER_NODE_TIMEOUT_MS:-5000}" --cluster-require-full-coverage no
     --repl-diskless-sync yes --repl-diskless-sync-delay 0)
 }
 

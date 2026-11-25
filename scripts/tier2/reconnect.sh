@@ -371,120 +371,6 @@ rc_heartbeats_ok() {
     lg_true - 'd["l"] == {"lost": d["p"]} and all(v["closes_heartbeat"] <= '"$allowed"' for g, v in d["g"].items())'
 }
 
-# rc_sessions_cmp CLIENTS SESSIONS MARK_MS: P_sessions' reading (review
-# O4). CLIENTS is loadgen's GET /clients; SESSIONS one line per client, in
-# order: "N|VALUE", N the sess hash's fields, VALUE the first ("gw|epoch|
-# conn_id|device|conn_seq|login_ms|tok_iat"). {"clients", "offline": not
-# logged in at loadgen, "found": one session on the client's gateway with
-# login_ms >= MARK_MS, "missing", "extra": more than one, "wrong_gateway",
-# "stale": logged in before the mark, "examples": up to 5 [uid, why]}; null
-# if a file is unreadable or SESSIONS has not exactly one line per client.
-rc_sessions_cmp() {
-  python3 -c 'import json, sys
-c = json.load(open(sys.argv[1]))
-lines = open(sys.argv[2]).read().splitlines()
-mark = int(sys.argv[3])
-gw = c["gw"]
-if len(lines) != len(gw):
-    raise SystemExit(1)
-r = {"clients": len(gw), "offline": 0, "found": 0, "missing": 0, "extra": 0, "wrong_gateway": 0, "stale": 0, "examples": []}
-for i, (g, l) in enumerate(zip(gw, lines)):
-    n, _, v = l.partition("|")
-    why = None
-    if g < 0:
-        why = "offline"
-    elif int(n) == 0:
-        why = "missing"
-    elif int(n) > 1:
-        why = "extra"
-    else:
-        f = v.split("|")
-        why = "wrong_gateway" if f[0] != c["gateways"][g] else "stale" if int(f[5]) < mark else None
-    if why:
-        r[why] += 1
-        if len(r["examples"]) < 5:
-            r["examples"].append(["%s-%d" % (c["uid_prefix"], i), why])
-    else:
-        r["found"] += 1
-if len(sys.argv) > 4:
-    r["ms"] = int(sys.argv[4])
-print(json.dumps(r))' "$@" 2>/dev/null || echo null
-}
-
-# rc_sessions_cmds CLIENTS SLOTS DIR: the session check's commands. Each
-# client's sess key goes to the master that owns its slot (SLOTS:
-# stack_redis_slots's "START END NAME" lines), in one EVAL per slot (HVALS
-# each; ~37 keys at 600k): a Cluster refuses a script whose keys span slots
-# (CROSSSLOT, review P6b3c2I-3). Writes DIR/NAME.cmd and DIR/NAME.idx (the
-# client index of each output line, in order) per master; fails if a slot
-# has no owner.
-rc_sessions_cmds() {
-  python3 -c 'import json, sys
-c = json.load(open(sys.argv[1]))
-ranges = [(int(a), int(b), n) for a, b, n in (l.split() for l in open(sys.argv[2]) if l.strip())]
-out = sys.argv[3]
-def crc16(b):  # CRC16-XMODEM, Redis Cluster key slots
-    r = 0
-    for x in b:
-        r ^= x << 8
-        for _ in range(8):
-            r = ((r << 1) ^ 0x1021 if r & 0x8000 else r << 1) & 0xFFFF
-    return r
-lua = "local r = {} for i, k in ipairs(KEYS) do local v = redis.call(\"HVALS\", k) r[i] = #v .. \"|\" .. (v[1] or \"\") end return r"
-slots = {}
-for i in range(len(c["gw"])):
-    uid = "%s-%d" % (c["uid_prefix"], i)
-    slots.setdefault(crc16(uid.encode()) % 16384, []).append(i)
-files = {}
-for slot in sorted(slots):
-    name = next((n for a, b, n in ranges if a <= slot <= b), None)
-    if name is None:
-        raise SystemExit("slot %d has no owner" % slot)
-    if name not in files:
-        files[name] = (open("%s/%s.cmd" % (out, name), "w"), open("%s/%s.idx" % (out, name), "w"))
-    cmd, idx = files[name]
-    b = slots[slot]
-    cmd.write("EVAL %s %d %s\n" % (json.dumps(lua), len(b), " ".join("sess:{%s-%d}" % (c["uid_prefix"], i) for i in b)))
-    idx.write("".join("%d\n" % i for i in b))' "$@"
-}
-
-# rc_sessions_join CLIENTS DIR: the replies (DIR/NAME.out, one line per key)
-# put back in client order, the SESSIONS lines rc_sessions_cmp reads. Fails
-# if a reply's line count is not its NAME.idx's or a client has no line.
-rc_sessions_join() {
-  python3 -c 'import glob, json, sys
-n = len(json.load(open(sys.argv[1]))["gw"])
-lines = [None] * n
-for f in glob.glob(sys.argv[2] + "/*.idx"):
-    idx = [int(x) for x in open(f).read().split()]
-    out = open(f[:-4] + ".out").read().splitlines()
-    if len(out) != len(idx):
-        raise SystemExit(1)
-    for i, l in zip(idx, out):
-        lines[i] = l
-if None in lines:
-    raise SystemExit(1)
-print("\n".join(lines))' "$@"
-}
-
-# rc_sessions MARK_MS: rc_sessions_cmp over loadgen's /clients and every
-# client's sess key, read per slot on each key's master (rc_sessions_cmds):
-# at 600k ~16k short scripts after the hold, on one Redis or a Cluster alike.
-rc_sessions() {
-  local a=$STACK_DIR/artifacts d=$STACK_DIR/sessions f name t0
-  t0=$(date +%s%3N)
-  curl -sf -m 60 "http://$(lg_control)/clients" >"$a/clients.json" || { echo null; return; }
-  rm -rf "$d" && mkdir -p "$d"
-  stack_redis_slots >"$d/slots.txt"
-  rc_sessions_cmds "$a/clients.json" "$d/slots.txt" "$d" 2>"$a/sessions.err" || { echo null; return; }
-  for f in "$d"/*.cmd; do
-    name=$(basename "$f" .cmd)
-    stack_redis_node_cli "$name" --raw <"$f" >"$d/$name.out" 2>&1
-  done
-  rc_sessions_join "$a/clients.json" "$d" >"$a/sessions.txt" 2>>"$a/sessions.err" || { echo null; return; }
-  rc_sessions_cmp "$a/clients.json" "$a/sessions.txt" "$1" $(($(date +%s%3N) - t0))
-}
-
 t=$SECONDS
 if ! make redis-server >"$T2_OUT/redis-build.log" 2>&1; then
   echo "make redis-server failed, see $T2_OUT/redis-build.log" >&2
@@ -628,7 +514,7 @@ for name in $PHASES; do
   [ "$hb_ok" != true ] && [ "$loadgen_bound" = true ] &&
     t2_not_covered "${name}_heartbeats failed while loadgen was the bound: a late read on loadgen's side can also time a Pong out; read ${name}.series lg_runq_ms_per_s and loadgen_set_busy_pct beside the Pong timeouts (${name}.loadgen.storm)"
   t2_lease "$name" "$d" "$window_s" "$ld"
-  sessions=$(rc_sessions "$mark_ms")
+  sessions=$(t2_sessions "$mark_ms")
   t2_check "${name}_sessions" "$(echo "${sessions:-null}" | lg_true - 'd["found"] == d["clients"] == '"$N")" \
     "\"sessions\": ${sessions:-null}, \"logic\": $(echo "$ld" | lg_py - '{k: d[k] for k in ("logins_replaced", "logouts_deleted", "logouts_not_owner", "logouts_unknown")}')"
 
