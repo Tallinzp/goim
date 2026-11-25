@@ -806,4 +806,26 @@ In this plan's *Execution Notes*: the dry run and run 35's numbers as in Step 3,
   - After both fixes: `go vet ./...` clean; 60 package runs `ok`.
   - **Minors, deferred:** M1 the 1s group bound also counts the wait for a go-redis pool connection (Logic sets no `PoolSize`; 64 groups per master can be in flight), so read run 35's before-window store errors with that in mind. M2 shutdown drops batches waiting for tokens (Review Focus 4, as stated). M3 the slot map never shrinks, and keys with no resolved master share one `""` pool (Review Focus 5). M4 `TestLoginFreesItsWorkerBeforeTheStore` can hang if it fails before `close(gate.release)`. M5 `silentRedis` calls `t.Cleanup` from its accept goroutine. M6 Login sends rejected entries while it holds the shared worker; `LoginQueueSeconds` now includes the token wait.
 - **Dry run again on `38319a0`:** 30 checks, only the three swap checks fail. `master_ms` manual 47, kill 8,688, zone 8,468. Other-shard p99 before → window: manual 12 → 12, kill 12 → 12, zone 13 → 13ms. `missing` 0 everywhere.
-- **Run 35:** pending (the user, on the Tier 2 host).
+- **Run 35** (the user, Tier 2 host, `e91c369`, 2026-11-25; 481s; ramp 122s, 600,000 online): **exit 0, 30/30**. No swap in any phase. The target was `redis-0` in every phase; gw-0's lease key was on it, `gwepochs` on `redis-1`.
+
+| | manual | kill | zone |
+|---|---|---|---|
+| `master_ms` / `cluster_ok_ms` | 25 / 35 (run 34: 23 / 34) | 7,810 / 7,823 (8,225 / 8,235) | 7,478 / 8,495 (8,228 / 8,240) |
+| `at_ms_since_renewal` | 9,002 | 9,007 | 9,024 |
+| lease `missing` (gw-0/1/2, Logic) | 0 | 0 | 0 |
+| lease `error` (gw-0/1/2; Logic) | 0/0/0; 0 | 7/0/0; 7 | 1/0/0; 1 |
+| sweep deletions | 0 | 0 | 0 |
+| restore / rejoin (`whole_s`) | 1s / 0s | 2s / 2s | 1s / 2s |
+| other shards' p99, before → window (n) | 21 → 22ms (141) | 22 → **25ms** (1,183; run 34: 104) | 22 → **22ms** (1,137; run 34: 4,470) |
+| other shards in the window: retried, max | 0, 26ms | 3, 1,409ms | 1, 1,358ms |
+| target shard in the window: n, retried, p50/p99/max | 64, 0, 7/61/61ms | 579, 533, 4,297/8,749/9,241ms | 558, 330, 4,501/9,460/10,273ms |
+| `target_affected_share` | 0.0 | 0.92 | 0.59 |
+| gateways' `logins_busy` / `logins_expired` | 0 / 0 | 0 / 0 | 0 / 0 (run 34: 0 / 52) |
+| flow clients that gave up | 0 | 0 | 0 |
+| main sessions (600k) / through window lost | all found / 0 of 8,000 | all found / 0 | all found / 0 |
+
+  - **#144 is fixed at Tier 2:** both other-shard checks pass with room (bounds 72 and 72ms). The target shard's logins all succeeded, faster than run 34's (zone p99 9.5s against 13.6s).
+  - A few other-shard logins still retried once (kill 3, zone 1; max ~1.4s), as in run 34's kill phase (4, 1,284ms). They are below the p99 and were not traced; read with 6c3.
+  - Review Focus 1 and 3: the report holds only the last 20 lines of Logic's log. Those show `gwconns SADD failed ... context deadline exceeded` (single-uid batches from gw-0) at 06:36:22–23, the end of the zone window and just after it, as in run 34. Store errors in the before windows and Logic's CPU are not in the report, so they were not read. No gateway refused or expired a login.
+  - Review Focus 2: no second failover (each phase's `whole` roles are as expected); the returning node's full resync loaded 202,713 keys in ~1.5s.
+  - The `Killed` line at the top of the run's output is the kill phase's SIGKILL of the target master (expected).
