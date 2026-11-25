@@ -527,8 +527,14 @@ stack_redis_restart() {
 # refusal, as from a zone cut off by the network. stack_down resumes a
 # stopped node before it stops it.
 declare -A STACK_REDIS_STOPPED=()
-stack_redis_stop() { kill -STOP "${STACK_PIDS[$1]:?no process $1}" && STACK_REDIS_STOPPED[$1]=1; }
-stack_redis_cont() { kill -CONT "${STACK_PIDS[$1]:?no process $1}" && unset "STACK_REDIS_STOPPED[$1]"; }
+stack_redis_stop() {
+  [ -n "${STACK_PIDS[$1]:-}" ] || { echo "stack: no process $1" >&2; return 1; }
+  kill -STOP "${STACK_PIDS[$1]}" && STACK_REDIS_STOPPED[$1]=1
+}
+stack_redis_cont() {
+  [ -n "${STACK_PIDS[$1]:-}" ] || { echo "stack: no process $1" >&2; return 1; }
+  kill -CONT "${STACK_PIDS[$1]}" && unset "STACK_REDIS_STOPPED[$1]"
+}
 
 # stack_redis_wait_role NAME ROLE SECONDS: polls every 50ms until NAME says
 # its role is ROLE (master, replica, down); fails after SECONDS.
@@ -834,7 +840,7 @@ stack_pinned() {
 # stack_forget NAME: drops NAME from STACK_PIDS and STACK_ORDER.
 stack_forget() {
   local n order=()
-  unset "STACK_PIDS[$1]"
+  unset "STACK_PIDS[$1]" "STACK_REDIS_STOPPED[$1]"
   for n in "${STACK_ORDER[@]}"; do [ "$n" = "$1" ] || order+=("$n"); done
   STACK_ORDER=("${order[@]}")
 }

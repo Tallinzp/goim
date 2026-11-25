@@ -90,11 +90,17 @@ expect "restore: the start layout again" "$(stack_redis_roles)" "$start_roles"
 expect "lease: no missing reply through both failovers" "$(missing)" "$m0"
 lg_in c lg_start c -mode light -clients 30 -rate 100 -uid-prefix fc && lg_in c lg_wait_online 30 30 && ok "logins: 30 more online after the zone" || bad "logins: after the zone"
 
-# A stopped node at stack_down is resumed and stops cleanly.
+# A wrong name fails the call, not the script (final review I1).
+stack_redis_stop redis-9 2>/dev/null && bad "stop: a wrong name must fail" || ok "stop: a wrong name fails the call"
+stack_redis_cont redis-9 2>/dev/null && bad "cont: a wrong name must fail" || ok "cont: a wrong name fails the call"
+# A node killed while stopped is no longer stopped (I1); a stopped node at
+# stack_down is resumed and stops cleanly.
+stack_redis_stop redis-3 && stack_redis_kill redis-3 && ok "kill: a stopped node" || bad "kill: a stopped node"
+expect "kill: a killed node is not left stopped" "${STACK_REDIS_STOPPED[redis-3]:-}" ""
 stack_redis_stop redis-4
 lg_stop_all
 stack_down
-expect "down: every node stops with 0" "$(grep -cE '^redis-[0-5] 0$' "$STACK_DIR/exit-status")" 6
+expect "down: every other node stops with 0" "$(grep -cE '^redis-[0-5] 0$' "$STACK_DIR/exit-status")" 5
 expect "health: the kill was expected, nothing else" "$(stack_health 2>&1)" ""
 
 echo "$fails failure(s)"
