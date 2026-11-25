@@ -29,7 +29,7 @@ var logicProfile = []string{
 // Reconcile cycle scales to 60s ± 6s; scenarios run passes on demand
 // instead (Options.PeriodicPasses, choice #60).
 var gatewayProfile = []string{
-	"-lease-interval", "1s", "-lease-timeout", "1s", "-lease-ttl", "3s",
+	"-lease-interval", "1s", "-lease-timeout", "1s", "-lease-retry", "100ms", "-lease-ttl", "3s",
 	"-heartbeat", "15s", "-heartbeat-min", "3s", "-heartbeat-max", "30s",
 	"-retry-for", "6s", "-retry-backoff", "100ms", "-retry-max-delay", "1s",
 	"-reconcile-cycle", "60s", "-reconcile-jitter", "6s",

@@ -89,6 +89,8 @@ redis_cluster_wait() {
     sleep 0.1
   done
   echo "redis-cluster: not every node reports cluster_state:ok with its replicas linked within ${secs}s" >&2
-  timeout 1 "$cli" -p "$1" cluster nodes >&2
+  for p in "$@"; do # the view of the first node that answers
+    [ "$(timeout 1 "$cli" -p "$p" ping 2>/dev/null)" = PONG ] && { timeout 1 "$cli" -p "$p" cluster nodes >&2; break; }
+  done
   return 1
 }

@@ -6,7 +6,9 @@
 # start layout comes back, a stopped zone (one master, one other master's
 # replica) fails over and returns, and nothing hangs on a stopped node.
 # The gateway's lease and new logins live through all of it. cluster-node-
-# timeout is 2s here (a failover in ~3s). Needs redis-server (make
+# timeout is 2s here (a failover in ~3s), so the lease would live through
+# it without the gateway's 1s retry too: the retry is tested in Go
+# (TestFailedRenewalIsRetriedBeforeTheNextTick), not here. Needs redis-server (make
 # redis-server) and curl.
 set -uo pipefail
 cd "$(git rev-parse --show-toplevel)"
@@ -81,6 +83,14 @@ lat=$(stack_redis_latency)
 expect "latency: the stopped nodes are null, the others read" "$(get "$lat" '[n for n in sorted(d) if d[n] is None]')" "['redis-0', 'redis-5']"
 [ $((SECONDS - t)) -le 6 ] && ok "zone: readers bounded ($((SECONDS - t))s)" || bad "zone: readers took $((SECONDS - t))s"
 out=$(stack_redis_wait_whole 2 2>&1) && bad "whole: a stopped zone must fail the wait" || ok "whole: not whole with a zone stopped"
+grep -q myself <<<"$out" && ok "whole: the failure shows a live node's view" || bad "whole: no CLUSTER NODES in [$out]"
+# The nodes that answer are reset, also when one does not (final review M1).
+stack_redis_node_cli redis-2 echo m1 >/dev/null
+stack_redis_resetstat 2>/dev/null && bad "resetstat: a stopped node must fail it" || ok "resetstat: fails with a node stopped"
+expect "resetstat: the nodes that answer are reset" "$(stack_redis_node_cli redis-2 info commandstats | grep -c '^cmdstat_echo')" 0
+# A node stopped after its PING does not hang the reader (M2).
+lat0=$(STACK_REDIS=cluster STACK_PORT_BASE=$STACK_PORT_BASE timeout 15 bash -c '. scripts/stack.sh; stack_redis_ping() { true; }; stack_redis_node_latency redis-0')
+expect "latency: a node stopped after its PING reads null" "$lat0:$?" "null:0"
 stack_redis_wait_role redis-3 master 15 && ok "zone: redis-3 is master" || bad "zone: redis-3 not master"
 expect "zone: a key of redis-2's range (slot 16287) still on redis-2" "$(stack_redis_owner '{x}')" redis-2
 stack_redis_cont redis-0 && stack_redis_cont redis-5 && ok "zone: z0 back"

@@ -18,6 +18,7 @@ func (g *Gateway) runLease(ctx context.Context, stop <-chan struct{}, lease pb.L
 	t := time.NewTicker(g.cfg.LeaseInterval)
 	defer t.Stop()
 	var lastOK time.Time // start of the last successful renewal
+	retrying := false
 	for {
 		select {
 		case <-stop:
@@ -25,8 +26,14 @@ func (g *Gateway) runLease(ctx context.Context, stop <-chan struct{}, lease pb.L
 		default:
 		}
 		next := t.C
-		if !g.renew(ctx, lease, &lastOK, trigger) {
-			next = time.After(g.cfg.LeaseRetry)
+		switch ok := g.renew(ctx, lease, &lastOK, trigger); {
+		case !ok:
+			next, retrying = time.After(g.cfg.LeaseRetry), true
+		case retrying:
+			// The first success after failures restarts the interval, so a
+			// tick that passed meanwhile does not renew again at once.
+			t.Reset(g.cfg.LeaseInterval)
+			retrying = false
 		}
 		select {
 		case <-ctx.Done():

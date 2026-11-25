@@ -108,3 +108,29 @@ func TestFailedRenewalIsRetriedBeforeTheNextTick(t *testing.T) {
 		t.Fatalf("lease_calls_total{result=error} %v, want 3", got)
 	}
 }
+
+// A success after failures that outlasted a tick restarts the interval: no
+// renewal follows at once on the tick that passed meanwhile (final review M3).
+func TestRetriedSuccessRestartsTheInterval(t *testing.T) {
+	var oks []time.Time // the start of each successful call
+	start := time.Now()
+	l := startLive(t, func(c *Config) {
+		c.LeaseInterval, c.LeaseTTL, c.LeaseRetry = 300*time.Millisecond, 3*time.Second, 20*time.Millisecond
+	},
+		func(_ *Gateway, f *fakeLogic) {
+			f.lease = func(*pb.LeaseRequest) (*pb.LeaseReply, error) {
+				f.mu.Lock()
+				defer f.mu.Unlock()
+				if time.Since(start) < 400*time.Millisecond { // past the first tick
+					return nil, errors.New("shard failing over")
+				}
+				oks = append(oks, time.Now())
+				return &pb.LeaseReply{Missing: true}, nil
+			}
+		})
+	waitFor(t, "first lease after the failures", l.g.leaseOK.Load)
+	time.Sleep(200 * time.Millisecond)
+	if n := get(l.logic, func() int { return len(oks) }); n != 1 {
+		t.Fatalf("%d successful calls within 200ms of the first, want 1: the interval restarts", n)
+	}
+}

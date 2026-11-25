@@ -395,7 +395,7 @@ stack_redis_slots() {
     stack_redis_cli ping >/dev/null 2>&1 && echo "0 16383 redis"
     return
   fi
-  stack_redis_cli cluster nodes 2>/dev/null | awk -v base="${STACK_PORT_BASE:-17000}" '
+  STACK_REDIS_TIMEOUT=${STACK_REDIS_TIMEOUT:-2} stack_redis_cli cluster nodes 2>/dev/null | awk -v base="${STACK_PORT_BASE:-17000}" '
     $3 ~ /master/ && $3 !~ /(^|,)fail(,|$)/ {
       split($2, a, "[:@]"); name = "redis-" (a[2] - base - 20)
       for (i = 9; i <= NF; i++) { if ($i ~ /^\[/) continue; n = split($i, r, "-"); print r[1], r[n], name } }' | sort -n
@@ -403,23 +403,28 @@ stack_redis_slots() {
 
 # stack_redis_resetstat: CONFIG RESETSTAT on every Redis process, so their
 # per-command latency percentiles and call counts cover a window from now
-# (Plan 6b2a-stress). Fails if any node did not answer OK.
+# (Plan 6b2a-stress). Resets every node that answers; fails if any did not
+# answer OK.
 stack_redis_resetstat() {
-  local name
+  local name rc=0
   for name in $(stack_redis_names); do
-    stack_redis_ping "$name" && [ "$(stack_redis_node_cli "$name" config resetstat 2>/dev/null)" = OK ] || return 1
+    stack_redis_ping "$name" &&
+      [ "$(STACK_REDIS_TIMEOUT=${STACK_REDIS_TIMEOUT:-2} stack_redis_node_cli "$name" config resetstat 2>/dev/null)" = OK ] || rc=1
   done
+  return $rc
 }
 
 # stack_redis_node_latency NAME: one node's per-command latency since the
 # last resetstat, from INFO latencystats (p50, p99 and p99.9 in µs, Redis 7's
 # defaults) and the calls from INFO commandstats, as {"CMD": {"calls",
 # "p50_us", "p99_us", "p999_us"}, ...}. The readers' own INFO and CONFIG
-# are left out. Prints null if the node does not answer (within 1s).
+# are left out. Prints null if the node does not answer (PING within 1s,
+# each INFO within STACK_REDIS_TIMEOUT or 2s).
 stack_redis_node_latency() {
-  local info
+  local info t=${STACK_REDIS_TIMEOUT:-2}
   stack_redis_ping "$1" || { echo null; return; }
-  info=$(stack_redis_node_cli "$1" info latencystats 2>/dev/null && stack_redis_node_cli "$1" info commandstats 2>/dev/null) &&
+  info=$(STACK_REDIS_TIMEOUT=$t stack_redis_node_cli "$1" info latencystats 2>/dev/null &&
+    STACK_REDIS_TIMEOUT=$t stack_redis_node_cli "$1" info commandstats 2>/dev/null) &&
     grep -q '^# Latencystats' <<<"$info" || { echo null; return; }
   awk -F'[:,=]' '{ sub(/\r$/, "") }
     /^latency_percentiles_usec_/ { c = substr($1, 26); p50[c] = $3; p99[c] = $5; p999[c] = $7; cmd[++n] = c }
@@ -473,7 +478,7 @@ stack_redis_roles() {
 # KEYSLOT on a live node, then stack_redis_slots). Fails if none does.
 stack_redis_owner() {
   local slot
-  slot=$(stack_redis_cli cluster keyslot "$1" 2>/dev/null) && [ -n "$slot" ] || return 1
+  slot=$(STACK_REDIS_TIMEOUT=${STACK_REDIS_TIMEOUT:-2} stack_redis_cli cluster keyslot "$1" 2>/dev/null) && [ -n "$slot" ] || return 1
   stack_redis_slots | awk -v s="$slot" '$1 <= s && s <= $2 { print $3; found = 1 } END { exit !found }'
 }
 
@@ -483,7 +488,7 @@ stack_redis_owner() {
 stack_lease_key() {
   local owner epoch
   owner=$(stack_redis_owner gwepochs) || return 1
-  epoch=$(stack_redis_node_cli "$owner" zrange gwepochs 0 -1 withscores 2>/dev/null | paste - - |
+  epoch=$(STACK_REDIS_TIMEOUT=${STACK_REDIS_TIMEOUT:-2} stack_redis_node_cli "$owner" zrange gwepochs 0 -1 withscores 2>/dev/null | paste - - |
     awk -v g="$1" 'index($1, g ":") == 1 && $2 > best { best = $2; e = substr($1, length(g) + 2) } END { if (e != "") print e }')
   [ -n "$epoch" ] || return 1
   echo "gwlease:$1:{$epoch}"
@@ -551,7 +556,7 @@ stack_redis_wait_role() {
 # no acknowledged write is lost); waits up to 10s for NAME to be master.
 stack_redis_failover() {
   [ "$(stack_redis_role "$1")" = replica ] || { echo "stack: $1 is not a replica" >&2; return 1; }
-  [ "$(stack_redis_node_cli "$1" cluster failover 2>/dev/null)" = OK ] || return 1
+  [ "$(STACK_REDIS_TIMEOUT=${STACK_REDIS_TIMEOUT:-2} stack_redis_node_cli "$1" cluster failover 2>/dev/null)" = OK ] || return 1
   stack_redis_wait_role "$1" master 10
 }
 

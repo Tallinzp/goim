@@ -50,7 +50,7 @@ func parseFlags(args []string) (logic.Config, logic.ServerConfig, options, error
 	fs := flag.NewFlagSet("logic", flag.ContinueOnError)
 	fs.StringVar(&o.redisAddrs, "redis", "127.0.0.1:6379", "Redis address(es), comma-separated")
 	fs.BoolVar(&o.redisCluster, "redis-cluster", true, "Redis Cluster (false: one node, for tests)")
-	fs.DurationVar(&o.redisReload, "redis-reload", time.Second, "Redis Cluster: reload the slot map when it is older than this; a failed-over master's slots reach its replica within it (#139)")
+	fs.DurationVar(&o.redisReload, "redis-reload", time.Second, "Redis Cluster: reload the slot map when it is older than this (#139); a failed-over master's slots reach its replica within it, plus the read timeout (3s) for each node that does not answer the reload")
 	fs.StringVar(&o.jwksURL, "jwks-url", "", "account service JWKS URL")
 	fs.StringVar(&o.jwksFallback, "jwks-fallback", "/etc/goim/jwks-fallback/jwks.json", "jwks-fallback ConfigMap file")
 	fs.DurationVar(&o.jwks.Refresh, "jwks-refresh", o.jwks.Refresh, "periodic JWKS refresh")
