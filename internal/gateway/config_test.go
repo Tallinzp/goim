@@ -72,6 +72,8 @@ func TestValidateRefuses(t *testing.T) {
 		{"inverted heartbeat range", func(c *Config) { c.HeartbeatMin = 10 * time.Minute }, "HeartbeatMin"},
 		{"lease timeout above the interval", func(c *Config) { c.LeaseTimeout = 11 * time.Second }, "LeaseTimeout"},
 		{"lease retry above the interval", func(c *Config) { c.LeaseRetry = 11 * time.Second }, "LeaseRetry"},
+		{"inflight below one batch", func(c *Config) { c.LoginInflight = c.LoginBatch - 1 }, "LoginInflight"},
+		{"no inflight", func(c *Config) { c.LoginInflight = 0 }, "LoginInflight"},
 		{"lease TTL not above the interval", func(c *Config) { c.LeaseTTL = 10 * time.Second }, "LeaseTTL"},
 		{"jitter of half a cycle", func(c *Config) { c.Reconcile.Jitter = 5 * time.Minute }, "Jitter"},
 		{"empty Busy window", func(c *Config) { c.BusyRetry = Window{3 * time.Second, time.Second} }, "BusyRetry"},

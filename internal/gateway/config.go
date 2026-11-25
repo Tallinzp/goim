@@ -42,7 +42,8 @@ type Config struct {
 	LoginTimeout  time.Duration // per entry from recv_ms, ≥ LoginDeadline + 1s (6s)
 	LoginBatch    int           // entries per Login RPC (200)
 	LoginLinger   time.Duration // longest wait to fill a batch (5ms)
-	LoginRPCs     int           // concurrent Login RPCs (16)
+	LoginRPCs     int           // Login senders (16): each sends a batch and goes on (#145)
+	LoginInflight int           // entries sent with no result yet (3,200 = LoginRPCs × LoginBatch, #145)
 	BusyRetry     Window        // Busy{retry_after}, uniform (1–3s)
 
 	LogoutBatch   int           // entries per Logout RPC (200)
@@ -119,6 +120,7 @@ func DefaultConfig() Config {
 		LoginBatch:       200,
 		LoginLinger:      5 * time.Millisecond,
 		LoginRPCs:        16,
+		LoginInflight:    3200,
 		BusyRetry:        Window{time.Second, 3 * time.Second},
 		LogoutBatch:      200,
 		LogoutLinger:     5 * time.Millisecond,
@@ -175,7 +177,8 @@ func (c Config) Validate() error {
 	}
 	for name, v := range map[string]int{"MaxConns": c.MaxConns, "PendingCap": c.PendingCap,
 		"LoginQueueCap": c.LoginQueueCap, "LoginBatch": c.LoginBatch, "LoginRPCs": c.LoginRPCs,
-		"LogoutBatch": c.LogoutBatch, "LogoutRPCs": c.LogoutRPCs, "LogoutQueue": c.LogoutQueue,
+		"LoginInflight": c.LoginInflight,
+		"LogoutBatch":   c.LogoutBatch, "LogoutRPCs": c.LogoutRPCs, "LogoutQueue": c.LogoutQueue,
 		"Reconcile.Chunk": c.Reconcile.Chunk, "Reconcile.TriggeredRate": c.Reconcile.TriggeredRate,
 		"Reconcile.MinRate": c.Reconcile.MinRate, "Reconcile.MaxInFlight": c.Reconcile.MaxInFlight,
 		"Reconcile.DeleteRate": c.Reconcile.DeleteRate} {
@@ -219,6 +222,9 @@ func (c Config) Validate() error {
 		if d <= 0 {
 			bad("%s %v must be positive", name, d)
 		}
+	}
+	if c.LoginInflight < c.LoginBatch {
+		bad("LoginInflight %d must be at least LoginBatch %d: a full batch must fit", c.LoginInflight, c.LoginBatch)
 	}
 	if c.LeaseTimeout > c.LeaseInterval {
 		bad("LeaseTimeout %v must not exceed LeaseInterval %v", c.LeaseTimeout, c.LeaseInterval)

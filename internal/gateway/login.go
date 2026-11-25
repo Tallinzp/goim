@@ -202,10 +202,23 @@ func (g *Gateway) startLogin(ctx context.Context, logic pb.LogicClient) {
 	}
 }
 
-// sendLogins sends one batch and hands each entry's reply to its loop as it
-// arrives (R5S-O1). An entry with no result by recv_ms + LoginTimeout, or when
-// the stream ends, has no definitive reply (spec: Login batching).
+// sendLogins takes an inflight token per entry and starts the batch's RPC on
+// its own goroutine, so a sender is never held by a slow shard's entries:
+// the gateway bounds the entries with no result, not the RPCs (#145).
 func (g *Gateway) sendLogins(ctx context.Context, logic pb.LogicClient, items []*loginItem) {
+	// One sender takes tokens at a time. Two senders that each hold part of
+	// the tokens would wait for good when LoginInflight < LoginRPCs × LoginBatch.
+	g.taking.Lock()
+	for n := range items {
+		select {
+		case g.inflight <- struct{}{}:
+		case <-ctx.Done():
+			g.taking.Unlock()
+			g.releaseInflight(n)
+			return
+		}
+	}
+	g.taking.Unlock()
 	nowMs := g.now().UnixMilli()
 	live := make([]*loginItem, 0, len(items))
 	entries := make([]*pb.LoginEntry, 0, len(items))
@@ -226,12 +239,27 @@ func (g *Gateway) sendLogins(ctx context.Context, logic pb.LogicClient, items []
 		entries = append(entries, it.entry)
 		latest = max(latest, it.entry.RecvMs)
 	}
+	g.releaseInflight(len(items) - len(live))
 	if len(live) == 0 {
 		return
 	}
 	for _, it := range live {
 		g.m.LoginQueueSeconds.Observe(float64(nowMs-it.entry.RecvMs) / 1000)
 	}
+	g.goRun(func() { g.runLogins(ctx, logic, live, entries, latest) })
+}
+
+func (g *Gateway) releaseInflight(n int) {
+	for range n {
+		<-g.inflight
+	}
+}
+
+// runLogins sends one batch and hands each entry's reply to its loop as it
+// arrives (R5S-O1). An entry with no result by recv_ms + LoginTimeout, or when
+// the stream ends, has no definitive reply (spec: Login batching). Each
+// resolved entry gives back its inflight token.
+func (g *Gateway) runLogins(ctx context.Context, logic pb.LogicClient, live []*loginItem, entries []*pb.LoginEntry, latest int64) {
 	var sentMs int64
 	resolved := make([]bool, len(live))
 	left := len(live)
@@ -243,6 +271,7 @@ func (g *Gateway) sendLogins(ctx context.Context, logic pb.LogicClient, items []
 				g.m.LoginLogicSeconds.Observe(float64(g.now().UnixMilli()-sentMs) / 1000)
 			}
 			g.loginFinished()
+			g.releaseInflight(1)
 			g.post(live[i], r)
 		}
 	}

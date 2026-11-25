@@ -23,11 +23,13 @@ func (s *Service) Login(b *pb.LoginBatch, stream grpc.ServerStreamingServer[pb.L
 	if err != nil {
 		return invalid("%v", err)
 	}
+	// The shared pool bounds the token checks only. The store calls take a
+	// slot of their master's own pool (store GroupWorkers), so a stalled
+	// shard holds no slot the other shards need (#145).
 	release, err := s.pool.acquire(ctx)
 	if err != nil {
 		return err
 	}
-	defer release()
 
 	var mu sync.Mutex // Send is not safe for concurrent use; LoginEach's done is concurrent
 	var sendErr error
@@ -58,6 +60,7 @@ func (s *Service) Login(b *pb.LoginBatch, stream grpc.ServerStreamingServer[pb.L
 	// #115): the batch's token checks, then each entry's age from
 	// the gateway's recv_ms as the batch goes to the store.
 	s.m.LoginPrepare.Observe(time.Since(prepStart).Seconds())
+	release()
 	nowMs := s.now().UnixMilli()
 	for _, r := range reqs {
 		s.m.LoginAge.Observe(float64(nowMs-r.Entry.LoginMs) / 1000)

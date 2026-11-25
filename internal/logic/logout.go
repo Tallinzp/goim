@@ -21,7 +21,6 @@ func (s *Service) Logout(ctx context.Context, b *pb.LogoutBatch) (*pb.LogoutRepl
 	if err != nil {
 		return nil, err
 	}
-	defer release()
 
 	entries := b.GetEntries()
 	done := make([]bool, len(entries))
@@ -44,6 +43,9 @@ func (s *Service) Logout(ctx context.Context, b *pb.LogoutBatch) (*pb.LogoutRepl
 			Gateway: ref.Gateway, Epoch: ref.Epoch, ConnID: e.GetConnId()})
 		idx = append(idx, i)
 	}
+	// As Login: the store call waits on its master's own slots (store
+	// GroupWorkers), so a stalled shard holds no shared worker (#145).
+	release()
 	start := time.Now()
 	// done is called concurrently, but each call writes its own element.
 	s.st.LogoutEach(ctx, reqs, func(j int, r store.LogoutResult) {
