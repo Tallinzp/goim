@@ -304,6 +304,9 @@ func TestLightGivesUpAfterItsAttempts(t *testing.T) {
 		if c.Online != 0 || c.Logins != 0 {
 			t.Errorf("online %d, logins %d, want none", c.Online, c.Logins)
 		}
+		if l := r.Recorder().Logins(); l.FirstMs[0] != start.UnixMilli() || l.EndMs[0] != 0 || l.Attempts[0] != lightAttempts {
+			t.Errorf("login log %d %d %d, want the start, 0 and %d attempts", l.FirstMs[0], l.EndMs[0], l.Attempts[0], lightAttempts)
+		}
 		if lo, hi := (lightAttempts-1)*500*time.Millisecond, (lightAttempts-1)*1500*time.Millisecond; waited < lo || waited > hi {
 			t.Errorf("gave up after %v of waits, want %v-%v", waited, lo, hi)
 		}

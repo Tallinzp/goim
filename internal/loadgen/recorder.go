@@ -2,6 +2,7 @@ package loadgen
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -38,6 +39,7 @@ type Recorder struct {
 	pongRTT        *hist
 	marks          []*mark // by index
 	byName         map[string]*mark
+	loginLog       *LoginLogs // light mode's sequences (#139), made by the first LoginLog
 }
 
 // clientState: gw is the gateway it is logged in on (-1: none); mark and
@@ -112,6 +114,45 @@ func (r *Recorder) Lost(i int, why string, now time.Time) {
 	if m := r.markOf(*c); m != nil && m.lost[c.pos] == 0 {
 		m.lost[c.pos] = now.UnixMilli()
 	}
+}
+
+// LoginLogs is each client's latest sequence of login attempts, by client
+// index (GET /logins, #139): its first attempt's start (ms), when it logged
+// in (ms; 0: it gave up), and its attempts. A client with no sequence ended
+// yet is 0 in all three. Light mode only: a Tier 2 scenario reads it per
+// Redis shard (Plan 6c2b).
+type LoginLogs struct {
+	FirstMs  []int64 `json:"first_ms"`
+	EndMs    []int64 `json:"end_ms"`
+	Attempts []int32 `json:"attempts"`
+}
+
+// LoginLog: client i's sequence of attempts started at first and logged in
+// at end after attempts (end zero: it gave up). It replaces the client's
+// earlier sequence.
+func (r *Recorder) LoginLog(i int, first, end time.Time, attempts int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.loginLog == nil {
+		n := len(r.clients)
+		r.loginLog = &LoginLogs{FirstMs: make([]int64, n), EndMs: make([]int64, n), Attempts: make([]int32, n)}
+	}
+	r.loginLog.FirstMs[i], r.loginLog.EndMs[i], r.loginLog.Attempts[i] = first.UnixMilli(), 0, int32(attempts)
+	if !end.IsZero() {
+		r.loginLog.EndMs[i] = end.UnixMilli()
+	}
+}
+
+// Logins is a copy of the login log, zeros for every client before the
+// first LoginLog.
+func (r *Recorder) Logins() LoginLogs {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.loginLog == nil {
+		n := len(r.clients)
+		return LoginLogs{FirstMs: make([]int64, n), EndMs: make([]int64, n), Attempts: make([]int32, n)}
+	}
+	return LoginLogs{FirstMs: slices.Clone(r.loginLog.FirstMs), EndMs: slices.Clone(r.loginLog.EndMs), Attempts: slices.Clone(r.loginLog.Attempts)}
 }
 
 // Gateways is the gateway index each client is logged in on now, -1 for

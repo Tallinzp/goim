@@ -212,3 +212,26 @@ func TestRecorderCountsTheStormSinceMark(t *testing.T) {
 		t.Fatalf("storm since mark %+v", s)
 	}
 }
+
+// The login log keeps each client's latest sequence of attempts: its first
+// attempt's start, when it logged in (0: it gave up) and its attempts
+// (#139). A client with no sequence ended is all zeros.
+func TestRecorderLogsLoginSequences(t *testing.T) {
+	r := NewRecorder(3, []string{"gw-0"})
+	if l := r.Logins(); len(l.FirstMs) != 3 || l.FirstMs[0] != 0 || l.EndMs[0] != 0 || l.Attempts[0] != 0 {
+		t.Fatalf("empty log %+v", l)
+	}
+	r.LoginLog(0, at(100), at(2600), 3)
+	r.LoginLog(1, at(200), time.Time{}, 10)
+	r.LoginLog(0, at(5000), at(5010), 1) // a later sequence replaces the first
+	l := r.Logins()
+	if l.FirstMs[0] != at(5000).UnixMilli() || l.EndMs[0] != at(5010).UnixMilli() || l.Attempts[0] != 1 {
+		t.Fatalf("client 0: %d %d %d", l.FirstMs[0], l.EndMs[0], l.Attempts[0])
+	}
+	if l.FirstMs[1] != at(200).UnixMilli() || l.EndMs[1] != 0 || l.Attempts[1] != 10 {
+		t.Fatalf("client 1 (gave up): %d %d %d", l.FirstMs[1], l.EndMs[1], l.Attempts[1])
+	}
+	if l.FirstMs[2] != 0 || l.Attempts[2] != 0 {
+		t.Fatalf("client 2: %d %d", l.FirstMs[2], l.Attempts[2])
+	}
+}

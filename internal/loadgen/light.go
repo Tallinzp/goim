@@ -45,11 +45,14 @@ const lightAttempts = 10
 
 // light logs client lc in and reads until its connection ends.
 func (r *Runner) light(ctx context.Context, lc *lightConn) {
+	first := time.Now()
 	for attempt := 1; ; attempt++ {
 		start := time.Now()
 		gw, why := r.lightConnect(ctx, lc, start.Add(r.cfg.Timeout))
 		if why == "" {
-			r.rec.Online(lc.i, gw, start, time.Now())
+			now := time.Now()
+			r.rec.Online(lc.i, gw, start, now)
+			r.rec.LoginLog(lc.i, first, now, attempt)
 			break
 		}
 		r.rec.Failed(why)
@@ -58,6 +61,7 @@ func (r *Runner) light(ctx context.Context, lc *lightConn) {
 		}
 		if attempt == lightAttempts {
 			r.rec.Failed("gave-up")
+			r.rec.LoginLog(lc.i, first, time.Time{}, attempt)
 			return
 		}
 		select {

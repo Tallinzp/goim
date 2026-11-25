@@ -282,6 +282,26 @@ func TestLightRetriesAPreHandshakeClose(t *testing.T) {
 	if took := time.Since(begin); took < time.Second {
 		t.Fatalf("logged in after %v: retries must wait 0.5–1.5s each", took)
 	}
+	// GET /logins: the whole sequence, from the first attempt (#139).
+	srv := httptest.NewServer(r.Handler())
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/logins")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var l struct {
+		UIDPrefix string  `json:"uid_prefix"`
+		FirstMs   []int64 `json:"first_ms"`
+		EndMs     []int64 `json:"end_ms"`
+		Attempts  []int32 `json:"attempts"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&l); err != nil {
+		t.Fatal(err)
+	}
+	if l.UIDPrefix != "retry" || len(l.Attempts) != 1 || l.Attempts[0] != 3 || l.FirstMs[0] < begin.UnixMilli() || l.EndMs[0]-l.FirstMs[0] < 1000 {
+		t.Fatalf("/logins %+v, want 3 attempts over at least 1s from the first", l)
+	}
 }
 
 // refuseFirst forwards to addr like closeFirst, but reads each connection's

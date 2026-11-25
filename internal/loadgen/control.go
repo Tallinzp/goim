@@ -43,6 +43,8 @@ func (r *Runner) Result(within time.Duration) Result {
 //	                                          time (/reset's is close_ms; both keys are in recorded runs)
 //	                                          409: not sdk mode or the mark taken, nothing changed; 500: ErrGhostKeeper
 //	GET  /clients                             {"uid_prefix", "gateways", "gw": [client i's gateway index, -1: offline]}
+//	GET  /logins                              light: {"uid_prefix", "first_ms", "end_ms", "attempts"}: each client's
+//	                                          latest login sequence (LoginLogs; #139)
 //	GET  /slo?mark=death&within=30s           SLO
 //	GET  /runtime                             Runtime: loadgen's GC, memory and scheduling counters
 //	/debug/pprof/                             loadgen's own profiles
@@ -121,6 +123,10 @@ func (r *Runner) Handler() http.Handler {
 	})
 	mux.HandleFunc("GET /clients", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, map[string]any{"uid_prefix": r.cfg.UIDPrefix, "gateways": r.env.GatewayIDs, "gw": r.rec.Gateways()})
+	})
+	mux.HandleFunc("GET /logins", func(w http.ResponseWriter, _ *http.Request) {
+		l := r.rec.Logins()
+		writeJSON(w, map[string]any{"uid_prefix": r.cfg.UIDPrefix, "first_ms": l.FirstMs, "end_ms": l.EndMs, "attempts": l.Attempts})
 	})
 	mux.HandleFunc("POST /network-change", func(w http.ResponseWriter, _ *http.Request) {
 		n, took, err := r.NetworkChange()
