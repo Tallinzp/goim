@@ -15,7 +15,6 @@ cd "$(git rev-parse --show-toplevel)"
 . scripts/tier2/lib.sh
 . scripts/stack.sh
 . scripts/loadgen.sh
-eval "$(sed -n '/^rc_sessions_cmp() {/,/^}/p; /^rc_sessions_cmds() {/,/^}/p; /^rc_sessions_join() {/,/^}/p; /^rc_sessions() {/,/^}/p' scripts/tier2/reconnect.sh)"
 STACK_DIR=$(mktemp -d)
 trap 'lg_stop_all; stack_down; rm -rf "$STACK_DIR"' EXIT
 fails=0
@@ -78,7 +77,7 @@ stack_redis_wait_whole 30 && ok "whole: after the restart" || bad "whole: after 
 stack_redis_restore 30 && ok "restore: done" || bad "restore"
 expect "restore: the start layout" "$(stack_redis_roles)" "$start_roles"
 expect "restore: redis-0's range back" "$(stack_redis_slots | head -n 1)" "0 5460 redis-0"
-expect "sessions: every client of a and b found after the failover" "$(get "$(lg_in a rc_sessions 0)" 'd["found"]'),$(get "$(lg_in b rc_sessions 0)" 'd["found"]')" "30,30"
+expect "sessions: every client of a and b found after the failover" "$(get "$(lg_in a t2_sessions 0)" 'd["found"]'),$(get "$(lg_in b t2_sessions 0)" 'd["found"]')" "30,30"
 
 # Zone z0 stopped (redis-0, a master, and redis-5, redis-2's replica): no
 # reader hangs on it, redis-3 takes over, and on SIGCONT the zone returns.

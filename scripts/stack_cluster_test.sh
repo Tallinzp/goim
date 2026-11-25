@@ -10,7 +10,6 @@ cd "$(git rev-parse --show-toplevel)"
 . scripts/tier2/lib.sh
 . scripts/stack.sh
 . scripts/loadgen.sh
-eval "$(sed -n '/^rc_sessions_cmp() {/,/^}/p; /^rc_sessions_cmds() {/,/^}/p; /^rc_sessions_join() {/,/^}/p; /^rc_sessions() {/,/^}/p' scripts/tier2/reconnect.sh)"
 STACK_DIR=$(mktemp -d)
 trap 'lg_stop; stack_down; rm -rf "$STACK_DIR"' EXIT
 fails=0
@@ -79,7 +78,7 @@ expect "latency: every node, its role and zone" "$(get "$lat" '[(n, d[n]["role"]
 expect "latency: logins' scripts on every master" "$(get "$lat" 'all(d[n]["cmds"].get("evalsha", {}).get("calls", 0) > 0 for n in ("redis-0", "redis-1", "redis-2"))')" True
 expect "latency: no reader's own commands" "$(get "$lat" 'any(k == "info" or k.startswith(("config", "cluster")) for n in d for k in d[n]["cmds"])')" False
 mkdir -p "$STACK_DIR/artifacts"
-s=$(rc_sessions 0)
+s=$(t2_sessions 0)
 expect "sessions: every client found per slot" "$(get "$s" '(d["clients"], d["found"])')" "(30, 30)"
 expect "sessions: the check's time is recorded" "$(get "$s" 'd.get("ms", -1) >= 0')" True
 expect "sessions: no CROSSSLOT" "$(cat "$STACK_DIR/sessions"/*.out | grep -c CROSSSLOT)" 0
