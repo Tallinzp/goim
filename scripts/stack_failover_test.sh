@@ -36,7 +36,8 @@ STACK_REDIS=cluster
 export REDIS_CLUSTER_NODE_TIMEOUT_MS=2000
 start_roles='{"redis-0": "master", "redis-1": "master", "redis-2": "master", "redis-3": "replica", "redis-4": "replica", "redis-5": "replica"}'
 
-expect "default node timeout: 10s (#139)" "$(unset REDIS_CLUSTER_NODE_TIMEOUT_MS; . scripts/redis-cluster.sh; redis_cluster_args 1 2 d; echo "${REDIS_CLUSTER_ARGS[@]}" | grep -o 'cluster-node-timeout [0-9]*')" "cluster-node-timeout 10000"
+expect "default node timeout: 5s (#140)" "$(unset REDIS_CLUSTER_NODE_TIMEOUT_MS; . scripts/redis-cluster.sh; redis_cluster_args 1 2 d; echo "${REDIS_CLUSTER_ARGS[@]}" | grep -o 'cluster-node-timeout [0-9]*')" "cluster-node-timeout 5000"
+expect "not full coverage: a failed master stops only its own slots (#142)" "$(. scripts/redis-cluster.sh; redis_cluster_args 1 2 d; echo "${REDIS_CLUSTER_ARGS[@]}" | grep -o 'cluster-require-full-coverage [a-z]*')" "cluster-require-full-coverage no"
 
 stack_build || { echo "build failed"; exit 1; }
 if stack_up; then ok "up: every process Ready"; else bad "up"; exit 1; fi
@@ -50,11 +51,16 @@ m0=$(missing)
 
 # A SIGKILLed master: the slot map now comes from redis-1 (P6c1I-1), its
 # replica takes over, the lease and new logins live on.
+t0k=$SECONDS
 stack_redis_kill redis-0 && ok "kill: redis-0 reaped" || bad "kill: redis-0"
 expect "kill: recorded as expected" "$(grep -c '^redis-0 expected:137$' "$STACK_DIR/exit-status")" 1
 expect "live: the first node that answers" "$(stack_redis_live)" redis-1
 expect "slots: 3 ranges from a live node" "$(stack_redis_slots | wc -l)" 3
 expect "role: a killed node is down" "$(stack_redis_role redis-0)" down
+# Before redis-3 takes over, redis-0 is marked failed (2 x the 2s node
+# timeout at most); redis-1 still serves its own slots ({c}: slot 7365) (#142).
+until stack_redis_node_cli redis-1 cluster nodes 2>/dev/null | grep -q 'master,fail ' || [ $((SECONDS - t0k)) -gt 10 ]; do sleep 0.05; done
+expect "kill: another shard answers while redis-0 is failed" "$(STACK_REDIS_TIMEOUT=1 stack_redis_node_cli redis-1 set '{c}' 1 2>&1)" OK
 t=$SECONDS
 stack_redis_wait_role redis-3 master 15 && ok "failover: redis-3 is master after $((SECONDS - t))s" || bad "failover: redis-3 not master"
 until stack_redis_slots | grep -q '^0 5460 redis-3$' || [ $((SECONDS - t)) -gt 15 ]; do sleep 0.2; done

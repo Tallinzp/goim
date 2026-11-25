@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 func TestDefaultFlagsAreValid(t *testing.T) {
@@ -11,7 +13,7 @@ func TestDefaultFlagsAreValid(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Store.LeaseTTL != 30*time.Second || sc.MaxConnectionAgeGrace != 30*time.Second || !o.redisCluster || o.redisReload != time.Second {
+	if cfg.Store.LeaseTTL != 30*time.Second || sc.MaxConnectionAgeGrace != 30*time.Second || !o.redisCluster || o.redisReload != time.Second || o.redisReadTimeout != time.Second {
 		t.Fatalf("defaults: %+v %+v %+v", cfg, sc, o)
 	}
 }
@@ -20,6 +22,36 @@ func TestDefaultFlagsAreValid(t *testing.T) {
 func TestRefusesZeroRedisReload(t *testing.T) {
 	if _, _, _, err := parseFlags([]string{"-jwks-url", "x", "-redis-reload", "0s"}); err == nil || !strings.Contains(err.Error(), "-redis-reload") {
 		t.Fatalf("-redis-reload 0s: %v", err)
+	}
+}
+
+// A zero -redis-read-timeout would be go-redis's 5s default, a negative one
+// no timeout at all (#140).
+func TestRefusesNonPositiveRedisReadTimeout(t *testing.T) {
+	for _, v := range []string{"0s", "-1s"} {
+		if _, _, _, err := parseFlags([]string{"-jwks-url", "x", "-redis-read-timeout", v}); err == nil || !strings.Contains(err.Error(), "-redis-read-timeout") {
+			t.Fatalf("-redis-read-timeout %s: %v", v, err)
+		}
+	}
+}
+
+// Both clients get the read and write timeout (#140) and the Cluster client
+// the reload interval (#139).
+func TestRedisClientTimeouts(t *testing.T) {
+	_, _, o, err := parseFlags([]string{"-jwks-url", "x", "-redis", "127.0.0.1:1,127.0.0.1:2", "-redis-read-timeout", "700ms"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := newRedis(o).(*redis.ClusterClient)
+	defer c.Close()
+	if co := c.Options(); co.ReadTimeout != 700*time.Millisecond || co.WriteTimeout != 700*time.Millisecond || co.ClusterStateReloadInterval != time.Second {
+		t.Fatalf("cluster: read %v write %v reload %v", co.ReadTimeout, co.WriteTimeout, co.ClusterStateReloadInterval)
+	}
+	o.redisCluster = false
+	s := newRedis(o).(*redis.Client)
+	defer s.Close()
+	if so := s.Options(); so.ReadTimeout != 700*time.Millisecond || so.WriteTimeout != 700*time.Millisecond {
+		t.Fatalf("single: read %v write %v", so.ReadTimeout, so.WriteTimeout)
 	}
 }
 
