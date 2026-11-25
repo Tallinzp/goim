@@ -452,3 +452,44 @@ func TestLoginFreesItsWorkerBeforeTheStore(t *testing.T) {
 	}
 	close(gate.release)
 }
+
+// gatedLogout holds every Logout until release is closed (or 2s pass), as a
+// stalled master would hold a store call.
+type gatedLogout struct {
+	*store.Store
+	release chan struct{}
+}
+
+func (g *gatedLogout) LogoutEach(ctx context.Context, reqs []store.LogoutReq, done func(int, store.LogoutResult)) {
+	select {
+	case <-g.release:
+	case <-time.After(2 * time.Second):
+	}
+	g.Store.LogoutEach(ctx, reqs, done)
+}
+
+// #145: Logout frees its shared worker before the store too, so Logouts held
+// by a stalled master do not hold the workers other shards' logins need.
+func TestLogoutFreesItsWorkerBeforeTheStore(t *testing.T) {
+	gate := &gatedLogout{release: make(chan struct{})}
+	t.Cleanup(func() { close(gate.release) })
+	e := newEnvWith(t, testConfig(), func(s *store.Store) Store { gate.Store = s; return gate })
+	c := e.dial()
+	for i := range 9 { // one more than the service's 8 workers
+		go c.Logout(ctx, &pb.LogoutBatch{Gw: pbRef(e.gw), Entries: []*pb.LogoutEntry{ // held until the test ends
+			{ConnId: uint64(i + 1), Uid: testredis.UID(), Appid: "im", Platform: pb.Platform_PLATFORM_MOBILE}}})
+	}
+	time.Sleep(100 * time.Millisecond) // the nine reach the store
+	start := time.Now()
+	stream, err := c.Login(ctx, &pb.LoginBatch{Gw: pbRef(e.gw), Entries: []*pb.LoginEntry{e.loginEntry(testredis.UID(), 20, "d", 1)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := stream.Recv()
+	if err != nil || r.Code != pb.LoginCode_LOGIN_CODE_OK {
+		t.Fatalf("login: %+v %v", r, err)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("login took %v: it waited for a worker the held Logouts held", d)
+	}
+}
