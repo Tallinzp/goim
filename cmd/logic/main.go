@@ -64,7 +64,7 @@ func parseFlags(args []string) (logic.Config, logic.ServerConfig, options, error
 	fs.StringVar(&sc.GRPCAddr, "grpc-addr", sc.GRPCAddr, "Logic and Revocation gRPC listen address")
 	fs.StringVar(&sc.LeaseAddr, "lease-addr", sc.LeaseAddr, "Lease gRPC listen address (dedicated, R1-O2)")
 	fs.StringVar(&sc.AdminAddr, "admin-addr", sc.AdminAddr, "/metrics, /healthz, /readyz, /debug/pprof/ listen address")
-	fs.IntVar(&sc.Workers, "workers", sc.Workers, "concurrent Login/Logout/Reconcile calls")
+	fs.IntVar(&sc.Workers, "workers", sc.Workers, "concurrent Login/Logout/Reconcile calls, and Login/Logout script groups in flight per Redis master")
 	fs.IntVar(&sc.LeaseWorkers, "lease-workers", sc.LeaseWorkers, "concurrent lease calls")
 	fs.DurationVar(&sc.MaxConnectionAge, "max-conn-age", sc.MaxConnectionAge, "gRPC MaxConnectionAge")
 	fs.DurationVar(&sc.MaxConnectionAgeGrace, "max-conn-age-grace", sc.MaxConnectionAgeGrace, "gRPC MaxConnectionAgeGrace")
@@ -110,6 +110,9 @@ func parseFlags(args []string) (logic.Config, logic.ServerConfig, options, error
 	if o.redisReadTimeout <= 0 { // go-redis reads 0 as its 5s default, -1 as none
 		return cfg, sc, o, errors.New("config: -redis-read-timeout must be positive")
 	}
+	// One master's group of Login/Logout scripts waits at most one read
+	// timeout, with -workers slots per master (#145).
+	cfg.Store.GroupTimeout, cfg.Store.GroupWorkers = o.redisReadTimeout, sc.Workers
 	return cfg, sc, o, nil
 }
 

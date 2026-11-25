@@ -18,6 +18,13 @@ type Config struct {
 	SessTTL       time.Duration // sess:{uid} TTL, also used for rev:{uid} (R4M-1); default 30d
 	LeaseTTL      time.Duration // gwlease TTL (default 30s)
 	WaitTimeout   time.Duration // Revoke's WAIT 1 <timeout> (default 1s)
+	// GroupTimeout bounds one master's group in runEach, from its send to
+	// its last reply, so a stopped master fails its calls in one read
+	// timeout and go-redis has no time to send them again (#145). 0: none.
+	GroupTimeout time.Duration
+	// GroupWorkers bounds the groups in flight to one master, so a stalled
+	// master uses only its own share (#145). 0: no bound.
+	GroupWorkers int
 }
 
 // DefaultConfig returns the spec defaults.
@@ -48,6 +55,9 @@ type Store struct {
 	masterFor   func(ctx context.Context, key string) (*redis.Client, error)
 	reloadSlots func(ctx context.Context)
 	rerouteWait time.Duration // how long Revoke waits for a new master
+
+	slotsMu sync.Mutex
+	slots   map[string]chan struct{} // per group, GroupWorkers each
 }
 
 // rerouteWait's default, and how often the slot map is re-read meanwhile.
@@ -136,20 +146,70 @@ func (s *Store) runEach(ctx context.Context, sc *redis.Script, calls []scriptCal
 		groups[g] = append(groups[g], j)
 	}
 	var wg sync.WaitGroup
-	for _, js := range groups {
+	for g, js := range groups {
 		wg.Add(1)
-		go func(js []int) {
+		go func(g string, js []int) {
 			defer wg.Done()
 			sub := make([]scriptCall, len(js))
 			for k, j := range js {
 				sub[k] = calls[j]
 			}
-			for k, cmd := range s.runBatch(ctx, sc, sub) {
+			release, err := s.acquireGroup(ctx, g)
+			if err != nil {
+				for _, j := range js {
+					done(j, failedCmd(ctx, err))
+				}
+				return
+			}
+			defer release()
+			gctx, cancel := s.groupCtx(ctx)
+			defer cancel()
+			for k, cmd := range s.runBatch(gctx, sc, sub) {
 				done(js[k], cmd)
 			}
-		}(js)
+		}(g, js)
 	}
 	wg.Wait()
+}
+
+// acquireGroup takes one of group g's GroupWorkers slots, waiting until ctx
+// ends. The wait is outside GroupTimeout: a busy healthy master queues its
+// calls, it does not fail them.
+func (s *Store) acquireGroup(ctx context.Context, g string) (release func(), err error) {
+	if s.cfg.GroupWorkers <= 0 {
+		return func() {}, nil
+	}
+	s.slotsMu.Lock()
+	if s.slots == nil {
+		s.slots = map[string]chan struct{}{}
+	}
+	ch, ok := s.slots[g]
+	if !ok {
+		ch = make(chan struct{}, s.cfg.GroupWorkers)
+		s.slots[g] = ch
+	}
+	s.slotsMu.Unlock()
+	select {
+	case ch <- struct{}{}:
+		return func() { <-ch }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// groupCtx is ctx bounded by GroupTimeout, when set.
+func (s *Store) groupCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	if s.cfg.GroupTimeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, s.cfg.GroupTimeout)
+}
+
+// failedCmd is a script call that was never sent, failed with err.
+func failedCmd(ctx context.Context, err error) *redis.Cmd {
+	cmd := redis.NewCmd(ctx)
+	cmd.SetErr(err)
+	return cmd
 }
 
 // nodeFor returns the client for the master that owns key, so commands that

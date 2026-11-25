@@ -55,6 +55,18 @@ func TestRedisClientTimeouts(t *testing.T) {
 	}
 }
 
+// The store bounds one master's Login/Logout group by the read timeout,
+// with -workers slots per master (#145).
+func TestStoreGroupFlags(t *testing.T) {
+	cfg, _, _, err := parseFlags([]string{"-jwks-url", "x", "-workers", "5", "-redis-read-timeout", "700ms"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Store.GroupWorkers != 5 || cfg.Store.GroupTimeout != 700*time.Millisecond {
+		t.Fatalf("store groups: workers %d timeout %v", cfg.Store.GroupWorkers, cfg.Store.GroupTimeout)
+	}
+}
+
 // The test timing profile (Plan 5) scales intervals ~10× and keeps the ratios.
 func TestScaledProfileFlags(t *testing.T) {
 	_, _, _, err := parseFlags([]string{"-jwks-url", "x", "-lease-ttl", "3s", "-renew-interval", "1s",
