@@ -1419,4 +1419,36 @@ In this plan's *Execution Notes*: run 34's numbers as in Step 2, against the dev
 
 ## Execution Notes
 
-(empty until execution)
+**Executed 2026-11-25, inline (superpowers:executing-plans), on `feat/plan6c2b`.** First, the user decided #143.1–7, all as proposed (`8b5db1f`).
+
+- **Task 1** (`67e4b30`): the tests failed as Step 2 says (vet `o.redisReadTimeout undefined`; `stack_failover_test.sh` 3 failures, among them `CLUSTERDOWN The cluster is down`). After the code: `go test ./cmd/logic/` ok, `stack_failover_test.sh` 0 failures, `make test-redis-cluster-local` 20 `ok`. Both mutations were caught as Step 4 says.
+- **Task 2** (`e2cffa9`): `reconnect_test` had 13 failures before the move and passed after it. `stack_failover_test.sh` and `stack_cluster_test.sh` had 0 failures, and `grep rc_sessions` prints nothing. `lib_test` `windows: two named windows pass` failed 3 of 5 times right after the stack suites, then passed 10 of 10 alone. It is the swap flake named under *Size*; the move does not touch `t2_record_*`.
+- **Task 3** (`be4b287`): `failover_test` had 25 failures before and passed after. The mutation gave the 3 FAILs Step 4 names. `go vet`, `make test`, `make test-redis-local` and `make test-redis-cluster-local` gave 20 `ok` each, and `make test-scripts` was all green. The dry run exited 1 with 30 checks. It failed only `no_swap_in_*` ×3 and `zone_other_shards`. `master_ms`: manual 37, kill 7,813, zone 7,984. Other-shard p99, before → window: 11 → 12, 11 → 15, 12 → 861ms. `missing` was 0 everywhere.
+- **Final review** (fresh Opus, whole branch): 0 Critical.
+  - **I-1:** the flow clients' 10 login attempts span ~9s (9 waits of 0.5–1.5s). A SIGKILLed master refuses each attempt at once, and the failover took ~8.2s, so `kill_logins` could fail by chance at 200/s. Fixed with the user's agreement, after run 34: loadgen `-light-attempts` (default 10, refused below 1; `Config.Attempts`, 0 → 10) and the scenario's `FAILOVER_FLOW_ATTEMPTS` (default 30, recorded in `run`). Tests `TestLightGivesUpAfterConfiguredAttempts` and `TestRunRefusesBadFlags` (`-light-attempts 0`) went RED → GREEN.
+  - **Deferred minors:** M1, a null `at_ms_since_renewal` (the worst time not reached) is recorded, not failed. M2, the flow's `t2_sessions` read overwrites main's raw files in `artifacts/`. M3, go-redis retries a read timeout up to `MaxRedirects` (3) times, so a stopped node costs ~4 × 1s, and a reply slower than 1s from a live master sends a non-idempotent EVAL again; this is carried into #144. M4, `P_lease` passes on an empty gateway map. M5, `t2_sessions`' bulk `redis-cli` has no timeout.
+- **Run 34** (the user, Tier 2 host, `be4b287`, 2026-11-25; 485s; ramp 122s, 600,000 online): **exit 1, 28/30**, failing `kill_other_shards` and `zone_other_shards`. No swap in any phase.
+
+| | manual | kill | zone |
+|---|---|---|---|
+| `master_ms` / `cluster_ok_ms` | 23 / 34 | 8,225 / 8,235 (dev 7.7–7.8s) | 8,228 / 8,240 (dev 7.1–9.2s) |
+| `at_ms_since_renewal` | 9,020 | 9,024 | 9,018 |
+| lease `missing` (gw-0/1/2, Logic) | 0 | 0 | 0 |
+| lease `error` (gw-0/1/2; Logic) | 0/0/0; 0 | 7/0/7; 14 | 1/1/2; 3 |
+| sweep deletions | 0 | 0 | 0 |
+| restore / rejoin (`whole_s`) | 0s / 0s | 2s / 1s | 2s / 2s |
+| other shards' p99, before → window (n) | 21 → 20ms (134) | 21 → **104ms** (1,228; bound 71) | 21 → **4,470ms** (1,223) |
+| other shards in the window: retried, max | 0, 26ms | 4, 1,284ms | 0, 4,743ms (p50 936) |
+| target shard in the window: n, retried, p50/p99/max | 71, 0, 7/63/63ms | 617, 581, 4,647/9,384/9,836ms | 623, 407, 6,825/13,611/14,125ms |
+| `target_affected_share` | 0.0 | 0.94 | 0.65 |
+| flow clients that gave up | 0 | 0 | 0 |
+| main sessions (600k) / through window lost | all found / 0 of 8,000 | all found / 0 | all found / 0 |
+
+  - The target was `redis-1` in every phase. gw-0's and gw-2's lease keys and `gwepochs` were all on it (Review Focus 5 happened); gw-1's key was on `redis-0`. The worst time was reached in every phase (~9.0s after gw-0's renewal), and the key lived: at the defaults with #140, the lease rule holds through a kill and a zone loss.
+  - Zone: the gateways refused no login for want of a worker (`logins_busy` 0); `logins_expired` was 51 on gw-1 and 1 on gw-2. The other shards' logins queued: #144 at scale, as Task 3 Step 5 expected.
+  - **Kill (not expected):** the other shards' window p99 was 104ms against a 71ms bound. 13 sequences were above it, and 4 retried, up to 1,284ms. A likely cause (not verified): a Login batch that holds a uid on the killed master keeps its `LoginRPCs` worker until its last reply, while go-redis retries the refused dial with backoff. That is #144's mechanism, but lighter. The user chose to record it under #144 and fix it in that plan.
+  - Review Focus 2: the returning node's full resync loaded 202,590 keys in 0.4s (fork CoW 8MB). No second failover.
+  - The masters' `evalsha` p99 over the through windows was 170–237µs.
+  - Review Focus 1: Logic's log shows `redis: connection pool timeout` and `context deadline exceeded` on `gwconns SADD` from 02:07:21 to 02:07:25, at the end of the zone failover window and just after it.
+- **Not rerun after I-1's fix on the host:** run 34 is the recorded result (its flow had 0 give-ups). The fix was checked by the dev dry run (below).
+
