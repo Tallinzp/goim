@@ -28,6 +28,7 @@ test-scripts:
 	scripts/tier2/lib_test.sh
 	scripts/tier2/floods_test.sh
 	scripts/tier2/reconnect_test.sh
+	scripts/tier2/failover_test.sh
 	scripts/loadgen_test.sh
 	STACK_REDIS_SERVER=$(REDIS_SERVER) scripts/stack_test.sh
 	STACK_REDIS_SERVER=$(REDIS_SERVER) scripts/stack_cluster_test.sh
