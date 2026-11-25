@@ -424,3 +424,31 @@ func TestLoginObservesEntryAgeAndPrepare(t *testing.T) {
 		t.Fatalf("login_prepare_seconds count %d, want 1 (one per batch)", n)
 	}
 }
+
+// #145: Login gives its shared worker back before the store calls, so logins
+// held on a stalled shard do not keep a login on another shard waiting.
+func TestLoginFreesItsWorkerBeforeTheStore(t *testing.T) {
+	slow := testredis.UID()
+	gate := &gatedLogin{slowUID: slow, release: make(chan struct{})}
+	e := newEnvWith(t, testConfig(), func(s *store.Store) Store { gate.Store = s; return gate })
+	c := e.dial()
+	for i := range 9 { // one more than the service's 8 workers
+		if _, err := c.Login(ctx, &pb.LoginBatch{Gw: pbRef(e.gw), Entries: []*pb.LoginEntry{e.loginEntry(slow, uint64(i+1), "d", uint64(i+1))}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(100 * time.Millisecond) // the nine reach the store
+	start := time.Now()
+	stream, err := c.Login(ctx, &pb.LoginBatch{Gw: pbRef(e.gw), Entries: []*pb.LoginEntry{e.loginEntry(testredis.UID(), 20, "d", 1)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := stream.Recv()
+	if err != nil || r.Code != pb.LoginCode_LOGIN_CODE_OK {
+		t.Fatalf("fast login: %+v %v", r, err)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("fast login took %v: it waited for a worker the stalled ones held", d)
+	}
+	close(gate.release)
+}
