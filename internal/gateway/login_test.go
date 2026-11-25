@@ -146,12 +146,12 @@ func TestLogicCodesReachTheClient(t *testing.T) {
 }
 
 func TestQueuedLoginPastTheDeadlineIsDroppedBeforeSending(t *testing.T) {
-	l := newLive(t, func(c *Config) { shortDeadline(c); c.LoginRPCs, c.LoginBatch = 1, 1 })
+	l := newLive(t, func(c *Config) { shortDeadline(c); c.LoginRPCs, c.LoginBatch, c.LoginInflight = 1, 1, 1 })
 	release := make(chan struct{})
 	l.logic.set(func() {
 		l.logic.login = func(b *pb.LoginBatch, s grpc.ServerStreamingServer[pb.LoginResult]) error {
 			if tokenSubject(b.Entries[0].GetToken()) == "first" {
-				<-release // the only worker is busy
+				<-release // the only inflight token is held
 			}
 			return s.Send(okResult(0, b.Entries[0]))
 		}
@@ -205,4 +205,25 @@ func histDTO(t *testing.T, h prometheus.Histogram) *dto.Histogram {
 		t.Fatal(err)
 	}
 	return m.GetHistogram()
+}
+
+// #145: a sender hands a sent batch to its own goroutine, so a batch held in
+// Logic (a stalled shard) does not hold the next batch back.
+func TestHeldLoginBatchDoesNotHoldTheSender(t *testing.T) {
+	l := newLive(t, func(c *Config) { c.LoginRPCs, c.LoginBatch = 1, 1 })
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	l.logic.set(func() {
+		l.logic.login = func(b *pb.LoginBatch, s grpc.ServerStreamingServer[pb.LoginResult]) error {
+			if tokenSubject(b.Entries[0].GetToken()) == "held" {
+				<-release
+			}
+			return s.Send(okResult(0, b.Entries[0]))
+		}
+	})
+	held, next := l.authed(0), l.authed(1)
+	l.frame(held, clientpb.Cmd_CMD_LOGIN, 1, loginReq("held", "d", 1))
+	waitFor(t, "held sent", func() bool { return get(l.logic, func() int { return len(l.logic.logins) }) == 1 })
+	l.frame(next, clientpb.Cmd_CMD_LOGIN, 1, loginReq("next", "d", 1))
+	waitFor(t, "next logged in while the first is held", func() bool { return next.last(t, clientpb.Cmd_CMD_LOGIN_RESP, nil) })
 }

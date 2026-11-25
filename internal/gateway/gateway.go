@@ -30,6 +30,7 @@ type Gateway struct {
 	draining    atomic.Bool
 
 	loginCh  chan *loginItem
+	inflight chan struct{} // one token per entry sent with no result yet (LoginInflight)
 	logoutCh chan *logoutItem
 	gauges   [3]stateGauges
 
@@ -67,6 +68,7 @@ func New(cfg Config, d Deps) (*Gateway, error) {
 		loops:    newLoops(cfg, now()),
 		log:      slog.Default().With("gw", cfg.GatewayID, "epoch", cfg.Epoch),
 		loginCh:  make(chan *loginItem, cfg.LoginQueueCap),
+		inflight: make(chan struct{}, cfg.LoginInflight),
 		logoutCh: make(chan *logoutItem, cfg.LogoutQueue),
 	}
 	g.server = server{registry: d.Registry, readyChecks: d.ReadyChecks, limits: hostLimits, faults: d.Faults}
