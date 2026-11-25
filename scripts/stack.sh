@@ -28,10 +28,28 @@
 #   stack_hist_quantile A B Q   # Q's bucket bound in ms over two stack_buckets readings (null: no sample)
 #   stack_redis_names           # the Redis processes: "redis", or redis-0..5 on a Cluster
 #   stack_redis_node_cli NAME ARGS...  # redis-cli against one Redis process
-#   stack_redis_slots           # "START END NAME" per master's slot range ("0 16383 redis" on one Redis)
+#   stack_redis_ping NAME       # true if NAME answers PING within 1s (a stopped node does not)
+#   stack_redis_live            # the first Redis process that answers ("": none)
+#   stack_redis_slots           # "START END NAME" per master's slot range ("0 16383 redis" on one Redis),
+#                               #   as the first node that answers sees it
 #   stack_redis_resetstat       # Redis CONFIG RESETSTAT on every node: a latency window starts
 #   stack_redis_latency         # {"CMD": {"calls", "p50_us", "p99_us", "p999_us"}...} since the reset (null: no answer);
 #                               #   on a Cluster {NAME: {"role", "zone", "cmds": {"CMD": ...}}...}
+#   Cluster failover (Plan 6c2a; each node keeps its name, port and nodes.conf):
+#   stack_redis_role NAME       # master, replica, or down (no answer within 1s)
+#   stack_redis_roles           # {"redis-0": "master", ...}: every node's role now
+#   stack_redis_owner KEY       # the master that owns KEY's slot now
+#   stack_lease_key GW          # gwlease:GW:{EPOCH} of GW's newest epoch in gwepochs
+#   stack_redis_kill NAME       # SIGKILL NAME and reap it (stack_expect_dead)
+#   stack_redis_restart NAME    # start a killed NAME again with its nodes.conf: it rejoins
+#   stack_redis_stop NAME       # SIGSTOP NAME: its sockets stay open, nothing answers (a cut-off zone)
+#   stack_redis_cont NAME       # SIGCONT NAME
+#   stack_redis_wait_role NAME ROLE SECONDS  # until NAME's role is ROLE; fails after SECONDS
+#   stack_redis_failover NAME   # CLUSTER FAILOVER on replica NAME: it becomes master within 10s
+#   stack_redis_wait_whole SECONDS  # until every node answers, reports cluster_state:ok, sees 3
+#                               #   replicas and no failed node, and every replica is linked
+#   stack_redis_restore SECONDS # the start layout back (redis/layout): each start master that is a
+#                               #   replica takes its role back; then stack_redis_wait_whole
 #   stack_down                  # gateways, then Logic, devtoken, Redis (#78); call it from the exit trap
 #   stack_health                # one line per problem: dead process, unclean stop, panic in a log
 #
@@ -44,7 +62,8 @@
 #                        below the race suite's 20000-32000 and the ephemeral range)
 #   STACK_REDIS          single (default): one redis-server; cluster: 3 masters and 3
 #                        replicas (scripts/redis-cluster.sh: zones z0-z2 as labels,
-#                        layout in redis/layout), Logic with -redis-cluster
+#                        layout in redis/layout, cluster-node-timeout 10s), Logic with
+#                        -redis-cluster
 #   STACK_PIN            1: taskset gateways to T2_CPUS_GATEWAY, Logic and Redis
 #                        to T2_CPUS_LOGIC (lib.sh sets both); 0: no pinning (default)
 #   STACK_REDIS_SERVER   default: redis-server on PATH, else .cache/redis/bin/redis-server
@@ -307,7 +326,7 @@ stack_snapshot() {
   stack_redis_cli info all >"$dir/redis.info" 2>&1
   if [ "${STACK_REDIS:-single}" = cluster ]; then
     for name in $(stack_redis_names); do
-      stack_redis_node_cli "$name" info all >"$dir/$name.info" 2>&1
+      if stack_redis_ping "$name"; then stack_redis_node_cli "$name" info all >"$dir/$name.info" 2>&1; else echo "no answer within 1s" >"$dir/$name.info"; fi
     done
     stack_redis_cli cluster nodes >"$dir/cluster-nodes.txt" 2>&1
   fi
@@ -319,7 +338,8 @@ stack_redis_names() {
 }
 
 # stack_redis_node_cli NAME ARGS...: redis-cli against one Redis process
-# (redis-j on port base + 20 + j), no redirects followed.
+# (redis-j on port base + 20 + j), no redirects followed; bounded by
+# STACK_REDIS_TIMEOUT seconds when it is set.
 stack_redis_node_cli() {
   local redis=${STACK_REDIS_SERVER:-$(command -v redis-server || echo "$PWD/.cache/redis/bin/redis-server")}
   local base=${STACK_PORT_BASE:-17000} port name=$1
@@ -329,20 +349,47 @@ stack_redis_node_cli() {
     redis-[0-5]) port=$((base + 20 + ${name#redis-})) ;;
     *) echo "stack: no Redis process $name" >&2; return 1 ;;
   esac
-  "$(dirname "$redis")/redis-cli" -p "$port" "$@"
+  if [ -n "${STACK_REDIS_TIMEOUT:-}" ]; then
+    timeout "$STACK_REDIS_TIMEOUT" "$(dirname "$redis")/redis-cli" -p "$port" "$@"
+  else
+    "$(dirname "$redis")/redis-cli" -p "$port" "$@"
+  fi
+}
+
+# stack_redis_ping NAME: true if NAME answers PING within 1s. A stopped
+# node (stack_redis_stop) accepts the connection and never answers.
+stack_redis_ping() { [ "$(STACK_REDIS_TIMEOUT=1 stack_redis_node_cli "$1" ping 2>/dev/null)" = PONG ]; }
+
+# stack_redis_live: the first process in stack_redis_names that answers
+# PING; nothing if none does.
+stack_redis_live() {
+  local name
+  for name in $(stack_redis_names); do
+    stack_redis_ping "$name" && { echo "$name"; return; }
+  done
 }
 
 # stack_redis_cli ARGS...: redis-cli against the stack's Redis: the one
-# redis-server, or on a Cluster redis-0 (a key it does not own answers
-# MOVED: per-key commands go through stack_redis_slots, review P6b3c2I-3).
+# redis-server, or on a Cluster the first node that answers (review
+# P6c1I-1: redis-0 may be down after a failover; a key a node does not own
+# answers MOVED: per-key commands go through stack_redis_slots, review
+# P6b3c2I-3). Fails if no node answers.
 stack_redis_cli() {
-  if [ "${STACK_REDIS:-single}" = cluster ]; then stack_redis_node_cli redis-0 "$@"; else stack_redis_node_cli redis "$@"; fi
+  if [ "${STACK_REDIS:-single}" = cluster ]; then
+    local live
+    live=$(stack_redis_live)
+    [ -n "$live" ] || return 1
+    stack_redis_node_cli "$live" "$@"
+  else
+    stack_redis_node_cli redis "$@"
+  fi
 }
 
 # stack_redis_slots: "START END NAME" for each master's slot range, from
-# CLUSTER NODES as redis-0 sees it now (after a failover too; a master
-# only suspected, "fail?", keeps its range until it is marked "fail"); "0 16383
-# redis" on one Redis. Prints nothing if Redis does not answer.
+# CLUSTER NODES as the first node that answers sees it now (after a failover
+# too; a master only suspected, "fail?", keeps its range until it is marked
+# "fail", review P6c1I-3); "0 16383 redis" on one Redis. Prints nothing if
+# Redis does not answer.
 stack_redis_slots() {
   if [ "${STACK_REDIS:-single}" != cluster ]; then
     stack_redis_cli ping >/dev/null 2>&1 && echo "0 16383 redis"
@@ -360,7 +407,7 @@ stack_redis_slots() {
 stack_redis_resetstat() {
   local name
   for name in $(stack_redis_names); do
-    [ "$(stack_redis_node_cli "$name" config resetstat 2>/dev/null)" = OK ] || return 1
+    stack_redis_ping "$name" && [ "$(stack_redis_node_cli "$name" config resetstat 2>/dev/null)" = OK ] || return 1
   done
 }
 
@@ -368,9 +415,10 @@ stack_redis_resetstat() {
 # last resetstat, from INFO latencystats (p50, p99 and p99.9 in µs, Redis 7's
 # defaults) and the calls from INFO commandstats, as {"CMD": {"calls",
 # "p50_us", "p99_us", "p999_us"}, ...}. The readers' own INFO and CONFIG
-# are left out. Prints null if the node does not answer.
+# are left out. Prints null if the node does not answer (within 1s).
 stack_redis_node_latency() {
   local info
+  stack_redis_ping "$1" || { echo null; return; }
   info=$(stack_redis_node_cli "$1" info latencystats 2>/dev/null && stack_redis_node_cli "$1" info commandstats 2>/dev/null) &&
     grep -q '^# Latencystats' <<<"$info" || { echo null; return; }
   awk -F'[:,=]' '{ sub(/\r$/, "") }
@@ -394,16 +442,138 @@ stack_redis_latency() {
   local name role zone cmds out="" any=""
   for name in $(stack_redis_names); do
     cmds=$(stack_redis_node_latency "$name")
-    role=$(stack_redis_node_cli "$name" info replication 2>/dev/null | tr -d '\r' | sed -n 's/^role://p')
     zone=$(awk -v n="$name" '$1 == n { print $4 }' "$STACK_DIR/redis/layout" 2>/dev/null)
     if [ "$cmds" = null ]; then
       out+="${out:+, }\"$name\": null"
     else
       any=1
-      out+="${out:+, }\"$name\": {\"role\": \"$([ "$role" = slave ] && echo replica || echo "${role:-unknown}")\", \"zone\": \"$zone\", \"cmds\": $cmds}"
+      role=$(stack_redis_role "$name")
+      out+="${out:+, }\"$name\": {\"role\": \"$([ "$role" = down ] && echo unknown || echo "$role")\", \"zone\": \"$zone\", \"cmds\": $cmds}"
     fi
   done
   if [ -n "$any" ]; then echo "{$out}"; else echo null; fi
+}
+
+# stack_redis_role NAME: master or replica, as NAME itself says now; down
+# if it does not answer within 1s.
+stack_redis_role() {
+  local role
+  role=$(STACK_REDIS_TIMEOUT=1 stack_redis_node_cli "$1" info replication 2>/dev/null | tr -d '\r' | sed -n 's/^role://p')
+  case $role in master) echo master ;; slave) echo replica ;; *) echo down ;; esac
+}
+
+# stack_redis_roles: {"redis-0": "master", ...} for every node, now.
+stack_redis_roles() {
+  local name out=""
+  for name in $(stack_redis_names); do out+="${out:+, }\"$name\": \"$(stack_redis_role "$name")\""; done
+  echo "{$out}"
+}
+
+# stack_redis_owner KEY: the master that owns KEY's slot now (CLUSTER
+# KEYSLOT on a live node, then stack_redis_slots). Fails if none does.
+stack_redis_owner() {
+  local slot
+  slot=$(stack_redis_cli cluster keyslot "$1" 2>/dev/null) && [ -n "$slot" ] || return 1
+  stack_redis_slots | awk -v s="$slot" '$1 <= s && s <= $2 { print $3; found = 1 } END { exit !found }'
+}
+
+# stack_lease_key GW: GW's lease key, gwlease:GW:{EPOCH}, for its newest
+# epoch in gwepochs (the highest score: a gateway started again has two).
+# Fails if GW has none.
+stack_lease_key() {
+  local owner epoch
+  owner=$(stack_redis_owner gwepochs) || return 1
+  epoch=$(stack_redis_node_cli "$owner" zrange gwepochs 0 -1 withscores 2>/dev/null | paste - - |
+    awk -v g="$1" 'index($1, g ":") == 1 && $2 > best { best = $2; e = substr($1, length(g) + 2) } END { if (e != "") print e }')
+  [ -n "$epoch" ] || return 1
+  echo "gwlease:$1:{$epoch}"
+}
+
+# stack_redis_kill NAME: SIGKILL NAME and reap it (stack_expect_dead: its
+# exit is recorded as expected, so stack_health does not report it).
+stack_redis_kill() {
+  [ -n "${STACK_PIDS[$1]:-}" ] || { echo "stack: no process $1" >&2; return 1; }
+  kill -KILL "${STACK_PIDS[$1]}" && stack_expect_dead "$1" 5
+}
+
+# stack_redis_restart NAME: starts a killed Cluster node again on its port,
+# pinned as before, with its directory and nodes.conf kept (review
+# P6c1I-2: not stack_redis_cluster_up, which makes new ones), so it rejoins
+# the Cluster as it was: a master that failed over comes back as a replica
+# of its replacement. Its earlier log moves to NAME.log.N. Waits up to 10s
+# for its PING.
+stack_redis_restart() {
+  local name=$1 base=${STACK_PORT_BASE:-17000} i j n=1
+  local redis=${STACK_REDIS_SERVER:-$(command -v redis-server || echo "$PWD/.cache/redis/bin/redis-server")}
+  [[ $name == redis-[0-5] ]] || { echo "stack: $name is not a Cluster node" >&2; return 1; }
+  [ -z "${STACK_PIDS[$name]:-}" ] || { echo "stack: $name is still running" >&2; return 1; }
+  [ -f "$STACK_DIR/redis/$name/nodes.conf" ] || { echo "stack: $name has no nodes.conf" >&2; return 1; }
+  while [ -e "$STACK_DIR/logs/$name.log.$n" ]; do n=$((n + 1)); done
+  mv "$STACK_DIR/logs/$name.log" "$STACK_DIR/logs/$name.log.$n"
+  . "$(dirname "${BASH_SOURCE[0]}")/redis-cluster.sh"
+  j=${name#redis-}
+  redis_cluster_args $((base + 20 + j)) $((base + 30 + j)) "$STACK_DIR/redis/$name"
+  stack_start "$name" "${T2_CPUS_LOGIC:-}" "$redis" "${REDIS_CLUSTER_ARGS[@]}"
+  for i in $(seq 100); do
+    stack_redis_ping "$name" && return 0
+    sleep 0.1
+  done
+  echo "stack: $name not answering within 10s of its restart" >&2
+  return 1
+}
+
+# stack_redis_stop NAME, stack_redis_cont NAME: SIGSTOP and SIGCONT. A
+# stopped node keeps its sockets: clients and peers see no answer, not a
+# refusal, as from a zone cut off by the network. stack_down resumes a
+# stopped node before it stops it.
+declare -A STACK_REDIS_STOPPED=()
+stack_redis_stop() { kill -STOP "${STACK_PIDS[$1]:?no process $1}" && STACK_REDIS_STOPPED[$1]=1; }
+stack_redis_cont() { kill -CONT "${STACK_PIDS[$1]:?no process $1}" && unset "STACK_REDIS_STOPPED[$1]"; }
+
+# stack_redis_wait_role NAME ROLE SECONDS: polls every 50ms until NAME says
+# its role is ROLE (master, replica, down); fails after SECONDS.
+stack_redis_wait_role() {
+  local deadline=$((SECONDS + $3))
+  until [ "$(stack_redis_role "$1")" = "$2" ]; do
+    [ "$SECONDS" -ge "$deadline" ] && return 1
+    sleep 0.05
+  done
+}
+
+# stack_redis_failover NAME: CLUSTER FAILOVER on replica NAME, the manual
+# failover (its master stops writes, the replica catches up and takes over:
+# no acknowledged write is lost); waits up to 10s for NAME to be master.
+stack_redis_failover() {
+  [ "$(stack_redis_role "$1")" = replica ] || { echo "stack: $1 is not a replica" >&2; return 1; }
+  [ "$(stack_redis_node_cli "$1" cluster failover 2>/dev/null)" = OK ] || return 1
+  stack_redis_wait_role "$1" master 10
+}
+
+# stack_redis_wait_whole SECONDS: redis_cluster_wait over the 6 nodes: the
+# Cluster is whole again (every node answers, cluster_state:ok, 3 replicas
+# linked, no node flagged fail or fail?).
+stack_redis_wait_whole() {
+  local redis=${STACK_REDIS_SERVER:-$(command -v redis-server || echo "$PWD/.cache/redis/bin/redis-server")}
+  local base=${STACK_PORT_BASE:-17000} j ports=()
+  . "$(dirname "${BASH_SOURCE[0]}")/redis-cluster.sh"
+  for j in 0 1 2 3 4 5; do ports+=($((base + 20 + j))); done
+  redis_cluster_wait "$(dirname "$redis")/redis-cli" "$1" "${ports[@]}"
+}
+
+# stack_redis_restore SECONDS: the start layout back, so the next phase
+# starts from it (zones: one master in each): the Cluster whole, then a
+# manual failover on each start master (redis/layout) that is a replica now,
+# then whole again with every node in its start role. Fails after SECONDS.
+stack_redis_restore() {
+  local deadline=$((SECONDS + $1)) name port role zone master
+  stack_redis_wait_whole "$1" || return 1
+  while read -r name port role zone master; do
+    [ "$role" = master ] && [ "$(stack_redis_role "$name")" = replica ] && { stack_redis_failover "$name" || return 1; }
+  done <"$STACK_DIR/redis/layout"
+  stack_redis_wait_whole $((deadline - SECONDS > 1 ? deadline - SECONDS : 1)) || return 1
+  while read -r name port role zone master; do
+    [ "$(stack_redis_role "$name")" = "$role" ] || { echo "stack: $name is $(stack_redis_role "$name"), its start role is $role" >&2; return 1; }
+  done <"$STACK_DIR/redis/layout"
 }
 
 # stack_profile NAME SECONDS: a CPU profile of Logic and every running
@@ -735,7 +905,9 @@ stack_down() {
     [ -n "${STACK_PIDS[$name]:-}" ] && stack_term 5 "$name"
   done
   # Redis last; a Cluster's nodes together, so no replica is left to
-  # fail over a stopped master.
+  # fail over a stopped master. A node stopped by stack_redis_stop is
+  # resumed first: a stopped process does not act on SIGTERM.
+  for name in "${!STACK_REDIS_STOPPED[@]}"; do stack_redis_cont "$name"; done
   local rs=()
   for name in "${STACK_ORDER[@]}"; do
     [[ $name == redis || $name == redis-* ]] && rs+=("$name")
