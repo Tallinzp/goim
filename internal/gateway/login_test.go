@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -226,4 +227,39 @@ func TestHeldLoginBatchDoesNotHoldTheSender(t *testing.T) {
 	waitFor(t, "held sent", func() bool { return get(l.logic, func() int { return len(l.logic.logins) }) == 1 })
 	l.frame(next, clientpb.Cmd_CMD_LOGIN, 1, loginReq("next", "d", 1))
 	waitFor(t, "next logged in while the first is held", func() bool { return next.last(t, clientpb.Cmd_CMD_LOGIN_RESP, nil) })
+}
+
+// Senders take their tokens one at a time. With LoginInflight below
+// LoginRPCs × LoginBatch, two senders could each hold part of the
+// tokens and wait for good. Only one sender takes tokens at a time.
+func TestSendersDoNotSplitTheInflightTokens(t *testing.T) {
+	var gw *Gateway
+	l := startLive(t, func(c *Config) { c.LoginRPCs, c.LoginBatch, c.LoginInflight = 2, 2, 2 }, func(g *Gateway, _ *fakeLogic) {
+		gw = g
+		g.inflight <- struct{}{} // the test holds both tokens, so both senders wait in order
+		g.inflight <- struct{}{}
+	})
+	l.logic.set(func() {
+		l.logic.login = func(b *pb.LoginBatch, s grpc.ServerStreamingServer[pb.LoginResult]) error {
+			for i, e := range b.Entries {
+				if err := s.Send(okResult(i, e)); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	})
+	var cs []*fakeLink
+	for i := range 4 {
+		c := l.authed(i)
+		cs = append(cs, c)
+		l.frame(c, clientpb.Cmd_CMD_LOGIN, 1, loginReq(fmt.Sprintf("u%d", i), "d", 1))
+	}
+	time.Sleep(200 * time.Millisecond) // both senders wait for their first token
+	<-gw.inflight                      // the first sender takes it and waits for its second
+	time.Sleep(200 * time.Millisecond)
+	<-gw.inflight // without one taker at a time, the second sender takes this one
+	for i, c := range cs {
+		waitFor(t, fmt.Sprintf("client %d logged in", i), func() bool { return c.last(t, clientpb.Cmd_CMD_LOGIN_RESP, nil) })
+	}
 }

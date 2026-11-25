@@ -206,14 +206,19 @@ func (g *Gateway) startLogin(ctx context.Context, logic pb.LogicClient) {
 // its own goroutine, so a sender is never held by a slow shard's entries:
 // the gateway bounds the entries with no result, not the RPCs (#145).
 func (g *Gateway) sendLogins(ctx context.Context, logic pb.LogicClient, items []*loginItem) {
+	// One sender takes tokens at a time. Two senders that each hold part of
+	// the tokens would wait for good when LoginInflight < LoginRPCs × LoginBatch.
+	g.taking.Lock()
 	for n := range items {
 		select {
 		case g.inflight <- struct{}{}:
 		case <-ctx.Done():
+			g.taking.Unlock()
 			g.releaseInflight(n)
 			return
 		}
 	}
+	g.taking.Unlock()
 	nowMs := g.now().UnixMilli()
 	live := make([]*loginItem, 0, len(items))
 	entries := make([]*pb.LoginEntry, 0, len(items))

@@ -3,6 +3,7 @@ package gateway
 import (
 	"log/slog"
 	"math/rand/v2"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -31,6 +32,7 @@ type Gateway struct {
 
 	loginCh  chan *loginItem
 	inflight chan struct{} // one token per entry sent with no result yet (LoginInflight)
+	taking   sync.Mutex    // one sender takes inflight tokens at a time, so none holds part of them for good
 	logoutCh chan *logoutItem
 	gauges   [3]stateGauges
 
