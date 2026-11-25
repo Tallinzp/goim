@@ -52,7 +52,7 @@ Each line's test: 1, 2 and 3 are run 35's readings (Task 4 Step 3; no dev test l
 
 ## Implementation choices this plan makes
 
-To be decided by the user before execution (AskUserQuestion), as **#146.1–#146.6** in the roadmap:
+These are **#146.1–#146.6** in the roadmap (proposed with this plan; decided by the user 2026-11-25, all as proposed, with AskUserQuestion; execution inline, superpowers:executing-plans, in a fresh session):
 1. **`-login-inflight` defaults to 3,200** (`LoginRPCs` × `LoginBatch`, today's most entries in flight) and is refused below `-login-batch` (a full batch must fit) and at 0.
 2. **`-login-rpcs` keeps its name** (default 16), now the number of senders; its help text says so. Not renamed: deployments and the Tier 2 scripts keep working.
 3. **`GroupWorkers` is Logic's `-workers`** (64 per master), shared by Login and Logout groups to that master; no new flag.
