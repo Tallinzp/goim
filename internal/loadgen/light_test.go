@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"syscall"
 	"testing"
 	"testing/synctest"
@@ -311,4 +312,34 @@ func TestLightGivesUpAfterItsAttempts(t *testing.T) {
 			t.Errorf("gave up after %v of waits, want %v-%v", waited, lo, hi)
 		}
 	})
+}
+
+// Attempts sets how many attempts a light client makes before it gives up
+// (Plan 6c2b final review: a killed shard refuses each attempt at once, so
+// the failover flow needs more than the default 10 to outlast the failover).
+func TestLightGivesUpAfterConfiguredAttempts(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := ln.Addr().String()
+	ln.Close()
+	synctest.Test(t, func(t *testing.T) {
+		r, err := New(Config{Mode: "light", Clients: 1, Rate: 1, UIDPrefix: "u", PingEvery: time.Minute, Timeout: time.Second, Attempts: 3},
+			Env{GatewayAddrs: []string{closed}, GatewayIDs: []string{"gw-0"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.light(t.Context(), &lightConn{i: 0})
+		if c := r.Recorder().Counts(); c.Failed["dial-refused"] != 3 || c.Failed["gave-up"] != 1 {
+			t.Errorf("failed %v, want 3 dial-refused and 1 gave-up", c.Failed)
+		}
+		if l := r.Recorder().Logins(); l.Attempts[0] != 3 {
+			t.Errorf("login log %d attempts, want 3", l.Attempts[0])
+		}
+	})
+	if _, err := New(Config{Mode: "light", Clients: 1, Rate: 1, UIDPrefix: "u", PingEvery: time.Minute, Timeout: time.Second, Attempts: -1},
+		Env{GatewayAddrs: []string{closed}, GatewayIDs: []string{"gw-0"}}); err == nil || !strings.Contains(err.Error(), "Attempts") {
+		t.Errorf("Attempts -1: %v, want refused", err)
+	}
 }

@@ -41,6 +41,11 @@
 #   FAILOVER_CLIENTS      light clients online over the 3 gateways (default 600000)
 #   FAILOVER_RATE         their ramp, clients per second (default 5000)
 #   FAILOVER_FLOW_RATE    each window's logins per second (default 200)
+#   FAILOVER_FLOW_ATTEMPTS each flow client's login attempts before it gives
+#                         up (loadgen -light-attempts; default 30: a killed
+#                         master refuses each attempt at once, and 10 attempts
+#                         0.5-1.5s apart span ~9s against a ~8.2s failover,
+#                         run 34's slowest target-shard login 9.8s)
 #   FAILOVER_WINDOW_S     the before and after windows' length (default 30)
 #   FAILOVER_THROUGH_S    the through window's length (default 40: the
 #                         wait for the worst time, up to 10s, the failover
@@ -121,11 +126,11 @@ for p in $PHASES; do
   case $named in *" $p "*) echo "failover: phase '$p' named twice in FAILOVER_PHASES" >&2; exit 1 ;; esac
   named+="$p "
 done
-for v in FAILOVER_CLIENTS FAILOVER_RATE FAILOVER_FLOW_RATE FAILOVER_WINDOW_S FAILOVER_THROUGH_S FAILOVER_AT_S \
+for v in FAILOVER_CLIENTS FAILOVER_RATE FAILOVER_FLOW_RATE FAILOVER_FLOW_ATTEMPTS FAILOVER_WINDOW_S FAILOVER_THROUGH_S FAILOVER_AT_S \
   FAILOVER_MAX_S FAILOVER_WHOLE_WAIT FAILOVER_P99_FLOOR_MS FAILOVER_GATEWAY_PROCS; do
   case ${!v-1} in ''|*[!0-9]*|0*) echo "failover: $v must be a positive whole number" >&2; exit 1 ;; esac
 done
-N=${FAILOVER_CLIENTS:-600000} RATE=${FAILOVER_RATE:-5000} FLOW=${FAILOVER_FLOW_RATE:-200}
+N=${FAILOVER_CLIENTS:-600000} RATE=${FAILOVER_RATE:-5000} FLOW=${FAILOVER_FLOW_RATE:-200} FLOW_ATTEMPTS=${FAILOVER_FLOW_ATTEMPTS:-30}
 WIN=${FAILOVER_WINDOW_S:-30} THROUGH=${FAILOVER_THROUGH_S:-40} AT=${FAILOVER_AT_S:-9} MAX=${FAILOVER_MAX_S:-20}
 WHOLE=${FAILOVER_WHOLE_WAIT:-600} FLOOR=${FAILOVER_P99_FLOOR_MS:-50}
 [ "$AT" -lt 10 ] || { echo "failover: FAILOVER_AT_S must be below the 10s renewal interval" >&2; exit 1; }
@@ -253,7 +258,7 @@ fo_affected() {
 # fo_flow NAME CLIENTS: a window's light instance (flow, its own uid
 # prefix and source net) started; FLOW logins per second.
 fo_flow() {
-  lg_in flow lg_start "$1" -mode light -clients "$2" -rate "$FLOW" -uid-prefix "$1" -source-net 1
+  lg_in flow lg_start "$1" -mode light -clients "$2" -rate "$FLOW" -light-attempts "$FLOW_ATTEMPTS" -uid-prefix "$1" -source-net 1
 }
 
 # fo_flow_done SECONDS FILE: waits until every flow client's sequence
@@ -427,7 +432,7 @@ for f in before/logic after/logic before/gw-0 after/gw-0; do
   grep -q '^# TYPE' "$a/$f.metrics" 2>/dev/null || missing+=" $f.metrics"
 done
 t2_check artifacts "$(t2_bool [ -z "$missing" ])" "\"missing\": $(t2_json_str "${missing# }")"
-t2_field run "{\"clients\": $N, \"rate\": $RATE, \"flow_rate\": $FLOW, \"window_s\": $WIN, \"through_s\": $THROUGH, \"at_s\": $AT, \"ramp_s\": $ramp_s, \"gateway_procs\": $STACK_GATEWAY_PROCS, \"loadgen_env\": $(t2_json_str "${LG_ENV[*]}"), \"node_timeout_ms\": ${REDIS_CLUSTER_NODE_TIMEOUT_MS:-5000}}"
+t2_field run "{\"clients\": $N, \"rate\": $RATE, \"flow_rate\": $FLOW, \"flow_attempts\": $FLOW_ATTEMPTS, \"window_s\": $WIN, \"through_s\": $THROUGH, \"at_s\": $AT, \"ramp_s\": $ramp_s, \"gateway_procs\": $STACK_GATEWAY_PROCS, \"loadgen_env\": $(t2_json_str "${LG_ENV[*]}"), \"node_timeout_ms\": ${REDIS_CLUSTER_NODE_TIMEOUT_MS:-5000}}"
 
 t2_not_covered "Revoke at zone loss (#141.3): no Tier 2 tool calls Revoke; the store tests cover a WAIT the replica does not acknowledge (TestRevokeFailsWhenReplicaDoesNotAck)" \
   "the repair of lost writes: Reconcile's 10-minute cycle is not waited for; P_sessions records the through window's lost sessions, and the race suite and store tests cover rules 3 and 4" \
