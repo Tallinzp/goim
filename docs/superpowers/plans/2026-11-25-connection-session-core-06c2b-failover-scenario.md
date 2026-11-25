@@ -54,7 +54,7 @@ Each line's test (6 has none: it is a known failure, measured by run 34): 1 and 
 
 ## Implementation choices this plan makes
 
-These are **#143.1–#143.7** in the roadmap (proposed with this plan; the user decides them at review).
+These are **#143.1–#143.7** in the roadmap (proposed with this plan; decided by the user 2026-11-25, all as proposed).
 1. **The target is gw-0's lease key's shard**, the same in every phase (gw-0 keeps its epoch). Its replica is the one that takes over (`redis/layout`); the zone is the target's zone (the target and the other master's replica there).
 2. **The failover window** for the p99 rule: the sequences of the through window whose first attempt started from the trigger to the replica's promotion + 1s (`master_ms`; not `cluster_state:ok`, which with #142 a live node may report throughout). The before p99 is over the whole before window. p99 is the nearest rank over the logged-in sequences (first attempt's start to login, retries included).
 3. **`P_failover`'s bound is 20s** (TTL − interval, the spec's lease rule), not Logic's `-redis-failover` 15s, which stays (Global Constraints).
