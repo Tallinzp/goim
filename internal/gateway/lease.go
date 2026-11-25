@@ -8,7 +8,10 @@ import (
 )
 
 // runLease renews the epoch's lease every LeaseInterval on the dedicated
-// lease connection (spec: Lease, R1-O2). It returns when stop is closed,
+// lease connection (spec: Lease, R1-O2). A failed call is retried after
+// LeaseRetry, not at the next tick: the key then outlives a Redis shard
+// failover of up to TTL − LeaseInterval (the spec's lease rule, R2-O5), not
+// TTL − 2 × LeaseInterval (#139). It returns when stop is closed,
 // after the renewal in flight (if any) has finished, so EpochEnded can follow
 // without a renewal re-creating the key behind it.
 func (g *Gateway) runLease(ctx context.Context, stop <-chan struct{}, lease pb.LeaseClient, trigger func()) {
@@ -21,13 +24,16 @@ func (g *Gateway) runLease(ctx context.Context, stop <-chan struct{}, lease pb.L
 			return
 		default:
 		}
-		g.renew(ctx, lease, &lastOK, trigger)
+		next := t.C
+		if !g.renew(ctx, lease, &lastOK, trigger) {
+			next = time.After(g.cfg.LeaseRetry)
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-stop:
 			return
-		case <-t.C:
+		case <-next:
 		}
 	}
 }
@@ -37,8 +43,8 @@ func (g *Gateway) runLease(ctx context.Context, stop <-chan struct{}, lease pb.L
 // lease TTL: the key may have expired and been swept, and a lost reply may
 // have hidden the missing that re-created it. The first successful call after
 // boot always finds a new epoch's key absent, so it neither counts nor acts
-// on missing (R3-OP5).
-func (g *Gateway) renew(ctx context.Context, lease pb.LeaseClient, lastOK *time.Time, trigger func()) {
+// on missing (R3-OP5). It reports whether the call succeeded.
+func (g *Gateway) renew(ctx context.Context, lease pb.LeaseClient, lastOK *time.Time, trigger func()) bool {
 	start := time.Now()
 	cctx, cancel := g.rpcCtx(ctx, g.cfg.LeaseTimeout)
 	reply, err := lease.GatewayLease(cctx, &pb.LeaseRequest{Gw: g.ref, GwNowMs: g.now().UnixMilli()})
@@ -48,7 +54,7 @@ func (g *Gateway) renew(ctx context.Context, lease pb.LeaseClient, lastOK *time.
 		if ctx.Err() == nil {
 			g.log.Warn("lease renewal failed", "err", err)
 		}
-		return
+		return false
 	}
 	first := lastOK.IsZero()
 	gap := time.Since(*lastOK)
@@ -56,7 +62,7 @@ func (g *Gateway) renew(ctx context.Context, lease pb.LeaseClient, lastOK *time.
 	if first {
 		g.m.LeaseCalls.WithLabelValues("first").Inc()
 		g.leaseOK.Store(true)
-		return
+		return true
 	}
 	if reply.GetMissing() {
 		g.m.LeaseCalls.WithLabelValues("missing").Inc()
@@ -66,4 +72,5 @@ func (g *Gateway) renew(ctx context.Context, lease pb.LeaseClient, lastOK *time.
 	if reply.GetMissing() || gap >= g.cfg.LeaseTTL {
 		trigger()
 	}
+	return true
 }

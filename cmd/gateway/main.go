@@ -155,6 +155,7 @@ func parseFlags(args []string) (gateway.Config, gateway.ServerConfig, tcp.Config
 	fs.DurationVar(&cfg.LoginTimeout, "login-timeout", cfg.LoginTimeout, "per-entry Login timeout from recv_ms")
 	fs.DurationVar(&cfg.LeaseInterval, "lease-interval", cfg.LeaseInterval, "GatewayLease period")
 	fs.DurationVar(&cfg.LeaseTimeout, "lease-timeout", cfg.LeaseTimeout, "GatewayLease call timeout")
+	fs.DurationVar(&cfg.LeaseRetry, "lease-retry", cfg.LeaseRetry, "wait after a failed GatewayLease call before the next one")
 	fs.DurationVar(&cfg.LeaseTTL, "lease-ttl", cfg.LeaseTTL, "Logic's lease TTL (the trigger rule)")
 	fs.DurationVar(&cfg.RetryFor, "retry-for", cfg.RetryFor, "Logout and ReconcileEnd retry budget")
 	fs.DurationVar(&cfg.RetryBackoff, "retry-backoff", cfg.RetryBackoff, "first Logout and ReconcileEnd retry delay, doubled per attempt")

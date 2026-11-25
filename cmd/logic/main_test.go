@@ -11,8 +11,15 @@ func TestDefaultFlagsAreValid(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Store.LeaseTTL != 30*time.Second || sc.MaxConnectionAgeGrace != 30*time.Second || !o.redisCluster {
+	if cfg.Store.LeaseTTL != 30*time.Second || sc.MaxConnectionAgeGrace != 30*time.Second || !o.redisCluster || o.redisReload != time.Second {
 		t.Fatalf("defaults: %+v %+v %+v", cfg, sc, o)
+	}
+}
+
+// A zero -redis-reload would be go-redis's 60s default (#139).
+func TestRefusesZeroRedisReload(t *testing.T) {
+	if _, _, _, err := parseFlags([]string{"-jwks-url", "x", "-redis-reload", "0s"}); err == nil || !strings.Contains(err.Error(), "-redis-reload") {
+		t.Fatalf("-redis-reload 0s: %v", err)
 	}
 }
 
