@@ -3,7 +3,8 @@
 # shard rule (gc_shards: the set's master's p99 at most max(2x, + floor)
 # each other master's, #147.2, #148.3, #148.6), the end check (gc_end: one ReconcileEnd at the
 # first attempt, every uid scanned, the rate at least 90% of the delete
-# rate, #147.3) and the counter wait (gc_wait_inc). The scenario itself
+# rate, #147.3), the counter wait (gc_wait_inc) and the probe reader
+# (gc_probe_latency: the probe's round-trip p99 per master in a window). The scenario itself
 # runs on the Tier 2 host.
 set -uo pipefail
 cd "$(git rev-parse --show-toplevel)"
@@ -17,7 +18,7 @@ ok() { echo "ok   $1"; }
 bad() { echo "FAIL $1"; fails=$((fails + 1)); }
 expect() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1: got [$2], want [$3]"; fi; }
 get() { python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(eval(sys.argv[2]))' "$1" "$2"; }
-eval "$(sed -n '/^gc_shards() {/,/^}/p; /^gc_end() {/,/^}/p; /^gc_wait_inc() {/,/^}/p' scripts/tier2/gwconns.sh)"
+eval "$(sed -n '/^gc_shards() {/,/^}/p; /^gc_end() {/,/^}/p; /^gc_wait_inc() {/,/^}/p; /^gc_probe_latency() {/,/^}/p; /^gc_probe_errors() {/,/^}/p' scripts/tier2/gwconns.sh)"
 
 # stack_redis_latency on a Cluster: masters redis-0..2 with evalsha p99
 # A, B, C (µs), replicas redis-3..5; redis-1 holds the set.
@@ -62,6 +63,31 @@ expect "end: an earlier phase in Logic's window" "$(get "$(gc_end "$(gw)" "$(lg 
 expect "end: not every uid scanned" "$(get "$(gc_end "$(gw)" "$(lg 20.0 1 249999)" 250000 10000 30)" 'd["ok"]')" False
 expect "end: over the grace is recorded only" "$(get "$(gc_end "$(gw)" "$(lg)" 250000 10000 25)" 'd["ok"], d["margin_s"]')" "(True, -1.0)"
 expect "end: an unreadable delta" "$(gc_end null "$(lg)" 250000 10000 30)" null
+
+# gc_probe_latency over a probe file ("MS NAME US"): redis-0..2 at MS
+# 1000..1009 (US base+1..base+10), a sample at 999 and one at 1010 that
+# the window [1000, 1010) must ignore.
+probe="$tmp/probe.tsv"
+for n in 0 1 2; do
+  for i in $(seq 0 9); do echo "$((1000 + i)) redis-$n $((100 * (n + 1) + i + 1))"; done
+  echo "999 redis-$n 9999"; echo "1010 redis-$n 9999"
+done >"$probe"
+pl=$(gc_probe_latency "$probe" 1000 1010)
+expect "probe: per master in the window" "$(get "$pl" '[(n, v["role"], v["cmds"]["ping"]["calls"], v["cmds"]["ping"]["p50_us"], v["cmds"]["ping"]["p99_us"], v["cmds"]["ping"]["p999_us"], v["cmds"]["ping"]["errors"]) for n, v in sorted(d.items())]')" "[('redis-0', 'master', 10, 105, 110, 110, 0), ('redis-1', 'master', 10, 205, 210, 210, 0), ('redis-2', 'master', 10, 305, 310, 310, 0)]"
+printf '%s\n' "1000 redis-0 100" "1001 redis-0 -1" "1002 redis-0 -1" "1003 redis-0 300" >"$tmp/err.tsv"
+expect "probe: errors counted, not timed" "$(get "$(gc_probe_latency "$tmp/err.tsv" 1000 1010)" 'd["redis-0"]["cmds"]["ping"]')" "{'calls': 2, 'p50_us': 100, 'p99_us': 300, 'p999_us': 300, 'errors': 2}"
+grep -v ' redis-2 ' "$probe" >"$tmp/two.tsv"
+pl=$(gc_probe_latency "$tmp/two.tsv" 1000 1010)
+expect "probe: a master with no sample" "$(get "$pl" 'd.get("redis-2")')" None
+printf '%s\n' "1000 redis-2 -1" >>"$tmp/two.tsv"
+pl=$(gc_probe_latency "$tmp/two.tsv" 1000 1010)
+expect "probe: a master with only errors" "$(get "$pl" 'd["redis-2"]["cmds"]["ping"]')" "{'calls': 0, 'p50_us': None, 'p99_us': None, 'p999_us': None, 'errors': 1}"
+expect "probe: no good sample fails the rule" "$(get "$(gc_shards "$pl" redis-1 ping 50)" 'd["ok"], d["calls"]["redis-2"]')" "(False, 0)"
+pp() { printf '%s\n' "1000 redis-0 120" "1000 redis-1 $1" "1000 redis-2 150" >"$tmp/p.tsv"; gc_shards "$(gc_probe_latency "$tmp/p.tsv" 1000 1001)" redis-1 ping 50; }
+expect "probe: through gc_shards, 240 within 2 x 120" "$(get "$(pp 240)" 'd["ok"], d["bound_us"]')" "(True, 240)"
+expect "probe: through gc_shards, 241 over" "$(get "$(pp 241)" 'd["ok"]')" False
+expect "probe: errors per master" "$(gc_probe_errors "$(gc_probe_latency "$tmp/err.tsv" 1000 1010)")" "{\"redis-0\": 2}"
+expect "probe: unreadable file" "$(gc_probe_latency "$tmp/none.tsv" 1000 1010)" null
 
 # gc_wait_inc: readings null, 3, 3, then 4 over a start of 3.
 printf '%s\n' null 3 3 4 >"$T2_TMP_READS"
