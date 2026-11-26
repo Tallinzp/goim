@@ -100,5 +100,21 @@ expect "ipvs: the service on the node's address" "$(t3_ipvs "$tmp/ip_vs" 172.18.
   '{"scheduler": "lc", "servers": 2, "active": [1001, 999]}'
 expect "ipvs: no such service" "$(t3_ipvs "$tmp/ip_vs" 172.18.0.8:30800)" null
 
+# k8s-tools.sh: a failed kubectl download falls back to the node image,
+# whose copy must pass the same SHA-256 (a fake curl that fails, a fake
+# docker whose cp copies $SRC).
+mkdir -p "$tmp/nonet"
+printf '#!/bin/sh\necho "curl: (18) Transferred a partial file" >&2\nexit 18\n' >"$tmp/nonet/curl"
+printf '#!/bin/sh\ncase "$1" in create) echo fakeid ;; cp) cp "$SRC" "$3" ;; esac\n' >"$tmp/nonet/docker"
+chmod +x "$tmp/nonet"/*
+tools() { rm -rf "$tmp/k8s" && mkdir -p "$tmp/k8s/bin" && cp "$K8S/kind" "$tmp/k8s/bin/" && env PATH="$tmp/nonet:$PATH" "$@" scripts/k8s-tools.sh "$tmp/k8s" 2>&1; }
+out=$(tools SRC="$K8S/kubectl" K8S_NODE_IMAGE=img); expect "tools: node-image fallback exits 0" "$?" 0
+contains "tools: kubectl came from the image" "$out" "kubectl from img"
+contains "tools: the copied kubectl runs" "$out" "Client Version: v1.37.0"
+out=$(tools SRC="$K8S/kind" K8S_NODE_IMAGE=img); expect "tools: a wrong binary from the image fails" "$?" 1
+expect "tools: nothing left in bin" "$(ls -A "$tmp/k8s/bin" | paste -sd' ' -)" kind
+out=$(tools SRC="$K8S/kubectl"); expect "tools: no K8S_NODE_IMAGE, no fallback" "$?" 1
+contains "tools: curl's error is shown" "$out" "partial file"
+
 echo "$fails failure(s)"
 [ "$fails" -eq 0 ]

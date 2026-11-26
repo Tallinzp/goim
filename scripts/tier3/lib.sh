@@ -40,7 +40,7 @@ t3_init() {
   t2_need docker curl python3 sudo
   sudo -n -l /usr/local/sbin/goim-srcaddr >/dev/null 2>&1 || t2_refuse "refused: sudo -n /usr/local/sbin/goim-srcaddr is not allowed (run once: sudo scripts/tier2/host-setup.sh)"
   docker info >/dev/null 2>&1 || t2_refuse "refused: docker info fails (is the daemon up and usable without sudo?)"
-  scripts/k8s-tools.sh .cache/k8s >"$T2_OUT/k8s-tools.log" 2>&1 || t2_refuse "refused: scripts/k8s-tools.sh failed, see $T2_OUT/k8s-tools.log"
+  K8S_NODE_IMAGE=$T3_NODE_IMAGE scripts/k8s-tools.sh .cache/k8s >"$T2_OUT/k8s-tools.log" 2>&1 || t2_refuse "refused: scripts/k8s-tools.sh failed, see $T2_OUT/k8s-tools.log"
   PATH=$PWD/.cache/k8s/bin:$PATH
   # kind writes the context to the run's kubeconfig, not ~/.kube/config.
   export KUBECONFIG=$T2_OUT/kubeconfig STACK_DIR=$T2_OUT/stack STACK_PIN=1
