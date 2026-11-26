@@ -1,0 +1,32 @@
+# Tier 3 TARGET=local (#67, #150.1): 6 tainted gateway nodes, 1 Logic node.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+networking:
+  kubeProxyMode: ipvs
+kubeadmConfigPatches:
+  - |
+    kind: KubeProxyConfiguration
+    ipvs:
+      scheduler: lc
+nodes:
+  - role: control-plane
+  - &gateway
+    role: worker
+    labels:
+      goim.io/role: gateway
+    kubeadmConfigPatches:
+      - |
+        kind: JoinConfiguration
+        nodeRegistration:
+          taints:
+            - key: goim.io/role
+              value: gateway
+              effect: NoSchedule
+  - *gateway
+  - *gateway
+  - *gateway
+  - *gateway
+  - *gateway
+  - role: worker
+    labels:
+      goim.io/role: logic

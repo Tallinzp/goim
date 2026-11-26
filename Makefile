@@ -7,7 +7,7 @@ export GOIM_REDIS_REPLICA_PORT ?= 16380
 COMPOSE_REDIS := docker compose -f deploy/compose/redis-test.yml
 TIER2_GUARD := test "$$GOIM_TEST_TIER" = 2 || { echo "Tier 2 host only: set GOIM_TEST_TIER=2"; exit 1; }
 
-.PHONY: test test-race-suite test-scripts test-load-probe redis-server test-redis-local test-redis-cluster-local proto redis-up redis-down test-redis test-redis-cluster test-tier2 deploy deploy-down deploy-status deploy-logs deploy-token
+.PHONY: test test-race-suite test-scripts test-load-probe redis-server k8s-tools test-tier3 test-redis-local test-redis-cluster-local proto redis-up redis-down test-redis test-redis-cluster test-tier2 deploy deploy-down deploy-status deploy-logs deploy-token
 
 # Tier 1a (dev machine): unit and Lua tests on in-process miniredis, race detector on.
 test:
@@ -23,9 +23,11 @@ test-race-suite:
 # The Tier 2 and load-run scripts (Plans 6a1, 6a2), on any machine: lib.sh's
 # guard, result.json, recording and host-setup checks, loadgen.sh's JSON
 # readers, and a real stack.sh stack.
-# Needs python3, curl and redis-server (make redis-server).
-test-scripts:
+# Needs python3, curl and redis-server (make redis-server); the Tier 3
+# tests (Plan 6d1) need the pinned kind and kubectl (make k8s-tools).
+test-scripts: k8s-tools
 	scripts/tier2/lib_test.sh
+	scripts/tier3/lib_test.sh
 	scripts/tier2/floods_test.sh
 	scripts/tier2/reconnect_test.sh
 	scripts/tier2/failover_test.sh
@@ -48,6 +50,11 @@ test-load-probe:
 REDIS_SERVER ?= $(or $(shell command -v redis-server 2>/dev/null),$(CURDIR)/.cache/redis/bin/redis-server)
 redis-server:
 	scripts/redis-build.sh .cache/redis
+
+# The pinned kind and kubectl for Tier 3 (Plan 6d1), user-space binaries in
+# .cache/k8s/bin, checked against their SHA-256; no root, no Docker needed.
+k8s-tools:
+	@scripts/k8s-tools.sh .cache/k8s >/dev/null
 
 # Tier 1a on real Redis, on the dev machine: every test, including the ones
 # that skip as "TODO: Tier 2 integration", against a local redis-server
@@ -94,6 +101,13 @@ test-redis-cluster:
 # prints the script's code. Automation that needs it runs the script directly.
 test-tier2:
 	@scripts/tier2/$(SCENARIO).sh; rc=$$?; [ $$rc -eq 0 ] || { echo "test-tier2: $(SCENARIO) exited $$rc" >&2; exit $$rc; }
+
+# Tier 3 scenario entry point (spec: Automation contract, Tier 3 target), on
+# the Tier 2 host with Docker: GOIM_TEST_TIER=3 make test-tier3 SCENARIO=smoke
+# TARGET=local. TARGET=cloud is refused until a cloud cluster exists.
+# Scenarios: smoke (Plan 6d1). Exit codes as test-tier2's.
+test-tier3:
+	@TARGET=$(TARGET) scripts/tier3/$(SCENARIO).sh; rc=$$?; [ $$rc -eq 0 ] || { echo "test-tier3: $(SCENARIO) exited $$rc" >&2; exit $$rc; }
 
 # A single-node stack for a real client app, on Ubuntu or macOS (scripts/deploy.sh,
 # README: Run a node on your machine). Data and keys live in $GOIM_HOME (~/.goim).
