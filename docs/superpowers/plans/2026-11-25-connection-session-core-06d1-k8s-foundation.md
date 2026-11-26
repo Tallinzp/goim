@@ -24,7 +24,7 @@ Inputs: the roadmap's **#149** (6d split and shape) and **#150** (6d1 shape), bo
 - **IPVS `rr` would balance the smoke's counts as well as `lc`:** the smoke also reads the scheduler from kube-proxy's ConfigMap and `/proc/net/ip_vs`.
 - kind decodes `kind.yaml` strictly (anchors included) before it needs Docker. Static builds, Logic Ready on the fallback JWKS alone, the Secret volume layout, and Redis announced on a second address all work (Task 4 Step 1).
 
-**Implementation choices this plan makes (proposed; the user decides them before execution, as #151):**
+**Implementation choices this plan makes (decided by the user 2026-11-25, all as proposed, as #151):**
 1. **Sources** `198.18.0.0/24` (RFC 2544 benchmark block, fixed in `goim-srcaddr`) as `/32` aliases on the kind bridge. *Alt:* addresses in the kind subnet (Docker picks it per host).
 2. **Logic on the `jwks-fallback` ConfigMap only** (`JWKS_URL` empty, no devtoken). *Alt:* devtoken on the bridge address as JWKS URL.
 3. **Probes:** `busybox:1.37.0` pods in `monitoring` (metrics, policy) and `goim-other`. *Alt:* the API server proxy (the policy would have to admit node addresses).
