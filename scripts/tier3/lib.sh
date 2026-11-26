@@ -38,6 +38,7 @@ t3_init() {
   t2_field scale "$T3_SCALE"
   t2_not_covered "${T3_NOT_COVERED[@]}"
   t2_need docker curl python3 sudo
+  sudo -n -l /usr/local/sbin/goim-srcaddr >/dev/null 2>&1 || t2_refuse "refused: sudo -n /usr/local/sbin/goim-srcaddr is not allowed (run once: sudo scripts/tier2/host-setup.sh)"
   docker info >/dev/null 2>&1 || t2_refuse "refused: docker info fails (is the daemon up and usable without sudo?)"
   scripts/k8s-tools.sh .cache/k8s >"$T2_OUT/k8s-tools.log" 2>&1 || t2_refuse "refused: scripts/k8s-tools.sh failed, see $T2_OUT/k8s-tools.log"
   PATH=$PWD/.cache/k8s/bin:$PATH
@@ -82,9 +83,9 @@ t3_cluster_up() {
 t3_cluster_down() {
   local p
   mkdir -p "$STACK_DIR/logs/k8s"
-  kubectl get events -A --sort-by=.lastTimestamp >"$STACK_DIR/logs/k8s/events.txt" 2>&1
+  kubectl --request-timeout=20s get events -A --sort-by=.lastTimestamp >"$STACK_DIR/logs/k8s/events.txt" 2>&1
   for p in $(kubectl -n im get pods -o name 2>/dev/null); do
-    kubectl -n im logs "$p" >"$STACK_DIR/logs/k8s/${p#pod/}.log" 2>&1
+    kubectl --request-timeout=20s -n im logs "$p" >"$STACK_DIR/logs/k8s/${p#pod/}.log" 2>&1
   done
   kind delete cluster --name "$T3_CLUSTER"
   [ -n "${T3_BRIDGE:-}" ] && sudo -n /usr/local/sbin/goim-srcaddr del "$T3_BRIDGE"
@@ -95,7 +96,9 @@ t3_cluster_down() {
 t3_redis_up() {
   local base=${STACK_PORT_BASE:-17000} j
   mkdir -p "$STACK_DIR/logs" "$STACK_DIR/redis"
-  REDIS_CLUSTER_HOST=$T3_HOST stack_redis_cluster_up "$STACK_REDIS_SERVER" "$T2_CPUS_LOGIC" || return 1
+  # Exported for the whole run: a node restarted later keeps this address.
+  export REDIS_CLUSTER_HOST=$T3_HOST
+  stack_redis_cluster_up "$STACK_REDIS_SERVER" "$T2_CPUS_LOGIC" || return 1
   T3_REDIS_ADDRS=""
   for j in 0 1 2 3 4 5; do T3_REDIS_ADDRS+="${T3_REDIS_ADDRS:+,}$T3_HOST:$((base + 20 + j))"; done
 }

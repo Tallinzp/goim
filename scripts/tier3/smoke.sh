@@ -108,7 +108,7 @@ t2_check admin_policy "$(lg_true - 'd == {"mon_gw_admin": "open", "mon_logic_adm
   "other_logic_admin": "closed", "other_gw_client": "open", "other_gw_kick": "open", "other_logic_grpc": "open"}' <<<"$p")" "\"reach\": $p"
 
 # Load through the NodePort on the Logic node.
-t3_sources 2 >"$T2_OUT/sources.log" 2>&1 || { echo "goim-srcaddr failed, see $T2_OUT/sources.log" >&2; exit 1; }
+t3_sources $(((CLIENTS + 4999) / 5000)) >"$T2_OUT/sources.log" 2>&1 || { echo "goim-srcaddr failed, see $T2_OUT/sources.log" >&2; exit 1; }
 t2_on_exit 'lg_stop'
 lg_start smoke -mode light -clients "$CLIENTS" -rate 500 -uid-prefix t3smoke -source-cidr "$T3_SOURCE_CIDR"
 lg_wait_online "$CLIENTS" 120; rc=$?

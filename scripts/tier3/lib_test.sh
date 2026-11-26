@@ -30,6 +30,11 @@ contains "init: names TARGET" "$out" "TARGET=local"
 out=$(run_init GOIM_TEST_TIER=3 TARGET=cloud); expect "init: TARGET=cloud is refused" "$?" 2
 contains "init: cloud does not exist yet" "$out" "cloud cluster"
 out=$(run_init GOIM_TEST_TIER=3 TARGET=local TIER3_SCALE=2); expect "init: scale 2 is refused" "$?" 2
+# The sudoers line for goim-srcaddr: a sudo that refuses -l makes the guard refuse.
+mkdir -p "$tmp/nosudo" && for t in docker curl python3; do printf '#!/bin/sh\nexit 0\n' >"$tmp/nosudo/$t"; done
+printf '#!/bin/sh\nexit 1\n' >"$tmp/nosudo/sudo" && chmod +x "$tmp/nosudo"/*
+out=$(run_init GOIM_TEST_TIER=3 TARGET=local PATH="$tmp/nosudo:$PATH"); expect "init: no sudoers line for goim-srcaddr is refused" "$?" 2
+contains "init: points to host-setup" "$out" "sudo scripts/tier2/host-setup.sh"
 r=$(ls "$tmp/repo/tier3-results"/x-*/result.json 2>/dev/null | head -n 1)
 expect "init: a refused run's result.json says tier 3" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tier"])' "$r" 2>&1)" 3
 
@@ -63,10 +68,10 @@ expect "overlay: config, gateways, Logic, client NodePort, namespace" "$r" \
 # kind.yaml decodes strictly (kind refuses an unknown field before it
 # needs docker): with a docker that fails, the error is docker's.
 mkdir -p "$tmp/bin" && printf '#!/bin/sh\nexit 1\n' >"$tmp/bin/docker" && chmod +x "$tmp/bin/docker"
-out=$(PATH=$tmp/bin:$PATH "$K8S/kind" create cluster --name t3-test --config scripts/tier3/kind.yaml 2>&1)
+out=$(KIND_EXPERIMENTAL_PROVIDER=docker PATH=$tmp/bin:$PATH "$K8S/kind" create cluster --name t3-test --config scripts/tier3/kind.yaml 2>&1)
 contains "kind.yaml: decodes, kind goes on to docker" "$out" "docker info"
 sed 's/    labels:/    labelz:/' scripts/tier3/kind.yaml >"$tmp/bad.yaml"
-out=$(PATH=$tmp/bin:$PATH "$K8S/kind" create cluster --name t3-test --config "$tmp/bad.yaml" 2>&1)
+out=$(KIND_EXPERIMENTAL_PROVIDER=docker PATH=$tmp/bin:$PATH "$K8S/kind" create cluster --name t3-test --config "$tmp/bad.yaml" 2>&1)
 contains "kind.yaml: a typo is refused" "$out" "field labelz not found"
 
 # t3_balance: within 10% of the mean (#150.3).
