@@ -18,7 +18,11 @@
 # 7.1-9.2s, well inside the lease rule's TTL 30s - interval 10s; 10000 took
 # ~16.5s and let a lease expire at zone loss, #140; Redis's 15000 took
 # 20.6-22.7s, #139);
-# REDIS_CLUSTER_JOIN_TIMEOUT_S (how long the join waits, default 30).
+# REDIS_CLUSTER_JOIN_TIMEOUT_S (how long the join waits, default 30);
+# REDIS_CLUSTER_HOST (default 127.0.0.1): the address the nodes also bind,
+# announce and join on, so clients elsewhere reach every node: Tier 3's
+# pods reach the host's Cluster on the kind bridge's address (#150.2).
+# Local tools keep reaching each node on 127.0.0.1.
 
 redis_cluster_layout() {
   printf '%s\n' "redis-0 master z0 -" "redis-1 master z1 -" "redis-2 master z2 -" \
@@ -32,18 +36,21 @@ redis_cluster_layout() {
 # node refuses every command (CLUSTERDOWN) until its replica takes over,
 # ~1s, so logins on the other shards failed too (Plan 6c2b's dry run, #142).
 redis_cluster_args() {
-  REDIS_CLUSTER_ARGS=(--port "$1" --cluster-port "$2" --bind 127.0.0.1 --dir "$3"
+  local host=${REDIS_CLUSTER_HOST:-127.0.0.1} bind=(127.0.0.1)
+  [ "$host" = 127.0.0.1 ] || bind+=("$host")
+  REDIS_CLUSTER_ARGS=(--port "$1" --cluster-port "$2" --bind "${bind[@]}" --dir "$3"
     --save "" --appendonly no --maxmemory-policy noeviction
     --cluster-enabled yes --cluster-config-file nodes.conf
     --cluster-node-timeout "${REDIS_CLUSTER_NODE_TIMEOUT_MS:-5000}" --cluster-require-full-coverage no
     --repl-diskless-sync yes --repl-diskless-sync-delay 0)
+  [ "$host" = 127.0.0.1 ] || REDIS_CLUSTER_ARGS+=(--cluster-announce-ip "$host")
 }
 
 # redis_cluster_join CLI P0 P1 P2 P3 P4 P5: P0-P2 become the masters (slots
 # split evenly by redis-cli), P3-P5 the replicas of P0-P2 in that order.
 # Fails, naming what did not happen, after REDIS_CLUSTER_JOIN_TIMEOUT_S.
 redis_cluster_join() {
-  local cli=$1 i p id ok deadline
+  local cli=$1 i p id ok deadline h=${REDIS_CLUSTER_HOST:-127.0.0.1}
   shift
   local ports=("$@")
   [ ${#ports[@]} -eq 6 ] || { echo "redis-cluster: want 6 ports, got ${#ports[@]}" >&2; return 1; }
@@ -55,11 +62,11 @@ redis_cluster_join() {
     done
     [ -n "$ok" ] || { echo "redis-cluster: no answer on port $p within 10s" >&2; return 1; }
   done
-  "$cli" --cluster create "127.0.0.1:${ports[0]}" "127.0.0.1:${ports[1]}" "127.0.0.1:${ports[2]}" \
+  "$cli" --cluster create "$h:${ports[0]}" "$h:${ports[1]}" "$h:${ports[2]}" \
     --cluster-yes >/dev/null || { echo "redis-cluster: --cluster create failed" >&2; return 1; }
   for i in 0 1 2; do
     id=$("$cli" -p "${ports[i]}" cluster myid)
-    "$cli" --cluster add-node "127.0.0.1:${ports[i + 3]}" "127.0.0.1:${ports[0]}" \
+    "$cli" --cluster add-node "$h:${ports[i + 3]}" "$h:${ports[0]}" \
       --cluster-slave --cluster-master-id "$id" >/dev/null ||
       { echo "redis-cluster: replica on port ${ports[i + 3]} not added" >&2; return 1; }
   done

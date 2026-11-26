@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"sync"
 	"syscall"
 	"time"
@@ -55,6 +56,29 @@ func SourcesIn(netOctet, n int) ([]net.IP, error) {
 	return ips, nil
 }
 
+// SourcesFrom are n addresses of the IPv4 network cidr from its second
+// host on, as #69 lays out 127.0.0.x: 198.18.0.0/24 gives 198.18.0.2, …,
+// up to the last below the broadcast address. Tier 3 (Plan 6d1, #150.2):
+// kind's nodes are reached over the kind bridge, not loopback, so the
+// sources are aliases goim-srcaddr adds there.
+func SourcesFrom(cidr string, n int) ([]net.IP, error) {
+	p, err := netip.ParsePrefix(cidr)
+	if err != nil || !p.Addr().Is4() || p != p.Masked() {
+		return nil, fmt.Errorf("loadgen: source CIDR %q, want an IPv4 network address such as 198.18.0.0/24", cidr)
+	}
+	most := min(maxSources, 1<<(32-p.Bits())-3)
+	if n < 1 || n > most {
+		return nil, fmt.Errorf("loadgen: %d sources in %s, want 1–%d", n, cidr, most)
+	}
+	ips := make([]net.IP, n)
+	a := p.Addr().Next()
+	for i := range ips {
+		a = a.Next()
+		ips[i] = net.IP(a.AsSlice())
+	}
+	return ips, nil
+}
+
 // NewBalancer balances over addrs from n source addresses.
 func NewBalancer(addrs []string, sources int) (*Balancer, error) {
 	return NewBalancerIn(addrs, 0, sources)
@@ -66,8 +90,12 @@ func NewBalancerIn(addrs []string, netOctet, sources int) (*Balancer, error) {
 	if err != nil {
 		return nil, err
 	}
+	return newBalancer(addrs, srcs), nil
+}
+
+func newBalancer(addrs []string, srcs []net.IP) *Balancer {
 	return &Balancer{addrs: addrs, srcs: srcs, open: make([]int, len(addrs)), down: make([]bool, len(addrs)),
-		next: make([]int, len(addrs))}, nil
+		next: make([]int, len(addrs))}
 }
 
 // SetDown takes gateway gw out of rotation for new dials, until a SetUp.

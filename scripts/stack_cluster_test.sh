@@ -100,9 +100,14 @@ expect "down: no process left" "$left" 0
 expect "down: no port left" "$(stack_busy_ports)" ""
 
 # A second stack_up in the same STACK_DIR forms a new Cluster: the old
-# nodes.conf files must not survive.
-if stack_up >"$STACK_DIR/up2.log" 2>&1; then ok "up again: the same STACK_DIR forms a Cluster"; else bad "up again: $(tail -n 3 "$STACK_DIR/up2.log" | paste -sd' ' -)"; fi
+# nodes.conf files must not survive. It joins on another host address
+# (REDIS_CLUSTER_HOST, Tier 3's kind bridge, Plan 6d1): every node
+# announces it and answers there, and Logic, seeded with 127.0.0.1, follows
+# the announced addresses.
+if REDIS_CLUSTER_HOST=127.0.0.9 stack_up >"$STACK_DIR/up2.log" 2>&1; then ok "up again: the same STACK_DIR forms a Cluster"; else bad "up again: $(tail -n 3 "$STACK_DIR/up2.log" | paste -sd' ' -)"; fi
 expect "up again: 3 ranges" "$(stack_redis_slots | wc -l)" 3
+expect "host: every node announces 127.0.0.9" "$(stack_redis_node_cli redis-0 cluster nodes | awk '$2 !~ /^127\.0\.0\.9:/' | wc -l)" 0
+expect "host: a node answers there" "$(stack_redis_node_cli redis-5 -h 127.0.0.9 ping)" PONG
 stack_down
 
 echo "$fails failure(s)"

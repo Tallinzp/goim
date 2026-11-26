@@ -30,13 +30,17 @@
 
 T2_MIN_CORES=12
 T2_MIN_MEM_GB=24
+# The tier a script runs at: Tier 3 scripts (scripts/tier3/lib.sh, Plan
+# 6d1) set 3 before t2_init. It names the GOIM_TEST_TIER the guard wants,
+# result.json's "tier" and the results directory.
+: "${T2_TIER:=2}"
 
 # t2_guard_verdict TIER CORES MEM_GB: prints why a host is refused and
 # returns 1, or returns 0. Pure, so it is tested on any machine.
 t2_guard_verdict() {
   local tier=$1 cores=$2 mem=$3
-  if [ "$tier" != 2 ]; then
-    echo "refused: Tier 2 scenarios need GOIM_TEST_TIER=2 set by the caller, e.g. GOIM_TEST_TIER=2 make test-tier2 SCENARIO=race"
+  if [ "$tier" != "$T2_TIER" ]; then
+    echo "refused: Tier $T2_TIER scenarios need GOIM_TEST_TIER=$T2_TIER set by the caller, e.g. GOIM_TEST_TIER=$T2_TIER make test-tier$T2_TIER SCENARIO=$([ "$T2_TIER" = 2 ] && echo race || echo smoke)"
     return 1
   fi
   local v
@@ -46,7 +50,7 @@ t2_guard_verdict() {
     esac
   done
   if [ "$cores" -lt "$T2_MIN_CORES" ] || [ "$mem" -lt "$T2_MIN_MEM_GB" ]; then
-    echo "refused: Tier 2 needs >= $T2_MIN_CORES cores and >= ${T2_MIN_MEM_GB}GB RAM (have $cores cores, ${mem}GB)"
+    echo "refused: Tier $T2_TIER needs >= $T2_MIN_CORES cores and >= ${T2_MIN_MEM_GB}GB RAM (have $cores cores, ${mem}GB)"
     return 1
   fi
 }
@@ -138,7 +142,7 @@ t2_result_json() {
 {
   "schema": 1,
   "scenario": $(t2_json_str "$T2_SCENARIO"),
-  "tier": 2,
+  "tier": $T2_TIER,
   "commit": $(t2_json_str "$(git rev-parse HEAD 2>/dev/null)"),
   "dirty": $(git status --porcelain 2>/dev/null | wc -l),
   "host": {"cores": $T2_CORES, "mem_gb": $T2_MEM_GB, "kernel": $(t2_json_str "$(uname -r)")},
@@ -172,7 +176,7 @@ t2_section() { printf '\n===== %s =====\n' "$1"; }
 # sections (define t2_report_extra in the scenario script).
 t2_write_report() {
   {
-    echo "goim Tier 2 report: scenario $T2_SCENARIO"
+    echo "goim Tier $T2_TIER report: scenario $T2_SCENARIO"
     t2_section "environment"
     echo "date:    $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "commit:  $(git rev-parse HEAD) ($(git rev-parse --abbrev-ref HEAD))"
@@ -251,11 +255,13 @@ t2_init() {
   local why kind
   why=$(t2_guard_verdict "${GOIM_TEST_TIER:-}" "$T2_CORES" "$T2_MEM_GB") || { echo "$why" >&2; exit 2; }
   t2_need go gcc make git
-  kind=$(t2_kind_state)
-  why=$(t2_kind_verdict "${kind%%|*}" "${kind#*|}") || { echo "$why" >&2; exit 2; }
+  if [ "$T2_TIER" = 2 ]; then
+    kind=$(t2_kind_state)
+    why=$(t2_kind_verdict "${kind%%|*}" "${kind#*|}") || { echo "$why" >&2; exit 2; }
+  fi
   export GOIM_TEST_TIER CGO_ENABLED=1
   T2_T0=$SECONDS
-  T2_OUT="$PWD/tier2-results/$T2_SCENARIO-$(date +%Y%m%d-%H%M%S)"
+  T2_OUT="$PWD/tier$T2_TIER-results/$T2_SCENARIO-$(date +%Y%m%d-%H%M%S)"
   T2_REPORT="$T2_OUT.report.txt"
   mkdir -p "$T2_OUT"
   t2_traps
@@ -592,12 +598,12 @@ t2_record_end() {
 
 # ---- Host setup (choice #68) ----
 
-# t2_host_setup_missing DIR PROC_SYS SYS_MODULE NETDROP: prints one line per
+# t2_host_setup_missing DIR PROC_SYS SYS_MODULE NETDROP SRCADDR: prints one line per
 # item host-setup.sh would fix: a sysctl below sysctl.conf (every field of a
 # multi-value one), a module of modules.conf not loaded, the installed
 # goim-netdrop missing or differing from DIR's. Tests pass fake paths.
 t2_host_setup_missing() {
-  local dir=$1 proc=$2 mods=$3 netdrop=$4 key want have m
+  local dir=$1 proc=$2 mods=$3 netdrop=$4 srcaddr=$5 key want have m
   while IFS=$'\t' read -r key want; do
     have=$(tr -s '\t ' '  ' <"$proc/${key//.//}" 2>/dev/null)
     awk -v w="$want" -v h="$have" 'BEGIN {
@@ -609,6 +615,7 @@ t2_host_setup_missing() {
     [ -d "$mods/$m" ] || echo "module $m is not loaded"
   done < <(grep -vE '^[[:space:]]*(#|$)' "$dir/modules.conf")
   cmp -s "$dir/goim-netdrop" "$netdrop" || echo "$netdrop is missing or differs from scripts/tier2/goim-netdrop"
+  cmp -s "$dir/goim-srcaddr" "$srcaddr" || echo "$srcaddr is missing or differs from scripts/tier2/goim-srcaddr"
 }
 
 # t2_netdrop_leftover RULES: refuses (returns 1) when goim-netdrop rules are
@@ -644,7 +651,7 @@ t2_notrack_covers() {
 # earlier run's DROP rules are left, and for a STACK_PORT_BASE outside them.
 t2_require_host_setup() {
   local missing rules why
-  missing=$(t2_host_setup_missing scripts/tier2 /proc/sys /sys/module /usr/local/sbin/goim-netdrop)
+  missing=$(t2_host_setup_missing scripts/tier2 /proc/sys /sys/module /usr/local/sbin/goim-netdrop /usr/local/sbin/goim-srcaddr)
   if [ -z "$missing" ] && ! rules=$(sudo -n /usr/local/sbin/goim-netdrop list 2>/dev/null); then
     missing="sudo -n /usr/local/sbin/goim-netdrop fails (no sudoers line?)"
   fi

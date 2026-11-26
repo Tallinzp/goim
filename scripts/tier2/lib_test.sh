@@ -26,6 +26,9 @@ contains "guard: names the minimum" "$why" ">= 12 cores"
 t2_guard_verdict 2 24 23 >/dev/null; expect "guard: 23GB is refused" "$?" 1
 t2_guard_verdict 2 "" 26 >/dev/null; expect "guard: unknown cores are refused" "$?" 1
 t2_guard_verdict 2 24 26 >/dev/null; expect "guard: the Tier 2 host passes" "$?" 0
+why=$(T2_TIER=3 t2_guard_verdict 2 24 26); expect "guard: a Tier 3 script refuses GOIM_TEST_TIER=2" "$?" 1
+contains "guard: Tier 3 names its tier" "$why" "GOIM_TEST_TIER=3 make test-tier3"
+T2_TIER=3 t2_guard_verdict 3 24 26 >/dev/null; expect "guard: Tier 3 on the Tier 2 host passes" "$?" 0
 t2_kind_verdict "" "" >/dev/null; expect "kind: none passes" "$?" 0
 t2_kind_verdict "" "kind-control-plane" >/dev/null; expect "kind: a leftover container is refused" "$?" 1
 t2_kind_verdict "goim" "" >/dev/null; expect "kind: a cluster is refused" "$?" 1
@@ -211,15 +214,16 @@ mkdir -p "$tmp/hs/root/etc/systemd/system/user@.service.d"
 echo old >"$tmp/hs/root/etc/systemd/system/user@.service.d/90-goim-tier2.conf"
 (cd "$tmp/hs" && "$OLDPWD/scripts/tier2/host-setup.sh" --root "$tmp/hs/root" --user alice --uid 1001) >"$tmp/hs/out" 2>&1
 expect "setup: test mode exits 0" "$?" 0
-expect "setup: sudoers line" "$(cat "$tmp/hs/root/etc/sudoers.d/goim-netdrop")" "alice ALL=(root) NOPASSWD: /usr/local/sbin/goim-netdrop"
+expect "setup: sudoers line" "$(cat "$tmp/hs/root/etc/sudoers.d/goim-netdrop")" "alice ALL=(root) NOPASSWD: /usr/local/sbin/goim-netdrop, /usr/local/sbin/goim-srcaddr"
 expect "setup: sudoers mode" "$(stat -c %a "$tmp/hs/root/etc/sudoers.d/goim-netdrop")" 440
 expect "setup: helper mode" "$(stat -c %a "$tmp/hs/root/usr/local/sbin/goim-netdrop")" 755
+expect "setup: Tier 3 helper mode" "$(stat -c %a "$tmp/hs/root/usr/local/sbin/goim-srcaddr")" 755
 expect "setup: nofile hard limit" "$(cat "$tmp/hs/root/etc/security/limits.d/90-goim-tier2.conf")" "alice hard nofile 2097152"
 expect "setup: alice's user manager's nofile" "$(grep LimitNOFILE "$tmp/hs/root/etc/systemd/system/user@1001.service.d/90-goim-tier2.conf")" "LimitNOFILE=1024:2097152"
 expect "setup: every user's drop-in removed" "$([ -e "$tmp/hs/root/etc/systemd/system/user@.service.d" ] || echo gone)" gone
 expect "setup: sysctl.conf as is on a host with nothing higher" "$(cmp -s scripts/tier2/sysctl.conf "$tmp/hs/root/etc/sysctl.d/90-goim-tier2.conf" && echo same)" same
 again=$(scripts/tier2/host-setup.sh --root "$tmp/hs/root" --user alice --uid 1001 | grep -c '^unchanged')
-expect "setup: idempotent" "$again" 6
+expect "setup: idempotent" "$again" 7
 scripts/tier2/host-setup.sh --root "$tmp/hs/root" --user 'a b' >/dev/null 2>&1; expect "setup: odd user refused" "$?" 2
 # A host whose systemd raised fs.nr_open at boot, and one lower tcp_mem field.
 mkdir -p "$tmp/hs2/root/proc/sys/fs" "$tmp/hs2/root/proc/sys/net/ipv4"
@@ -238,20 +242,33 @@ while IFS='=' read -r k v; do
 done < <(grep -vE '^[[:space:]]*(#|$)' scripts/tier2/sysctl.conf)
 for m in $(grep -vE '^[[:space:]]*(#|$)' scripts/tier2/modules.conf); do mkdir -p "$fake/mod/$m"; done
 cp scripts/tier2/goim-netdrop "$fake/netdrop"
-expect "setup check: a set-up host" "$(t2_host_setup_missing scripts/tier2 "$fake/proc" "$fake/mod" "$fake/netdrop")" ""
+cp scripts/tier2/goim-srcaddr "$fake/srcaddr"
+expect "setup check: a set-up host" "$(t2_host_setup_missing scripts/tier2 "$fake/proc" "$fake/mod" "$fake/netdrop" "$fake/srcaddr")" ""
 printf '1048576\t1000000\t2097152\n' >"$fake/proc/net/ipv4/tcp_mem"
 echo 262144 >"$fake/proc/net/netfilter/nf_conntrack_max"
 rmdir "$fake/mod/ip_vs"
 echo "# old" >>"$fake/netdrop"
-m=$(t2_host_setup_missing scripts/tier2 "$fake/proc" "$fake/mod" "$fake/netdrop")
+rm "$fake/srcaddr"
+m=$(t2_host_setup_missing scripts/tier2 "$fake/proc" "$fake/mod" "$fake/netdrop" "$fake/srcaddr")
 contains "setup check: low conntrack" "$m" "sysctl net.netfilter.nf_conntrack_max is 262144, want >= 4194304"
 contains "setup check: one low tcp_mem field" "$m" "sysctl net.ipv4.tcp_mem is 1048576 1000000 2097152"
 contains "setup check: module" "$m" "module ip_vs is not loaded"
 contains "setup check: outdated helper" "$m" "differs from scripts/tier2/goim-netdrop"
-expect "setup check: nothing else" "$(echo "$m" | wc -l)" 4
+contains "setup check: Tier 3's helper missing" "$m" "$fake/srcaddr is missing"
+expect "setup check: nothing else" "$(echo "$m" | wc -l)" 5
 t2_netdrop_leftover "" >/dev/null; expect "leftover: no rules pass" "$?" 0
 why=$(t2_netdrop_leftover "-A INPUT -i lo -p tcp -m tcp --dport 17100 -m comment --comment goim-netdrop -j DROP"); expect "leftover: a rule is refused" "$?" 1
 contains "leftover: says how to remove it" "$why" "sudo -n /usr/local/sbin/goim-netdrop flush"
+
+# goim-srcaddr (Plan 6d1) prints its addresses and refuses anything else.
+expect "srcaddr: add" "$(scripts/tier2/goim-srcaddr --print add br-0123456789ab 2)" \
+"ip addr replace 198.18.0.2/32 dev br-0123456789ab
+ip addr replace 198.18.0.3/32 dev br-0123456789ab"
+for args in "add br-0123456789ab 254" "add br-0123456789ab 0" "add br-0123456789ab 07" "add eth0 1" "add br-0123456789AB 1" "del br-0123456789ab" "flush br-0123456789ab"; do
+  # shellcheck disable=SC2086
+  scripts/tier2/goim-srcaddr --print $args >/dev/null 2>&1; expect "srcaddr: refuses $args" "$?" 2
+done
+scripts/tier2/goim-srcaddr list br-0123456789ab >/dev/null 2>&1; expect "srcaddr: refuses a bridge that does not exist" "$?" 1
 
 # goim-netdrop prints its rules and refuses anything else.
 expect "netdrop: add" "$(scripts/tier2/goim-netdrop --print add 21100)" \

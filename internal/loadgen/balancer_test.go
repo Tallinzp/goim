@@ -175,3 +175,30 @@ func TestBalancerEveryGatewayUsesEverySource(t *testing.T) {
 		}
 	}
 }
+
+// Tier 3 sources (Plan 6d1, #150.2): kind's nodes are not on loopback, so
+// loadgen's sources are host aliases from a CIDR, in #69's layout.
+func TestSourcesFrom(t *testing.T) {
+	ips, err := SourcesFrom("198.18.0.0/24", 253)
+	if err != nil || ips[0].String() != "198.18.0.2" || ips[252].String() != "198.18.0.254" {
+		t.Fatalf("sources %v … %v, err %v; want 198.18.0.2 … 198.18.0.254", ips[0], ips[len(ips)-1], err)
+	}
+	if ips, _ := SourcesFrom("10.1.0.0/16", 2); len(ips) != 2 || ips[1].String() != "10.1.0.3" {
+		t.Fatalf("a /16: %v", ips)
+	}
+	for _, tc := range []struct {
+		cidr string
+		n    int
+	}{
+		{"198.18.0.0/24", 254}, // past .254
+		{"198.18.0.0/24", 0},
+		{"198.18.0.0/30", 2}, // .2 only
+		{"198.18.0.1/24", 1}, // not a network address
+		{"fd00::/64", 1},
+		{"198.18.0.0", 1},
+	} {
+		if _, err := SourcesFrom(tc.cidr, tc.n); err == nil {
+			t.Errorf("SourcesFrom(%q, %d) accepted", tc.cidr, tc.n)
+		}
+	}
+}

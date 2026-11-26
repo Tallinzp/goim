@@ -33,6 +33,7 @@ type Config struct {
 	Clients    int           // client i logs in as uid <UIDPrefix>-<i>; ModeGarbage: attempts in flight at most
 	Rate       float64       // clients started per second; ModeGarbage: attempts per second
 	SourceNet  int           // source addresses 127.0.SourceNet.2…, so instances keep apart (Plan 6b3a)
+	SourceCIDR string        // source addresses from this network instead (SourcesFrom; Tier 3, Plan 6d1)
 	UIDPrefix  string        // distinct per loadgen run, so runs never replace each other's sessions
 	Sources    int           // source addresses; 0: one per 5,000 connections per gateway, with one gateway gone or Down; flood modes: all 253
 	Down       []string      // gateway ids out of the balancer from the start, until POST /up (b_stress, #93)
@@ -106,6 +107,8 @@ func New(cfg Config, env Env) (*Runner, error) {
 		return nil, errors.New("loadgen: Attempts must not be negative")
 	case cfg.SourceNet < 0 || cfg.SourceNet > 255:
 		return nil, fmt.Errorf("loadgen: source net %d, want 0–255", cfg.SourceNet)
+	case cfg.SourceCIDR != "" && cfg.SourceNet != 0:
+		return nil, errors.New("loadgen: a source CIDR or a source net, not both")
 	}
 	if cfg.Attempts == 0 {
 		cfg.Attempts = lightAttempts
@@ -133,10 +136,14 @@ func New(cfg Config, env Env) (*Runner, error) {
 		perGW := (cfg.Clients + gws - 1) / gws
 		cfg.Sources = min(maxSources, (perGW+connsPerSource-1)/connsPerSource)
 	}
-	bal, err := NewBalancerIn(env.GatewayAddrs, cfg.SourceNet, cfg.Sources)
+	srcs, err := SourcesIn(cfg.SourceNet, cfg.Sources)
+	if cfg.SourceCIDR != "" {
+		srcs, err = SourcesFrom(cfg.SourceCIDR, cfg.Sources)
+	}
 	if err != nil {
 		return nil, err
 	}
+	bal := newBalancer(env.GatewayAddrs, srcs)
 	for _, gw := range down {
 		bal.SetDown(gw)
 	}

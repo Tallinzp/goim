@@ -1,0 +1,56 @@
+#!/bin/bash
+# goim-srcaddr: the one root action Tier 3 runs need (Plan 6d1, #150.2, the
+# #68 pattern): loadgen's source addresses (-source-cidr 198.18.0.0/24) as
+# aliases on the kind bridge, since kind's nodes are not on loopback.
+# host-setup.sh installs it root-owned with goim-netdrop's sudoers line.
+#
+#   sudo -n /usr/local/sbin/goim-srcaddr add BRIDGE N   198.18.0.2 … 198.18.0.(N+1)/32 on BRIDGE
+#   sudo -n /usr/local/sbin/goim-srcaddr del BRIDGE     every 198.18.0.0/24 address off BRIDGE
+#   sudo -n /usr/local/sbin/goim-srcaddr list BRIDGE    show them
+#   goim-srcaddr --print add BRIDGE N                   print the ip commands, run nothing
+#
+# It runs only ip, from a fixed path, on a fixed range: 198.18.0.0/24, in
+# the block reserved for network benchmarks (RFC 2544), outside kind's
+# pod (10.244/16) and Service (10.96/12) ranges. BRIDGE must be a Docker
+# bridge, br- and 12 hex digits, that exists; N must be 1-253. It reads no
+# environment variable.
+set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+IP=/usr/sbin/ip
+NET=198.18.0
+
+usage() { echo "usage: goim-srcaddr [--print] add BRIDGE N | del BRIDGE | list BRIDGE" >&2; exit 2; }
+
+print=0
+if [ "${1:-}" = --print ]; then print=1; shift; fi
+cmd=${1:-}
+br=${2:-}
+case $br in br-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;; *) usage ;; esac
+if [ $print = 0 ] && [ ! -d "/sys/class/net/$br/bridge" ]; then
+  echo "goim-srcaddr: $br is not a bridge" >&2
+  exit 1
+fi
+
+# ours: our addresses on the bridge now, one per line.
+ours() { $IP -4 -o addr show dev "$br" | awk -v p="$NET." '{ split($4, a, "/"); if (index(a[1], p) == 1) print a[1] }'; }
+
+case $cmd in
+  add)
+    [ $# -eq 3 ] || usage
+    n=$3
+    case $n in ''|0*|*[!0-9]*) usage ;; esac
+    [ "$n" -le 253 ] || usage
+    for ((i = 2; i <= n + 1; i++)); do
+      if [ $print = 1 ]; then echo "ip addr replace $NET.$i/32 dev $br"; else $IP addr replace "$NET.$i/32" dev "$br"; fi
+    done
+    ;;
+  del)
+    [ $# -eq 2 ] && [ $print = 0 ] || usage
+    for a in $(ours); do $IP addr del "$a/32" dev "$br"; done
+    ;;
+  list)
+    [ $# -eq 2 ] && [ $print = 0 ] || usage
+    ours
+    ;;
+  *) usage ;;
+esac
