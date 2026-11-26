@@ -43,7 +43,9 @@ redis_cluster_args() {
     --cluster-enabled yes --cluster-config-file nodes.conf
     --cluster-node-timeout "${REDIS_CLUSTER_NODE_TIMEOUT_MS:-5000}" --cluster-require-full-coverage no
     --repl-diskless-sync yes --repl-diskless-sync-delay 0)
-  [ "$host" = 127.0.0.1 ] || REDIS_CLUSTER_ARGS+=(--cluster-announce-ip "$host")
+  # Protected mode refuses every non-127.x client without a password, and the
+  # kind bridge address is not 127.x; the nodes listen only on it and loopback.
+  [ "$host" = 127.0.0.1 ] || REDIS_CLUSTER_ARGS+=(--cluster-announce-ip "$host" --protected-mode no)
 }
 
 # redis_cluster_join CLI P0 P1 P2 P3 P4 P5: P0-P2 become the masters (slots
