@@ -33,6 +33,7 @@ t2_not_covered "rolling restart and drain (Plan 6d2)" "node loss and disruption 
 
 t2_report_extra() {
   local f
+  [ -n "${T3_STOP_LOG:-}" ] && { t2_section "stopped: $T3_STOP_WHAT failed, $(basename "$T3_STOP_LOG") (last 30 lines)"; tail -n 30 "$T3_STOP_LOG"; }
   for f in "$STACK_DIR"/logs/*.log "$STACK_DIR"/logs/k8s/*.log; do
     [ -f "$f" ] || continue
     t2_section "$(basename "$f") (last 30 lines)"
@@ -42,15 +43,12 @@ t2_report_extra() {
 }
 
 t=$SECONDS
-if ! make redis-server >"$T2_OUT/redis-build.log" 2>&1; then
-  echo "make redis-server failed, see $T2_OUT/redis-build.log" >&2
-  exit 1
-fi
-t3_build >"$T2_OUT/build.log" 2>&1 || { echo "build failed, see $T2_OUT/build.log" >&2; exit 1; }
+make redis-server >"$T2_OUT/redis-build.log" 2>&1 || t3_stop "make redis-server" "$T2_OUT/redis-build.log"
+t3_build >"$T2_OUT/build.log" 2>&1 || t3_stop "build" "$T2_OUT/build.log"
 t2_duration build $((SECONDS - t))
 
 t=$SECONDS
-t3_cluster_up >"$T2_OUT/cluster.log" 2>&1 || { echo "kind cluster failed, see $T2_OUT/cluster.log" >&2; exit 1; }
+t3_cluster_up >"$T2_OUT/cluster.log" 2>&1 || t3_stop "kind cluster" "$T2_OUT/cluster.log"
 t2_duration cluster $((SECONDS - t))
 ready=$(kubectl get nodes -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' | grep -c '^True$')
 proxy=$(kubectl -n kube-system get configmap kube-proxy -o jsonpath='{.data.config\.conf}')
@@ -59,7 +57,7 @@ t2_check cluster "$(t2_bool [ "$ready" = 8 ] && [ "$mode" = ipvs ] && [ "$sched"
   "\"nodes_ready\": $ready, \"mode\": $(t2_json_str "$mode"), \"scheduler\": $(t2_json_str "$sched")"
 
 t=$SECONDS
-t3_redis_up >"$T2_OUT/redis.log" 2>&1 || { echo "Redis Cluster failed, see $T2_OUT/redis.log" >&2; exit 1; }
+t3_redis_up >"$T2_OUT/redis.log" 2>&1 || t3_stop "Redis Cluster" "$T2_OUT/redis.log"
 t3_deploy >"$T2_OUT/deploy.log" 2>&1; rc=$?
 t2_duration deploy $((SECONDS - t))
 pods=$(kubectl -n im get pods -o jsonpath='{range .items[*]}{.metadata.labels.app} {.metadata.name} {.spec.nodeName} {.status.podIP} {.status.containerStatuses[0].ready}{"\n"}{end}')
@@ -86,7 +84,7 @@ loops=$(for p in gw-0 gw-1 gw-2 gw-3 gw-4 gw-5; do kubectl -n im logs "$p" | gre
 t2_check pinning "$(t2_bool [ "$want" = "$have" ] && [ -z "$wrong" ] && [ "$loops" = loops=2x6 ])" \
   "\"nodes\": $(t2_json_str "${have% }"), \"redis_off_set\": $(t2_json_str "${wrong# }"), \"gateway_loops\": $(t2_json_str "$loops")"
 
-t3_probes >"$T2_OUT/probes.log" 2>&1 || { echo "probe pods failed, see $T2_OUT/probes.log" >&2; exit 1; }
+t3_probes >"$T2_OUT/probes.log" 2>&1 || t3_stop "probe pods" "$T2_OUT/probes.log"
 pong=""
 for j in 0 1 2 3 4 5; do
   pong+=$(t3_exec monitoring sh -c "printf 'PING\r\n' | nc -w 2 $T3_HOST $((${STACK_PORT_BASE:-17000} + 20 + j))" | tr -d '\r')
@@ -108,7 +106,7 @@ t2_check admin_policy "$(lg_true - 'd == {"mon_gw_admin": "open", "mon_logic_adm
   "other_logic_admin": "closed", "other_gw_client": "open", "other_gw_kick": "open", "other_logic_grpc": "open"}' <<<"$p")" "\"reach\": $p"
 
 # Load through the NodePort on the Logic node.
-t3_sources $(((CLIENTS + 4999) / 5000)) >"$T2_OUT/sources.log" 2>&1 || { echo "goim-srcaddr failed, see $T2_OUT/sources.log" >&2; exit 1; }
+t3_sources $(((CLIENTS + 4999) / 5000)) >"$T2_OUT/sources.log" 2>&1 || t3_stop "goim-srcaddr" "$T2_OUT/sources.log"
 t2_on_exit 'lg_stop'
 lg_start smoke -mode light -clients "$CLIENTS" -rate 500 -uid-prefix t3smoke -source-cidr "$T3_SOURCE_CIDR"
 lg_wait_online "$CLIENTS" 120; rc=$?

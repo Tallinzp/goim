@@ -9,7 +9,11 @@
 
 T3_CLUSTER=goim-t3
 T3_NODE_IMAGE=kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
-T3_PROBE_IMAGE=busybox:1.37.0
+# The probe image is busybox rebuilt as a one-platform local image: kind
+# load cannot import a multi-platform image from Docker's containerd store
+# when only one platform's content is present (6d1 host run).
+T3_PROBE_BASE=busybox:1.37.0
+T3_PROBE_IMAGE=goim-probe:tier3
 T3_NODEPORT=30800
 T3_SOURCE_CIDR=198.18.0.0/24
 # Gateway node k on one Zen 5c core, both SMT siblings (#150.1); the
@@ -52,7 +56,17 @@ t3_build() {
   mkdir -p "$T2_OUT/image"
   CGO_ENABLED=0 go build -trimpath -o "$T2_OUT/image/" ./cmd/gateway ./cmd/logic || return 1
   docker build -q -t goim:tier3 -f deploy/k8s/Dockerfile "$T2_OUT/image" || return 1
-  docker image inspect "$T3_PROBE_IMAGE" >/dev/null 2>&1 || docker pull -q "$T3_PROBE_IMAGE"
+  docker image inspect "$T3_PROBE_BASE" >/dev/null 2>&1 || docker pull -q --platform linux/amd64 "$T3_PROBE_BASE" || return 1
+  printf 'FROM %s\n' "$T3_PROBE_BASE" | docker build -q -t "$T3_PROBE_IMAGE" - || return 1
+}
+
+# t3_stop WHAT LOG: stops the run (exit 1) after a setup step failed; the
+# report and result.json name the step, and the report shows LOG's tail.
+t3_stop() {
+  T3_STOP_WHAT=$1 T3_STOP_LOG=$2
+  t2_field stopped_at "$(t2_json_str "$1")"
+  echo "$1 failed, see $2" >&2
+  exit 1
 }
 
 # t3_cluster_up: a fresh cluster, nodes pinned before our pods start.
