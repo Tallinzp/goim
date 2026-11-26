@@ -24,7 +24,7 @@ Inputs:
 1. **The trigger** is the test fault API (gateway `-faults`, `POST /fault/action/reconcile`), not a deleted lease key (#147.1).
 2. **One gateway** at the cap, 250k light clients (#148.1).
 3. **Two windows**, pass and delete phase, both gated (#148.2).
-4. **The rule:** in each window the set's master's p99 ≤ max(2 ×, + 50µs) **each** other master's p99 (#147.2, #148.3, #148.6). The commands: `pexpire` in the pass, `hgetall` in the delete phase (#148.5). The set's own commands (`sadd`, `sscan`, `srem`) are recorded, not gated.
+4. **The rule:** in each window the set's master's p99 ≤ max(2 ×, + floor) **each** other master's p99 (#147.2, #148.3, #148.6). **Amended at the final review (#148.7):** the p99 is a client-side probe's round trip (`PING` to each master every 10ms from loadgen's CPUs), floor 200µs; Redis's own service-time p99s (`pexpire` in the pass, `hgetall` in the delete phase, #148.5) are recorded only. The set's own commands (`sadd`, `sscan`, `srem`) are recorded, not gated.
 5. **The delete phase** is gated on its rate: uids scanned ÷ the phase's time ≥ 90% of `-delete-rate`, one ReconcileEnd, none retried or dropped. The time and its margin to 30s are recorded only (#147.3 amended).
 6. **No Logic SIGTERM phase** (#147.4).
 7. **Logic and the 6 Redis nodes share Logic's CPU set** (11,23), as runs 33–35 (#148.4).
@@ -41,16 +41,16 @@ Inputs:
 
 - `make test-scripts` stays green on the dev machine (2 cores, ~1GB, no Docker, no root). `make test`, `go vet ./...` are untouched (no Go change).
 - No change to any Go code, the wire, any Lua script, `scripts/stack.sh`, `scripts/loadgen.sh` or `scripts/tier2/lib.sh`. New files only: `scripts/tier2/gwconns.sh`, `scripts/tier2/gwconns_test.sh`; one line in the `Makefile` (`test-scripts`).
-- Run 36 is `GOIM_TEST_TIER=2 make test-tier2 SCENARIO=gwconns` at its defaults: 250,000 clients, `-max-conns` 250,000, ramp 5,000/s, `-triggered-rate` 5,000, `-delete-rate` 10,000 (Logic and the gateway), floor 50µs, graces 30s; CPU sets gateway `6-9,18-21` (GOMAXPROCS 8), Logic + Redis `11,23`, loadgen `0-5,10,12-17,22`; `-reconcile-cycle 24h` (no periodic pass in the run, capacity's choice).
+- Run 36 is `GOIM_TEST_TIER=2 make test-tier2 SCENARIO=gwconns` at its defaults: 250,000 clients, `-max-conns` 250,000, ramp 5,000/s, `-triggered-rate` 5,000, `-delete-rate` 10,000 (Logic and the gateway), floor 200µs (the probe's, #148.7), graces 30s; CPU sets gateway `6-9,18-21` (GOMAXPROCS 8), Logic + Redis `11,23`, loadgen `0-5,10,12-17,22`; `-reconcile-cycle 24h` (no periodic pass in the run, capacity's choice).
 - The gateway's `-delete-rate` equals Logic's: it sizes ReconcileEnd's deadline (2 × tracked ÷ rate + 10s = 60s at 250k).
 - `result.json` member names must not repeat lib.sh's own (`pass`, `checks`, …): the windows' fields are `pass_window` and `delete_window`.
 
 ## Review Focus
 
 1. **The pass's end leaks ~1s of the delete phase into the pass window.** The pass window's numbers are read (6 nodes × 3 `redis-cli` calls) before the delete window's `RESETSTAT`. The pass's gate (`pexpire`) is unaffected (the delete phase runs no `pexpire`); its `hgetall` and `sscan` numbers carry that second. Run 36: read the delete window's `hgetall` calls against the clients (~250k, less what the first second took).
-2. **A periodic pass at a random time.** `-reconcile-cycle 24h` starts the first periodic pass at a random point of 24h (~0.4% in a 6-minute run). A trigger during it cancels it (no ReconcileEnd); one before the trigger adds its own ReconcileEnd. `passes_periodic` is recorded in `pass`; `end` fails on two phases (`ends` ≠ 1). Run 36: read `passes_periodic` (0 expected).
+2. **A periodic pass at a random time.** `-reconcile-cycle 24h` starts the first periodic pass at a random point of 24h (~0.4% in a 6-minute run). It runs at `MinRate` 10/s, so it cannot end or send a ReconcileEnd in the run (and Logic's `ends` counts `pace="triggered"` only). A trigger during it cancels it; its chunks in flight may resolve after the first reading, so `pass_entries` reads above the clients and fails (the safe direction). `passes_periodic` in `pass` shows the cause. Run 36: read `passes_periodic` (0 expected). (Corrected at the final review, M-1.)
 3. **ReconcileEnd across Logic's `MaxConnectionAge` (5m).** The gateway's channel to Logic gets a GOAWAY every ~5m; a phase in flight then has the 30s grace, longer than the ~25s phase. A cut phase would be retried (`end` fails on `retried`). Run 36: if `end` fails on a retry, read Logic's log for the GOAWAY before any change.
-4. **The p99 of a few hundred SSCAN pages.** At 250k the set's master runs ~500 `sscan` pages and ~1,250 `sadd`s (one per chunk); each blocks that master for its time (dry run: p99 365µs and 811µs at 5,000 members). The 50µs floor is below one page, so a page queued before most per-uid commands shows. Run 36: record `sadd`/`sscan` p99 and p99.9 and the set's master's CPU against the others'.
+4. **The p99 of a few hundred SSCAN pages.** At 250k the set's master runs ~500 `sscan` pages and ~1,250 `sadd`s (one per chunk); each blocks that master for its time (dry run: p99 365µs and 811µs at 5,000 members). Redis's `INFO latencystats` times a command's own run only, so a per-uid command queued behind a page does not show there (final review I-1); the probe's round trip does, and it is the gate (#148.7). A page lands under ~1% of the probes (500 × ~0.5ms over ~25s), near the p99. Run 36: record `sadd`/`sscan` p99 and p99.9, the probe's p50/p99/p99.9 per master, and the set's master's CPU against the others'.
 5. **The rate gate's burst.** Logic's limiter allows a burst of one page (500 uids) at once, so the measured rate is a little above `-delete-rate` (dry run: 555 against 500/s); at 250k it is ~0.2% above. The gate is a floor (≥ 90%), so the burst cannot make it fail.
 
 Each line's test: 1, 2, 3, 4 are run 36's readings (Task 2 Step 3); 2's `end` rule (two phases fail) and 5's floor are pinned by `gwconns_test.sh` (`end: an earlier phase in Logic's window`, `end: 9,000 uids/s is 90%`).
@@ -585,7 +585,7 @@ and to send back `tier2-results/gwconns-<timestamp>.report.txt`. About 5 minutes
 Expected: exit 0, **14/14** checks. Read and record:
 - `gwconns_set`: the set's master and the lease key's (the same: one hash tag), `members` 250,000.
 - `pass`: `pass_ms` (~50s at 5,000/s), the entries by result, `requeued`, `not_owner_by_reason` (a reading; run 31 had 4,119 on gw-0 after a reset storm; 0 expected at rest), `passes_periodic` (Review Focus 2).
-- `pass_shards`, `end_shards`: each master's p99 and calls, `bound_us`; beside them from `pass_window`/`delete_window`: the set's master's `sadd`, `sscan`, `srem` (calls, p99, p99.9), `hget`/`hmget` per master, and each node's CPU (`usage`) (Review Focus 1, 4).
+- `pass_shards`, `end_shards`: the probe's p99 and calls per master, `bound_us`, `probe_errors`, `service_time`; beside them from `pass_window`/`delete_window`: the set's master's `sadd`, `sscan`, `srem` (calls, p99, p99.9), `hget`/`hmget` per master, and each node's CPU (`usage`) (Review Focus 1, 4).
 - `end`: `duration_s` (~25s), `rate`, `margin_s` to 30s, `deadline_s` (60), `reply_ms`, `deleted`.
 - `sessions`: 250,000 found.
 - Run 33's per-master `evalsha` p99 (119–124µs) is from a login storm; this run's commands differ (#148.5), so it is context, not a baseline.
@@ -605,3 +605,13 @@ In this plan's *Execution Notes*: the dry run and run 36's numbers as in Step 3.
 - Then **6d** (Tier 3, k8s: rolling restart, the LB).
 
 ## Execution Notes
+
+**Executed 2026-11-25** (superpowers:subagent-driven-development, the user's choice after a start inline was stopped before any step ran), on `feat/plan6c3` from `c492283`.
+- Task 1: `2c8742f`, byte for byte the plan's patch (`git diff proto-6c3` empty). Step 2: 26 failures; Step 4: 27 ok; the 6 mutations 1, 4, 1, 1, 1, 1 FAIL; `make test-scripts` green. Task review (Sonnet): spec ✅, approved; minors deferred: ~1s of the delete phase in the pass window (Review Focus 1); `t2_sessions 0` never flags `stale` (no re-login in the window).
+- Task 2 Step 1 (dry run on `2c8742f`): exit 1, 14 checks, only `no_swap_in` (151 pages); pass 32,155ms; `pexpire` 6.0/6.0/8.0µs, `hgetall` 7.0/8.0/12.0µs; delete phase 9.0s at 555 uids/s, deleted 0, retried 0.
+- **Final review (Opus): 0 Critical, 1 Important, 3 Minor.**
+  - **I-1: the gate read Redis's service time.** `INFO latencystats` times a command's own run; a command queued behind an `sscan` page or a `sadd` still shows a few µs, so the gate could not see the head-of-line blocking R4M-9 is about. The user chose (#148.7): a client-side probe, gated. Fixed `a845331` (`gc_probe`, `gc_probe_latency`, `gc_probe_errors`; 8 new tests failed first). The scoped re-review found the probe outliving its kill (python a child of `bash -c`); fixed `23050a1` (`exec python3`; test `probe: killing its PID stops it` failed first), with each master probed once (`sort -u`) and the floor 200µs (the user's choice: the dev machine's probe p99 is ~1.4–2.0ms on every master, scheduler noise on 2 shared CPUs, so it gives no number; re-checked after run 36).
+  - M-1: Review Focus 2's premise (corrected above). M-2 (`redis_reset` not gated): not fixed, moot once the gate reads the probe. M-3 (an empty lease key named slot 0's master as the owner): fixed in `a845331`.
+  - The patch in Task 1 is the code before these fixes; the code on the branch (`23050a1`) supersedes it.
+- Dry run on `23050a1`: exit 1, 14 checks, only `no_swap_in`; probe p99 pass 1,799/2,039/1,885µs (bound 3,598), delete 1,843/1,944/1,425µs (bound 3,686), 0 probe errors; no probe left after the run.
+- **Next: the user runs run 36** (Task 2 Steps 2–4).
