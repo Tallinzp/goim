@@ -1,0 +1,109 @@
+# gw-k is the gateway id ($POD_NAME) and Logic's Kick target
+# gw-k.gateway.im.svc.cluster.local:9100; the binary's defaults are these
+# ports and Logic at logic.im.svc.cluster.local:9000/9001.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: gw
+spec:
+  serviceName: gateway
+  replicas: 6
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: gateway
+  template:
+    metadata:
+      labels:
+        app: gateway
+      annotations:
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    spec:
+      # > -drain-timeout (85s).
+      terminationGracePeriodSeconds: 90
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: gateway
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: gateway
+          image: goim
+          command: ["/gateway"]
+          args: ["-max-conns=$(MAX_CONNS)"]
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: MAX_CONNS
+              valueFrom:
+                configMapKeyRef:
+                  name: goim-config
+                  key: MAX_CONNS
+          ports:
+            - name: client
+              containerPort: 8000
+            - name: kick
+              containerPort: 9100
+            - name: admin
+              containerPort: 9090
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 9090
+            periodSeconds: 2
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: noise-keys
+              mountPath: /etc/goim/noise
+              readOnly: true
+      volumes:
+        - name: noise-keys
+          secret:
+            secretName: noise-keys
+---
+# Kicks reach a draining (NotReady) pod.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: gateway
+  ports:
+    - name: kick
+      port: 9100
+---
+# Clients: Ready pods only (R4M-7); the cloud LB uses least connections.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway-client
+spec:
+  type: LoadBalancer
+  selector:
+    app: gateway
+  ports:
+    - name: client
+      port: 8000
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: gateway
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: gateway
