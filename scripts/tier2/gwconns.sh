@@ -44,7 +44,7 @@
 #   GWCONNS_DELETE_RATE    the delete phase's rate, uids/s: Logic's and
 #                          gw-0's -delete-rate (default 10000)
 #   GWCONNS_FLOOR_US       the rule's floor over the other masters' p99, µs
-#                          (default 50, #148.6)
+#                          (default 200, #148.6-7: the probe's round trip)
 #   GWCONNS_GRACE_S        MaxConnectionAgeGrace and ShutdownGrace, for the
 #                          recorded margin (default 30, Logic's defaults)
 #   GWCONNS_LG_MEMLIMIT    loadgen's GOMEMLIMIT (default 4GiB)
@@ -103,7 +103,7 @@ for v in GWCONNS_CLIENTS GWCONNS_CAP GWCONNS_RATE GWCONNS_TRIGGERED_RATE GWCONNS
   case ${!v-1} in ''|*[!0-9]*|0*) echo "gwconns: $v must be a positive whole number" >&2; exit 1 ;; esac
 done
 N=${GWCONNS_CLIENTS:-250000} CAP=${GWCONNS_CAP:-250000} RATE=${GWCONNS_RATE:-5000}
-TR=${GWCONNS_TRIGGERED_RATE:-5000} DR=${GWCONNS_DELETE_RATE:-10000} GRACE=${GWCONNS_GRACE_S:-30} FLOOR=${GWCONNS_FLOOR_US:-50}
+TR=${GWCONNS_TRIGGERED_RATE:-5000} DR=${GWCONNS_DELETE_RATE:-10000} GRACE=${GWCONNS_GRACE_S:-30} FLOOR=${GWCONNS_FLOOR_US:-200}
 [ "$N" -le "$CAP" ] || { echo "gwconns: GWCONNS_CLIENTS must not exceed GWCONNS_CAP" >&2; exit 1; }
 # 250k light clients: under capacity's 600k budget.
 t2_mem_budget 12
@@ -181,9 +181,10 @@ print(json.dumps({"cmd": cmd, "owner": owner, "p99_us": p99, "calls": calls, "bo
 # per round trip to OUT: "MS NAME US" (MS: wall clock ms at the send, US:
 # the round trip in µs, -1 if the send or read failed, then it reconnects).
 # It sees what Redis's own latency stats cannot: the wait behind a slow
-# command on the same master (head-of-line blocking, R4M-9).
+# command on the same master (head-of-line blocking, R4M-9). It execs
+# python, so a bash -c running it leaves python's PID to kill.
 gc_probe() {
-  python3 -c 'import socket, sys, time
+  exec python3 -c 'import socket, sys, time
 out = open(sys.argv[1], "a", buffering=1)
 tg = [(a.split("=")[0], a.split("=")[1].rsplit(":", 1)) for a in sys.argv[2:]]
 tg = [(n, (h, int(p))) for n, (h, p) in tg]
@@ -323,7 +324,7 @@ admin=$(stack_admins | awk '$1 == "gw-0" { print $2 }')
 # before the trigger to after the delete window (the round trip a client
 # waits, #148.7).
 probe_args=()
-for n in $(stack_redis_slots | awk '{ print $3 }'); do
+for n in $(stack_redis_slots | awk '{ print $3 }' | sort -u); do
   probe_args+=("$n=127.0.0.1:$(awk -v n="$n" '$1 == n { print $2 }' "$STACK_DIR/redis/layout")")
 done
 rm -f "$STACK_DIR/probe.tsv"

@@ -18,7 +18,7 @@ ok() { echo "ok   $1"; }
 bad() { echo "FAIL $1"; fails=$((fails + 1)); }
 expect() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1: got [$2], want [$3]"; fi; }
 get() { python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(eval(sys.argv[2]))' "$1" "$2"; }
-eval "$(sed -n '/^gc_shards() {/,/^}/p; /^gc_end() {/,/^}/p; /^gc_wait_inc() {/,/^}/p; /^gc_probe_latency() {/,/^}/p; /^gc_probe_errors() {/,/^}/p' scripts/tier2/gwconns.sh)"
+eval "$(sed -n '/^gc_shards() {/,/^}/p; /^gc_end() {/,/^}/p; /^gc_wait_inc() {/,/^}/p; /^gc_probe_latency() {/,/^}/p; /^gc_probe_errors() {/,/^}/p; /^gc_probe() {/,/^}/p' scripts/tier2/gwconns.sh)"
 
 # stack_redis_latency on a Cluster: masters redis-0..2 with evalsha p99
 # A, B, C (µs), replicas redis-3..5; redis-1 holds the set.
@@ -98,5 +98,17 @@ printf '%s\n' null 1 >"$T2_TMP_READS"
 expect "wait: a null start counts as 0" "$(gc_wait_inc gw-0 m x null 5 && echo done)" done
 SECONDS=0
 expect "wait: fails after SECONDS" "$(gc_wait_inc gw-0 m x 3 0 || echo timeout)" timeout
+
+# gc_probe started as the scenario starts it (a bash -c running the
+# function): killing the PID it leaves stops the probe itself, not only
+# its bash (re-review of fix wave 1).
+bash -c "$(declare -f gc_probe); gc_probe \"\$@\"" _ "$tmp/probe-kill.tsv" redis-0=127.0.0.1:1 2>/dev/null &
+pid=$!
+command sleep 1
+kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+command sleep 0.5
+expect "probe: killing its PID stops it" "$(pgrep -f "$tmp/probe-kill.tsv" | wc -l)" 0
+pkill -f "$tmp/probe-kill.tsv" 2>/dev/null
+expect "probe: it wrote failed round trips" "$(awk '$3 == -1' "$tmp/probe-kill.tsv" | head -n 1 | wc -l)" 1
 
 if [ "$fails" -eq 0 ]; then echo "gwconns_test: all passed"; else echo "gwconns_test: $fails failure(s)"; exit 1; fi
