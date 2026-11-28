@@ -117,7 +117,7 @@ t3_redis_up() {
   local base=${STACK_PORT_BASE:-17000} j
   mkdir -p "$STACK_DIR/logs" "$STACK_DIR/redis"
   # Exported for the whole run: a node restarted later keeps this address.
-  export REDIS_CLUSTER_HOST=$T3_HOST
+  export REDIS_CLUSTER_HOST=$T3_HOST STACK_REDIS=cluster
   stack_redis_cluster_up "$STACK_REDIS_SERVER" "$T2_CPUS_LOGIC" || return 1
   T3_REDIS_ADDRS=""
   for j in 0 1 2 3 4 5; do T3_REDIS_ADDRS+="${T3_REDIS_ADDRS:+,}$T3_HOST:$((base + 20 + j))"; done
