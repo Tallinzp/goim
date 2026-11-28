@@ -1822,4 +1822,34 @@ In this plan's *Execution Notes*: the dry run and the host run as in Step 3. In 
 
 ## Execution Notes
 
-Not executed yet.
+Executed 2026-11-25..28, subagent-driven (one implementer and one reviewer per task, then a final whole-branch review and one fix wave). Commits: Task 1 `d87344a`, Task 2 `ad1318f`, Task 3 `8813390`; fix wave `602cd28`, `1c961eb`; host-run fixes `1986ff6`, `f81d5be`, `c93b60b`, `1020552`, `cfc74ca`, `9dd60c1`.
+
+**Dry run (Task 4 Step 1, dev machine):** MATCH, all 8 lines as expected.
+
+**Final review and fix wave (before the host run):**
+- Critical: Redis 7.4.11 protected mode refuses non-loopback clients without a password. Pods reach Redis on the kind bridge, so `redis-cluster.sh` now adds `--protected-mode no` only when `REDIS_CLUSTER_HOST` is set and is not 127.0.0.1 (`602cd28`).
+- The smoke's source count follows `(CLIENTS+4999)/5000`. `REDIS_CLUSTER_HOST` is exported for the whole run. `t3_init` refuses the run when `sudo -n` cannot run `goim-srcaddr`. The teardown kubectl calls have `--request-timeout=20s` (`1c961eb`).
+- Parked: the pod listing in `t3_cluster_down` has no timeout.
+
+**Host runs (Task 4 Step 2):** six runs; the first five found a bug each, the sixth passed.
+1. `smoke-20261126-071716`: refused at `k8s-tools.sh`. `cdn.dl.k8s.io` is not reachable from the host (curl 18 after 625s). The node image's `/usr/bin/kubectl` has the release's SHA-256. Fix `1986ff6`: kubectl from the node image when the download fails; curl timeouts and retries.
+2. `smoke-20261126-075314`: stopped at `kind load`: `ctr ... content digest sha256:88132f86...: not found`. The pulled busybox is in Docker's containerd image store without all its content. Fix `f81d5be`: a `FROM busybox` rebuild; the report now names the failed step and shows its log tail (`t3_stop`).
+3. `smoke-20261128-071640`: the same `kind load` error. A `FROM`-only build gives back the same image (same ID). Fix `c93b60b`: the probe image is `docker export | docker import` of a busybox container, local content only.
+4. `smoke-20261128-071934`: cluster and ready passed; the pinning loop failed (a bare word on an assignment line ran as a command). Fix `1020552`. In the same fix, for busybox's small `nc` (no `-z`, waits for the server to close): the port checks count a live `nc` after its 3s connect timeout as open (`T3_TCP`), and the Redis check sends `PING` then `QUIT`.
+5. `smoke-20261128-072541`: all 10 checks passed, but wrongly. `STACK_REDIS` was not `cluster`, so the pinning check looked for one Redis named `redis` and listed it as off its CPU set. The check still passed: `t2_bool A && B` prints A's result only. Four Tier 3 checks and three Tier 2 checks (`gwconns_set`, the failover checks, `cluster_no_skips`) were written that way, the Tier 2 ones since before this plan. Fixes `cfc74ca` (`STACK_REDIS=cluster`) and `9dd60c1` (compound checks as `$(A && B && echo true || echo false)`; a lib test refuses the old form). Earlier Tier 2 results of those three checks were scored by their first test only.
+6. `smoke-20261128-072954` (`9dd60c1`, clean): **pass, 10/10.**
+
+**Run 6 results:**
+- Durations: total 93s; build 4s, cluster 33s, deploy 16s.
+- `cluster`: 8 nodes Ready, kube-proxy `ipvs`, scheduler `lc`.
+- `ready`: rollout 0; `gw-0..5` one per gateway node; both Logic pods on `goim-t3-worker7`.
+- `pinning`: the gateway nodes on `4,16` .. `9,21`; the control plane and the Logic node on `10,11,22,23`; no Redis node off its set; `loops=2x6`.
+- `redis_from_pods`: `+PONG+OK` from all 6 nodes at `172.19.0.1`.
+- `admin_policy`: from `monitoring` gateway and Logic admin are open; from `goim-other` admin is closed, and client 8000, Kick 9100 and Logic gRPC 9000 are open.
+- `online`: 6,000 online in 12.2s through `172.19.0.4:30800` from 2 sources; login p50/p90/p99/max 7/23/35/59 ms; `failed` `{"pre-handshake": 21}` (all retried; 17 in run 5); pong RTT p99 2 ms.
+- `balance`: 1,000 on each gateway, max deviation 0%.
+- `ipvs`: `lc`, 6 real servers, ActiveConn 1,000 each.
+- `pods`: 8 Ready, 0 restarts. `processes`: no problems, loadgen exit 0.
+- Seen, not checked: each gateway logs "lease renewal failed ... no children to pick from" for ~1-4s at start, until Logic is up; the HPA logs FailedGetResourceMetric (no metrics-server, in `not_covered`).
+
+**For 6d2:** the 17-21 pre-handshake failures at 500 logins/s through the NodePort (find the cause before the scale run); flood modes cannot use `-source-cidr`; NodePort SNAT gives ~64k ports per gateway, so `TIER3_SCALE` ≤ ~0.25 unless sources change; kind's startup budget (cluster ~30s, deploy ~10-16s).
