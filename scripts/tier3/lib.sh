@@ -177,6 +177,11 @@ t3_probes() {
 }
 
 t3_exec() { local ns=$1; shift; timeout 20 kubectl -n "$ns" exec probe -- "$@"; }
+# T3_TCP: run in a probe as sh -c "$T3_TCP" IP PORT; exit 0 when the TCP
+# connect succeeds. busybox nc may be the small one (no -z, waits for the
+# server to close), so: stdin stays open, and nc alive after its 3s
+# connect timeout means connected.
+T3_TCP='sleep 6 | nc -w 3 "$0" "$1" >/dev/null 2>&1 & p=$!; sleep 4; kill $p 2>/dev/null && exit 0; wait $p'
 t3_metrics() { t3_exec monitoring wget -q -T 5 -O - "http://$1:9090/metrics"; }
 
 # t3_sources N: N aliases (goim-srcaddr); stack.env names one target, the

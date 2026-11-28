@@ -72,7 +72,7 @@ t2_check ready "$(t2_bool [ "$rc" = 0 ] && [ "$(awk '{ print $2 }' <<<"$gws" | s
 [ "$rc" = 0 ] || exit 1
 
 # Pinning: as planned on the containers, and as seen inside a pod.
-want="" have="" n i=0
+want="" have="" i=0
 for n in $(kubectl get nodes -l goim.io/role=gateway -o name | sed 's|node/||' | sort -V); do
   want+="$n=${T3_GW_CPUS[i]} " i=$((i + 1))
 done
@@ -87,9 +87,9 @@ t2_check pinning "$(t2_bool [ "$want" = "$have" ] && [ -z "$wrong" ] && [ "$loop
 t3_probes >"$T2_OUT/probes.log" 2>&1 || t3_stop "probe pods" "$T2_OUT/probes.log"
 pong=""
 for j in 0 1 2 3 4 5; do
-  pong+=$(t3_exec monitoring sh -c "printf 'PING\r\n' | nc -w 2 $T3_HOST $((${STACK_PORT_BASE:-17000} + 20 + j))" | tr -d '\r')
+  pong+=$(t3_exec monitoring sh -c "printf 'PING\r\nQUIT\r\n' | nc -w 2 $T3_HOST $((${STACK_PORT_BASE:-17000} + 20 + j))" | tr -d '\r\n')
 done
-t2_check redis_from_pods "$(t2_bool [ "$pong" = "+PONG+PONG+PONG+PONG+PONG+PONG" ])" "\"host\": $(t2_json_str "$T3_HOST"), \"replies\": $(t2_json_str "$pong")"
+t2_check redis_from_pods "$(t2_bool [ "$pong" = "+PONG+OK+PONG+OK+PONG+OK+PONG+OK+PONG+OK+PONG+OK" ])" "\"host\": $(t2_json_str "$T3_HOST"), \"replies\": $(t2_json_str "$pong")"
 
 gw_ip=$(awk '$2 == "gw-0" { print $4 }' <<<"$pods") logic_ip=$(awk '$1 == "logic" { print $4; exit }' <<<"$pods")
 reach() { if t3_exec "$1" "${@:2}" >/dev/null 2>&1; then echo open; else echo closed; fi; }
@@ -98,9 +98,9 @@ p=$(printf '"%s": "%s", ' \
   mon_logic_admin "$(reach monitoring wget -q -T 3 -O /dev/null "http://$logic_ip:9090/readyz")" \
   other_gw_admin "$(reach goim-other wget -q -T 3 -O /dev/null "http://$gw_ip:9090/readyz")" \
   other_logic_admin "$(reach goim-other wget -q -T 3 -O /dev/null "http://$logic_ip:9090/readyz")" \
-  other_gw_client "$(reach goim-other nc -w 3 "$gw_ip" 8000)" \
-  other_gw_kick "$(reach goim-other nc -w 3 "$gw_ip" 9100)" \
-  other_logic_grpc "$(reach goim-other nc -w 3 "$logic_ip" 9000)")
+  other_gw_client "$(reach goim-other sh -c "$T3_TCP" "$gw_ip" 8000)" \
+  other_gw_kick "$(reach goim-other sh -c "$T3_TCP" "$gw_ip" 9100)" \
+  other_logic_grpc "$(reach goim-other sh -c "$T3_TCP" "$logic_ip" 9000)")
 p="{${p%, }}"
 t2_check admin_policy "$(lg_true - 'd == {"mon_gw_admin": "open", "mon_logic_admin": "open", "other_gw_admin": "closed",
   "other_logic_admin": "closed", "other_gw_client": "open", "other_gw_kick": "open", "other_logic_grpc": "open"}' <<<"$p")" "\"reach\": $p"
