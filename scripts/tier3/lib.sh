@@ -9,9 +9,10 @@
 
 T3_CLUSTER=goim-t3
 T3_NODE_IMAGE=kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
-# The probe image is busybox rebuilt as a one-platform local image: kind
-# load cannot import a multi-platform image from Docker's containerd store
-# when only one platform's content is present (6d1 host run).
+# The probe image is busybox's file system imported as a new local image.
+# kind load cannot import the pulled busybox from Docker's containerd store
+# (a blob is missing), and a "FROM busybox" build is the same image
+# (6d1 host runs 2 and 3). An imported image holds only local content.
 T3_PROBE_BASE=busybox:1.37.0
 T3_PROBE_IMAGE=goim-probe:tier3
 T3_NODEPORT=30800
@@ -57,7 +58,12 @@ t3_build() {
   CGO_ENABLED=0 go build -trimpath -o "$T2_OUT/image/" ./cmd/gateway ./cmd/logic || return 1
   docker build -q -t goim:tier3 -f deploy/k8s/Dockerfile "$T2_OUT/image" || return 1
   docker image inspect "$T3_PROBE_BASE" >/dev/null 2>&1 || docker pull -q --platform linux/amd64 "$T3_PROBE_BASE" || return 1
-  printf 'FROM %s\n' "$T3_PROBE_BASE" | docker build -q -t "$T3_PROBE_IMAGE" - || return 1
+  local cid
+  cid=$(docker create --platform linux/amd64 "$T3_PROBE_BASE") || return 1
+  docker export "$cid" | docker import -c 'ENV PATH=/bin:/usr/bin:/sbin:/usr/sbin' - "$T3_PROBE_IMAGE" >/dev/null
+  local rc=$?
+  docker rm "$cid" >/dev/null
+  return "$rc"
 }
 
 # t3_stop WHAT LOG: stops the run (exit 1) after a setup step failed; the
