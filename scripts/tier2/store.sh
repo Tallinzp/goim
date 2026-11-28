@@ -154,7 +154,7 @@ cluster_s=$((SECONDS - t))
 cran=$(grep -c -- '--- PASS: TestClusterHasThreeMastersWithReplicas' "$out/tests-cluster.log" 2>/dev/null)
 t2_field redis_cluster "$(t2_json_str "$("$server" --version 2>/dev/null)")"
 t2_check cluster_tests "$(t2_bool [ "$ctests_rc" -eq 0 ])" "\"failed\": $(t2_json_str "$cfailed"), \"duration_s\": $cluster_s"
-t2_check cluster_no_skips "$(t2_bool [ "$cskips" -eq 0 ] && [ "${cran:-0}" -eq 1 ])" "\"tier2_skips\": $cskips, \"cluster_test_passed\": ${cran:-0}"
+t2_check cluster_no_skips "$([ "$cskips" -eq 0 ] && [ "${cran:-0}" -eq 1 ] && echo true || echo false)" "\"tier2_skips\": $cskips, \"cluster_test_passed\": ${cran:-0}"
 t2_check cluster_mutation "$(t2_bool [ "$cmutation" = pass ])" "\"detail\": $(t2_json_str "$cmutation")"
 t2_check cluster_eviction "$(t2_bool [ "$cpolicy" = noeviction=6 ])" "\"maxmemory_policy\": $(t2_json_str "$cpolicy")"
 t2_not_covered "Redis Cluster failover: MOVED and NOSCRIPT on a new master, the lease across it (Plan 6c2)" \

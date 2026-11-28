@@ -12,8 +12,10 @@
 #                                          (fs.nr_open: systemd raises it at boot)
 #   /etc/modules-load.d/goim-tier2.conf    from scripts/tier2/modules.conf, loaded now
 #   /usr/local/sbin/goim-netdrop           root-owned, 0755 (the b2 DROP rule only)
-#   /etc/sudoers.d/goim-netdrop            $SUDO_USER may run goim-netdrop, and only
-#                                          it, without a password (checked with visudo)
+#   /usr/local/sbin/goim-srcaddr           root-owned, 0755 (Tier 3's loadgen sources
+#                                          on the kind bridge only, Plan 6d1)
+#   /etc/sudoers.d/goim-netdrop            $SUDO_USER may run these two, and only
+#                                          them, without a password (checked with visudo)
 #   /etc/security/limits.d/90-goim-tier2.conf  and
 #   /etc/systemd/system/user@UID.service.d/90-goim-tier2.conf
 #                                          $SUDO_USER's nofile hard limit 2,097,152,
@@ -85,7 +87,8 @@ done <"$here/sysctl.conf" >"$tmp/sysctl"
 put "$tmp/sysctl" /etc/sysctl.d/90-goim-tier2.conf 0644
 put "$here/modules.conf" /etc/modules-load.d/goim-tier2.conf 0644
 put "$here/goim-netdrop" /usr/local/sbin/goim-netdrop 0755
-echo "$user ALL=(root) NOPASSWD: /usr/local/sbin/goim-netdrop" >"$tmp/sudoers"
+put "$here/goim-srcaddr" /usr/local/sbin/goim-srcaddr 0755
+echo "$user ALL=(root) NOPASSWD: /usr/local/sbin/goim-netdrop, /usr/local/sbin/goim-srcaddr" >"$tmp/sudoers"
 if [ -z "$root" ]; then
   visudo -cqf "$tmp/sudoers" || { echo "host-setup: visudo rejected the sudoers line" >&2; exit 1; }
 fi

@@ -64,7 +64,8 @@ The full reasoning, including the rejected alternatives, is in the [design guide
 | `internal/sdk`, `internal/clientconn` | Client SDK and the low-level client connection |
 | `internal/racetest`, `internal/fault` | Race scenarios and fault injection |
 | `api/` | Protobuf definitions (client protocol and internal gRPC) |
-| `scripts/` | Single-node deploy (`deploy.sh`), local stack, load probe and Tier 2 benchmark scenarios |
+| `deploy/k8s` | Kubernetes manifests (kustomize base, `local` overlay for kind) and the static image |
+| `scripts/` | Single-node deploy (`deploy.sh`), local stack, load probe, Tier 2 benchmark scenarios and Tier 3 (kind) scenarios |
 | `docs/` | Design spec, guide, implementation plans and review records |
 
 ## Running the tests
@@ -81,6 +82,12 @@ Tier 2 benchmark scenarios (`smoke`, `race`, `foundation`, …) run on a dedicat
 
 ```sh
 GOIM_TEST_TIER=2 make test-tier2 SCENARIO=smoke
+```
+
+Tier 3 runs gateway and Logic on a local kind cluster on the same host (6 gateway nodes, kube-proxy IPVS least-connections; Redis and loadgen stay on the host). It needs Docker; the pinned kind and kubectl come from `make k8s-tools`, and `sudo scripts/tier2/host-setup.sh` installs the helper for loadgen's source addresses:
+
+```sh
+GOIM_TEST_TIER=3 make test-tier3 SCENARIO=smoke TARGET=local
 ```
 
 ## Run a node on your machine
@@ -119,7 +126,7 @@ Tested on Ubuntu. The macOS parts are checked by reading, shellcheck and cross-c
 
 ## Status
 
-This is sub-project 1 (connection and session core) of a larger IM system. Done: gateway, Logic, session store, TCP transport, client SDK, race suite, load generator, the Tier 2 benchmark foundation, the single-gateway capacity and heartbeat-cost benchmarks (600k connections), gateway loss with SDK clients at 200k and 600k, silent loss of a 200k gateway, a slowed Logic (a CPU quota), handshake and slow-client floods, and whole-population reconnect (LB reset, network change, silent drop). Next: Redis Cluster failover, and Kubernetes rolling restarts. Messaging, push and the WebSocket transport are later sub-projects.
+This is sub-project 1 (connection and session core) of a larger IM system. Done: gateway, Logic, session store, TCP transport, client SDK, race suite, load generator, the Tier 2 benchmark foundation, the single-gateway capacity and heartbeat-cost benchmarks (600k connections), gateway loss with SDK clients at 200k and 600k, silent loss of a 200k gateway, a slowed Logic (a CPU quota), handshake and slow-client floods, whole-population reconnect (LB reset, network change, silent drop), Redis Cluster (failover, zone loss, the gwconns shard load), and the Kubernetes manifests with a smoke run on a local kind cluster. Next: Kubernetes rolling restart and node loss. Messaging, push and the WebSocket transport are later sub-projects.
 
 ## License
 
@@ -193,7 +200,8 @@ flowchart LR
 | `internal/sdk`、`internal/clientconn` | 客户端 SDK 与底层客户端连接 |
 | `internal/racetest`、`internal/fault` | 竞态场景与故障注入 |
 | `api/` | Protobuf 定义（客户端协议与内部 gRPC） |
-| `scripts/` | 单节点部署（`deploy.sh`）、本地集群、压测探针与 Tier 2 压测场景 |
+| `deploy/k8s` | Kubernetes 清单（kustomize base、用于 kind 的 `local` overlay）与静态镜像 |
+| `scripts/` | 单节点部署（`deploy.sh`）、本地集群、压测探针、Tier 2 压测场景与 Tier 3（kind）场景 |
 | `docs/` | 设计文档、指南、实施计划与评审记录 |
 
 ### 运行测试
@@ -210,6 +218,12 @@ Tier 2 压测场景（`smoke`、`race`、`foundation` 等）在专用主机上�
 
 ```sh
 GOIM_TEST_TIER=2 make test-tier2 SCENARIO=smoke
+```
+
+Tier 3 在同一台主机上的本地 kind 集群中运行网关和 Logic（6 个网关节点，kube-proxy 使用 IPVS 最少连接调度；Redis 和压测工具仍在主机上）。需要 Docker；固定版本的 kind 和 kubectl 由 `make k8s-tools` 获取，`sudo scripts/tier2/host-setup.sh` 会安装压测工具源地址所需的辅助程序：
+
+```sh
+GOIM_TEST_TIER=3 make test-tier3 SCENARIO=smoke TARGET=local
 ```
 
 ### 在本机运行一个节点
@@ -238,7 +252,7 @@ make deploy-down                  # 停止：先让网关排空，再停 Logic�
 
 ### 当前状态
 
-这是一个更大 IM 系统中的子项目 1（连接与会话核心）。已完成：网关、Logic、会话存储、TCP 传输、客户端 SDK、竞态测试集、压测工具、Tier 2 压测基础设施，单网关容量和心跳开销压测（60 万连接），使用 SDK 客户端的 20 万和 60 万连接网关故障，静默丢失一个 20 万连接的网关，变慢的 Logic（CPU 配额），握手洪泛和慢客户端洪泛，以及全体客户端重连（LB 重置、网络变化、静默断开）。下一步：Redis Cluster 故障转移，以及 Kubernetes 滚动重启。消息、推送和 WebSocket 传输属于后续子项目。
+这是一个更大 IM 系统中的子项目 1（连接与会话核心）。已完成：网关、Logic、会话存储、TCP 传输、客户端 SDK、竞态测试集、压测工具、Tier 2 压测基础设施，单网关容量和心跳开销压测（60 万连接），使用 SDK 客户端的 20 万和 60 万连接网关故障，静默丢失一个 20 万连接的网关，变慢的 Logic（CPU 配额），握手洪泛和慢客户端洪泛，全体客户端重连（LB 重置、网络变化、静默断开），Redis Cluster（故障转移、可用区丢失、gwconns 分片负载），以及 Kubernetes 清单和在本地 kind 集群上的冒烟测试。下一步：Kubernetes 滚动重启和节点丢失。消息、推送和 WebSocket 传输属于后续子项目。
 
 ### 许可证
 

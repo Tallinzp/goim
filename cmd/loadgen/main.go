@@ -57,6 +57,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	fs.StringVar(&cfg.UIDPrefix, "uid-prefix", "lg", "uid prefix, distinct per run")
 	fs.IntVar(&cfg.Sources, "sources", 0, "source addresses 127.0.<source-net>.2…; 0: one per 5,000 connections per gateway (floods: 253)")
 	fs.IntVar(&cfg.SourceNet, "source-net", 0, "third octet of the source addresses, one per instance on a stack; floods: required, 1–255")
+	fs.StringVar(&cfg.SourceCIDR, "source-cidr", "", "source addresses from this IPv4 network's second host on instead of 127.0.<source-net>.2…, e.g. 198.18.0.0/24 (Tier 3)")
 	fs.DurationVar(&cfg.PingEvery, "ping-every", 150*time.Second, "light: Ping interval (the gateway's -heartbeat)")
 	fs.DurationVar(&cfg.Timeout, "timeout", 10*time.Second, "light: dial + handshake + Login per attempt; floods: dial, then the wait for the gateway's close")
 	fs.IntVar(&cfg.Attempts, "light-attempts", 10, "light: login attempts before a client gives up (0.5-1.5s apart)")

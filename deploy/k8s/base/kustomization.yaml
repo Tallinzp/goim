@@ -1,0 +1,11 @@
+# A deployment adds the ConfigMaps goim-config (REDIS_ADDRS, JWKS_URL,
+# MAX_CONNS) and jwks-fallback (jwks.json) and the Secret noise-keys (a
+# file per key_id, made with kubectl: kustomize drops a data key named 1).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: im
+resources:
+  - namespace.yaml
+  - gateway.yaml
+  - logic.yaml
+  - netpol.yaml

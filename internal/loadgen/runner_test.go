@@ -81,3 +81,19 @@ func TestNewRefusesPrecomputeInLightMode(t *testing.T) {
 		t.Fatalf("err %v, want a precompute error", err)
 	}
 }
+
+// -source-cidr replaces 127.0.<source-net>.x; both at once is a mistake.
+func TestNewTakesSourcesFromACIDR(t *testing.T) {
+	env := Env{GatewayIDs: []string{"lb"}, GatewayAddrs: []string{"172.18.0.3:30800"}}
+	r, err := New(Config{Mode: "sdk", Clients: 6_000, Rate: 1, UIDPrefix: "x", SourceCIDR: "198.18.0.0/24"}, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.cfg.Sources != 2 || len(r.bal.srcs) != 2 || r.bal.srcs[1].String() != "198.18.0.3" {
+		t.Fatalf("sources %d %v, want 198.18.0.2 and .3", r.cfg.Sources, r.bal.srcs)
+	}
+	_, err = New(Config{Mode: "sdk", Clients: 1, Rate: 1, UIDPrefix: "x", SourceCIDR: "198.18.0.0/24", SourceNet: 1}, env)
+	if err == nil || !strings.Contains(err.Error(), "source") {
+		t.Fatalf("err %v, want a source error", err)
+	}
+}

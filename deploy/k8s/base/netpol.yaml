@@ -1,0 +1,42 @@
+# The admin port (metrics, pprof, /readyz) from the monitoring namespace
+# only (#85); the kubelet's probe comes from the node (kindnet does not
+# police the node's root user). Every other port stays open.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway
+spec:
+  podSelector:
+    matchLabels:
+      app: gateway
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - port: 8000
+        - port: 9100
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 9090
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: logic
+spec:
+  podSelector:
+    matchLabels:
+      app: logic
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - port: 9000
+        - port: 9001
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 9090

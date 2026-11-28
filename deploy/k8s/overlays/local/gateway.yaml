@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: gw
+spec:
+  template:
+    spec:
+      nodeSelector:
+        goim.io/role: gateway
+      tolerations:
+        - key: goim.io/role
+          value: gateway
+          effect: NoSchedule
+      containers:
+        - name: gateway
+          imagePullPolicy: Never
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway-client
+spec:
+  type: NodePort
+  ports:
+    - name: client
+      port: 8000
+      nodePort: 30800

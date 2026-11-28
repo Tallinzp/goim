@@ -315,7 +315,7 @@ if [ -n "$lease" ]; then # an empty key would hash to slot 0's master
 fi
 scard=$(STACK_REDIS_TIMEOUT=5 stack_redis_node_cli "${owner:-redis-0}" scard "$set" 2>/dev/null)
 case $scard in '' | *[!0-9]*) scard=null ;; esac
-t2_check gwconns_set "$(t2_bool [ -n "$owner" ] && [ "$scard" = "$N" ])" \
+t2_check gwconns_set "$([ -n "$owner" ] && [ "$scard" = "$N" ] && echo true || echo false)" \
   "\"key\": \"$set\", \"owner\": \"$owner\", \"lease_owner\": \"$lease_owner\", \"members\": $scard, \"want\": $N, \"roles\": $(stack_redis_roles)"
 stack_snapshot before
 admin=$(stack_admins | awk '$1 == "gw-0" { print $2 }')

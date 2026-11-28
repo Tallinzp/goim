@@ -1,0 +1,12 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: logic
+spec:
+  template:
+    spec:
+      nodeSelector:
+        goim.io/role: logic
+      containers:
+        - name: logic
+          imagePullPolicy: Never
