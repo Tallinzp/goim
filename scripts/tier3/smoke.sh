@@ -53,7 +53,7 @@ t2_duration cluster $((SECONDS - t))
 ready=$(kubectl get nodes -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' | grep -c '^True$')
 proxy=$(kubectl -n kube-system get configmap kube-proxy -o jsonpath='{.data.config\.conf}')
 mode=$(awk '/^mode:/ { print $2 }' <<<"$proxy") sched=$(awk '/^  scheduler:/ { print $2 }' <<<"$proxy")
-t2_check cluster "$(t2_bool [ "$ready" = 8 ] && [ "$mode" = ipvs ] && [ "$sched" = lc ])" \
+t2_check cluster "$([ "$ready" = 8 ] && [ "$mode" = ipvs ] && [ "$sched" = lc ] && echo true || echo false)" \
   "\"nodes_ready\": $ready, \"mode\": $(t2_json_str "$mode"), \"scheduler\": $(t2_json_str "$sched")"
 
 t=$SECONDS
@@ -65,9 +65,9 @@ echo "$pods" >"$T2_OUT/pods.txt"
 gw_nodes=$(kubectl get nodes -l goim.io/role=gateway -o name | sed 's|node/||' | sort | paste -sd' ' -)
 logic_node=$(kubectl get nodes -l goim.io/role=logic -o jsonpath='{.items[0].metadata.name}')
 gws=$(awk '$1 == "gateway" && $5 == "true"' <<<"$pods")
-t2_check ready "$(t2_bool [ "$rc" = 0 ] && [ "$(awk '{ print $2 }' <<<"$gws" | sort | paste -sd' ' -)" = "gw-0 gw-1 gw-2 gw-3 gw-4 gw-5" ] &&
+t2_check ready "$([ "$rc" = 0 ] && [ "$(awk '{ print $2 }' <<<"$gws" | sort | paste -sd' ' -)" = "gw-0 gw-1 gw-2 gw-3 gw-4 gw-5" ] &&
   [ "$(awk '{ print $3 }' <<<"$gws" | sort | paste -sd' ' -)" = "$gw_nodes" ] &&
-  [ "$(awk -v n="$logic_node" '$1 == "logic" && $3 == n && $5 == "true"' <<<"$pods" | wc -l)" = 2 ])" \
+  [ "$(awk -v n="$logic_node" '$1 == "logic" && $3 == n && $5 == "true"' <<<"$pods" | wc -l)" = 2 ] && echo true || echo false)" \
   "\"rollout\": $rc, \"pods\": $(t2_json_str "$pods")"
 [ "$rc" = 0 ] || exit 1
 
@@ -81,7 +81,7 @@ for n in ${want}; do n=${n%%=*}; have+="$n=$(docker inspect -f '{{.HostConfig.Cp
 wrong=""
 for n in $(stack_redis_names); do stack_pinned "$n" "$T2_CPUS_LOGIC" || wrong+=" $n"; done
 loops=$(for p in gw-0 gw-1 gw-2 gw-3 gw-4 gw-5; do kubectl -n im logs "$p" | grep -m 1 -o 'loops=[0-9]*'; done | sort | uniq -c | awk '{ print $2 "x" $1 }')
-t2_check pinning "$(t2_bool [ "$want" = "$have" ] && [ -z "$wrong" ] && [ "$loops" = loops=2x6 ])" \
+t2_check pinning "$([ "$want" = "$have" ] && [ -z "$wrong" ] && [ "$loops" = loops=2x6 ] && echo true || echo false)" \
   "\"nodes\": $(t2_json_str "${have% }"), \"redis_off_set\": $(t2_json_str "${wrong# }"), \"gateway_loops\": $(t2_json_str "$loops")"
 
 t3_probes >"$T2_OUT/probes.log" 2>&1 || t3_stop "probe pods" "$T2_OUT/probes.log"
@@ -128,6 +128,6 @@ after=$(kubectl -n im get pods -o jsonpath='{range .items[*]}{.metadata.name} {.
 t2_check pods "$(t2_bool [ "$(awk '$2 == "true" && $3 == 0' <<<"$after" | wc -l)" = 8 ])" "\"pods\": $(t2_json_str "$after")"
 stack_down
 problems=$(stack_health)
-t2_check processes "$(t2_bool [ -z "$problems" ] && [ "$LG_STATUS" = 0 ])" \
+t2_check processes "$([ -z "$problems" ] && [ "$LG_STATUS" = 0 ] && echo true || echo false)" \
   "\"problems\": $(t2_json_str "$problems"), \"loadgen_exit\": ${LG_STATUS:-null}"
 t2_finish

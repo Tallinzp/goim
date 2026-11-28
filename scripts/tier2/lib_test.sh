@@ -366,4 +366,8 @@ f0=$fails
 out=$(GOIM_TEST_TIER= make -s test-tier2 SCENARIO=race 2>&1)
 contains "make: shows the scenario's exit code" "$out" "test-tier2: race exited 2"
 
+# t2_bool A && B prints A's result only; no check may use it that way.
+found=$(grep -nE 't2_bool \[[^)]*\] *(&&|\|\|)' scripts/*.sh scripts/tier2/*.sh scripts/tier3/*.sh | grep -v '_test.sh:' | grep -v '^scripts/tier2/lib.sh:')
+if [ -z "$found" ]; then ok "t2_bool: never followed by && or ||"; else bad "t2_bool: followed by && or ||: $found"; fi
+
 [ "$fails" -eq 0 ] && echo "lib_test: all passed" || { echo "lib_test: $fails failed"; exit 1; }

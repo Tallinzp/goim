@@ -374,7 +374,7 @@ for name in $PHASES; do
   master=false master_ms=null ok=false ok_ms=null
   stack_redis_wait_role "$replica" master "$MAX" && { master=true; master_ms=$(($(date +%s%3N) - trig_ms)); }
   fo_wait_ok 60 && { ok=true; ok_ms=$(($(date +%s%3N) - trig_ms)); }
-  t2_check "${name}_failover" "$(t2_bool [ "$master" = true ] && [ "$ok" = true ])" \
+  t2_check "${name}_failover" "$([ "$master" = true ] && [ "$ok" = true ] && echo true || echo false)" \
     "\"target\": \"$target\", \"replica\": \"$replica\", \"lease_key\": \"$key\", \"at_ms_since_renewal\": $at_ms, \"master_ms\": $master_ms, \"cluster_ok_ms\": $ok_ms, \"max_s\": $MAX, \"stopped\": $(t2_json_str "$([ "$name" = zone ] && echo "$zone")"), \"gwepochs_on\": \"$epochs\", \"lease_keys\": {$leases}, \"roles\": $(stack_redis_roles)"
   through_done=$(t2_bool fo_flow_done $((THROUGH + 120)) "$d/through.json")
   t1=$((trig_ms + ${master_ms/null/$((MAX * 1000))} + 1000))

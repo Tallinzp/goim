@@ -78,6 +78,8 @@ t2_json_str() {
 }
 
 # t2_bool CMD...: prints true if CMD succeeds, else false.
+# t2_bool CMD...: true or false for one command. For A && B, write
+# "$(A && B && echo true || echo false)": t2_bool A && B prints A's only.
 t2_bool() { if "$@"; then echo true; else echo false; fi; }
 
 # t2_refuse MSG: refuses the run (exit 2). After t2_init the report shows
